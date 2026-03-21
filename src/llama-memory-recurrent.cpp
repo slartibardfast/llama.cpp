@@ -10,6 +10,7 @@
 #include <cstring>
 #include <limits>
 #include <map>
+
 #include <stdexcept>
 
 //
@@ -163,20 +164,27 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
             const auto & cell = cells[tail_id];
             // partial intersection is invalid if it includes the final pos
             if (0 < p0 && p0 <= cell.pos && p1 > cell.pos) {
-                // for speculative decoding, we search for a checkpoint in the history
+                // for speculative decoding, search for the best checkpoint to roll back to.
+                // Prefer exact match at p0-1, but accept the closest position < p0.
+                // For MTP with 2-token batches, checkpoint may be at p0-2 (before the batch)
+                // since both tokens are processed atomically.
                 int32_t best_cell = -1;
+                llama_pos best_pos = -1;
                 for (uint32_t i = 0; i < size; ++i) {
-                    if (cells[i].has_seq_id(seq_id) && cells[i].pos == p0 - 1) {
-                        best_cell = i;
-                        break;
+                    if (cells[i].has_seq_id(seq_id)) {
+                        // Find the closest checkpoint at or below p0-1
+                        if (cells[i].pos < p0 && cells[i].pos > best_pos) {
+                            best_pos = cells[i].pos;
+                            best_cell = i;
+                        }
                     }
                 }
 
                 if (best_cell >= 0) {
                     tail_id = best_cell;
                 } else {
-                    // No checkpoint found at p0-1: SSM tensor state cannot be rolled back
-                    // without re-evaluating the sequence. Signal failure to the caller.
+                    // No checkpoint found below p0: SSM tensor state cannot be rolled
+                    // back without re-evaluating the sequence. Signal failure to the caller.
                     return false;
                 }
             }
@@ -423,6 +431,9 @@ void llama_memory_recurrent::copy_cell(int32_t i_src, int32_t i_dst) {
         return;
     }
 
+    // Copy recurrent state via GPU-to-GPU (ggml_backend_tensor_copy).
+    // Views created with no_alloc=true have buffer=NULL. We must set
+    // the buffer to the parent tensor's buffer for the copy to work.
     ggml_init_params params = {
         /*.mem_size   =*/ size_t(2*ggml_tensor_overhead()),
         /*.mem_buffer =*/ NULL,
@@ -432,17 +443,25 @@ void llama_memory_recurrent::copy_cell(int32_t i_src, int32_t i_dst) {
     for (uint32_t il = 0; il < hparams.n_layer; ++il) {
         if (r_l[il]) {
             ggml_context * ctx = ggml_init(params);
-            size_t r_row_size = ggml_row_size(r_l[il]->type, hparams.n_embd_r());
-            ggml_tensor * src_v = ggml_view_1d(ctx, r_l[il], r_row_size, i_src * r_row_size);
-            ggml_tensor * dst_v = ggml_view_1d(ctx, r_l[il], r_row_size, i_dst * r_row_size);
+            // Tensor is 1D: ne[0] = n_embd_r * size. Each cell = ne[0]/size elements.
+            // ggml_view_1d takes ELEMENT count, not byte count.
+            int64_t cell_elements = r_l[il]->ne[0] / size;
+            size_t  cell_bytes    = ggml_row_size(r_l[il]->type, cell_elements);
+            ggml_tensor * src_v = ggml_view_1d(ctx, r_l[il], cell_elements, (size_t)i_src * cell_bytes);
+            ggml_tensor * dst_v = ggml_view_1d(ctx, r_l[il], cell_elements, (size_t)i_dst * cell_bytes);
+            src_v->buffer = r_l[il]->buffer;
+            dst_v->buffer = r_l[il]->buffer;
             ggml_backend_tensor_copy(src_v, dst_v);
             ggml_free(ctx);
         }
         if (s_l[il]) {
             ggml_context * ctx = ggml_init(params);
-            size_t s_row_size = ggml_row_size(s_l[il]->type, hparams.n_embd_s());
-            ggml_tensor * src_v = ggml_view_1d(ctx, s_l[il], s_row_size, i_src * s_row_size);
-            ggml_tensor * dst_v = ggml_view_1d(ctx, s_l[il], s_row_size, i_dst * s_row_size);
+            int64_t cell_elements = s_l[il]->ne[0] / size;
+            size_t  cell_bytes    = ggml_row_size(s_l[il]->type, cell_elements);
+            ggml_tensor * src_v = ggml_view_1d(ctx, s_l[il], cell_elements, (size_t)i_src * cell_bytes);
+            ggml_tensor * dst_v = ggml_view_1d(ctx, s_l[il], cell_elements, (size_t)i_dst * cell_bytes);
+            src_v->buffer = s_l[il]->buffer;
+            dst_v->buffer = s_l[il]->buffer;
             ggml_backend_tensor_copy(src_v, dst_v);
             ggml_free(ctx);
         }
@@ -544,6 +563,10 @@ bool llama_memory_recurrent::prepare(const std::vector<llama_ubatch> & ubatches)
 bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
     const uint32_t n_seq_tokens = ubatch.n_seq_tokens;
     const uint32_t n_seqs       = ubatch.n_seqs;
+
+    fprintf(stderr, "[MTP-FINDSLOT] find_slot: n_seq_tokens=%d, n_seqs=%d, size=%d, used=%d, head=%d\n",
+            (int)n_seq_tokens, (int)n_seqs, (int)size, (int)used, (int)head);
+    fflush(stderr);
 
     // if we have enough unused cells before the current head ->
     //   better to start searching from the beginning of the cache, hoping to fill it
