@@ -63,6 +63,7 @@ DispatchLoaderDynamic & ggml_vk_default_dispatcher();
 #endif
 
 #include "ggml-impl.h"
+#include "ggml-vk-jit.h"
 #include "ggml-backend-impl.h"
 
 #include "ggml-vulkan-shaders.hpp"
@@ -837,6 +838,16 @@ struct vk_device_struct {
     vk_pipeline pipeline_opt_step_adamw_f32;
     vk_pipeline pipeline_opt_step_sgd_f32;
     std::map<vk_conv2d_pipeline_state, vk_pipeline> pipeline_conv2d_f32[CONV_SHAPE_COUNT];
+
+    // Phase 17b: JIT ubershader
+    struct JitEntry {
+        vk_pipeline pipeline;
+        std::vector<uint32_t> spirv;
+    };
+    std::unordered_map<std::string, JitEntry> jit_cache;
+    vk_buffer jit_barrier_buf;  // 8 bytes: sense-reversing barrier
+    bool jit_enabled = false;
+    int jit_warmup_tokens = 0;  // count tokens before JIT activates
     std::map<vk_conv2d_pipeline_state, vk_pipeline> pipeline_conv2d_f16_f32[CONV_SHAPE_COUNT];
     std::map<vk_conv2d_pipeline_state, vk_pipeline> pipeline_conv_transpose_2d_f32[CONV_SHAPE_COUNT];
     std::map<vk_conv2d_pipeline_state, vk_pipeline> pipeline_conv_transpose_2d_f16_f32[CONV_SHAPE_COUNT];
@@ -5197,6 +5208,12 @@ static vk_device ggml_vk_get_device(size_t idx) {
         device->shader_int64 = device_features2.features.shaderInt64;
         device->buffer_device_address = vk12_features.bufferDeviceAddress;
         device->vulkan_memory_model = vk12_features.vulkanMemoryModel;
+
+        // Phase 17b: JIT ubershader
+        if (getenv("GGML_VK_JIT") && device->buffer_device_address && device->shader_int64) {
+            device->jit_enabled = true;
+            GGML_LOG_INFO("ggml_vulkan: JIT ubershader enabled for %s\n", device->name.c_str());
+        }
 
         if (device->subgroup_size_control) {
             device->subgroup_min_size = subgroup_size_control_props.minSubgroupSize;
@@ -14393,6 +14410,94 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         // initialize partial sums to zero.
         ggml_vk_buffer_memset_async(compute_ctx, ctx->prealloc_add_rms_partials, 0, 0, ctx->prealloc_size_add_rms_partials);
         ggml_vk_sync_buffers(ctx, compute_ctx);
+    }
+
+    // Phase 17b: JIT ubershader dispatch path
+    auto jit_get_bda = [&](const ggml_tensor * t) -> uint64_t {
+        if (!t || !t->buffer || !t->buffer->context) return 0;
+        // Check if this is a Vulkan buffer (has dev_buffer)
+        auto buf_ctx = (ggml_backend_vk_buffer_context *)t->buffer->context;
+        if (!buf_ctx || !buf_ctx->dev_buffer) return 0;
+        if (!buf_ctx->dev_buffer->bda_addr) return 0;
+        size_t offset = vk_tensor_offset(t) + t->view_offs;
+        return buf_ctx->dev_buffer->bda_addr + offset;
+    };
+
+    if (ctx->device->jit_enabled && ctx->device->jit_warmup_tokens >= 2) {
+        std::string sig = ggml_vk_jit::compute_signature(cgraph, jit_get_bda);
+        auto it = ctx->device->jit_cache.find(sig);
+
+        if (it != ctx->device->jit_cache.end() && it->second.pipeline) {
+            // Cache hit with compiled pipeline — single dispatch
+            compute_ctx = ggml_vk_get_compute_ctx(ctx);
+
+            // Allocate barrier buffer if needed (8 bytes: 2 uint32 counters)
+            if (!ctx->device->jit_barrier_buf) {
+                ctx->device->jit_barrier_buf = ggml_vk_create_buffer_check(ctx->device, 8,
+                    vk::MemoryPropertyFlagBits::eDeviceLocal | vk::MemoryPropertyFlagBits::eHostVisible |
+                    vk::MemoryPropertyFlagBits::eHostCoherent);
+            }
+            memset(ctx->device->jit_barrier_buf->ptr, 0, 8);
+
+            const uint32_t num_wgs = 5;
+            struct { uint32_t n; } jit_pc = { num_wgs };
+            ggml_pipeline_request_descriptor_sets(ctx, it->second.pipeline, 1);
+            ggml_vk_sync_buffers(ctx, compute_ctx);
+            ggml_vk_dispatch_pipeline(ctx, compute_ctx,
+                it->second.pipeline,
+                { vk::DescriptorBufferInfo{ctx->device->jit_barrier_buf->buffer, 0, 8} },
+                jit_pc,
+                { num_wgs, 1, 1 });
+
+            // Submit and wait
+            ggml_vk_ctx_end(compute_ctx);
+            ggml_vk_submit(compute_ctx, ctx->device->fence);
+            VK_CHECK(ctx->device->device.waitForFences({ ctx->device->fence }, true, UINT64_MAX),
+                     "JIT waitForFences");
+            ctx->device->device.resetFences({ ctx->device->fence });
+            ctx->compute_ctx.reset();
+
+            ctx->last_total_mul_mat_bytes = 0; // unknown
+            return GGML_STATUS_SUCCESS;
+        } else if (it != ctx->device->jit_cache.end() && !it->second.pipeline && !it->second.spirv.empty()) {
+            // SPIR-V cached but pipeline not yet created — use ggml infrastructure
+            auto & entry = it->second;
+            entry.pipeline = std::make_shared<vk_pipeline_struct>();
+                entry.pipeline->name = "jit_uber";
+                entry.pipeline->push_constant_size = sizeof(uint32_t);
+                entry.pipeline->align = 1;
+                ggml_vk_create_pipeline_func(ctx->device, entry.pipeline,
+                    entry.spirv.size() * 4, entry.spirv.data(), "main",
+                    1, {1, 1, 1}, {}, false, false, 0);
+            fprintf(stderr, "ggml_vk_jit: pipeline created from cached SPIR-V\n");
+            // Fall through to standard dispatch — pipeline ready for next token
+        } else {
+            // Cache miss — generate and compile JIT shader
+            std::string glsl = ggml_vk_jit::generate_shader(cgraph, jit_get_bda);
+            if (!glsl.empty()) {
+                // Try disk cache first
+                std::string cache_path = ggml_vk_jit::get_cache_path(sig);
+                std::vector<uint32_t> spirv;
+                if (!ggml_vk_jit::load_spirv_cache(cache_path, spirv)) {
+                    spirv = ggml_vk_jit::compile_glsl(glsl, "jit_uber_" + sig.substr(0, 8));
+                    if (!spirv.empty()) {
+                        ggml_vk_jit::save_spirv_cache(cache_path, spirv);
+                    }
+                }
+                if (!spirv.empty()) {
+                    // Store SPIR-V for pipeline creation
+                    vk_device_struct::JitEntry entry;
+                    entry.spirv = spirv;
+                    // Pipeline will be created on next token when we detect cached SPIR-V
+                    ctx->device->jit_cache[sig] = std::move(entry);
+                    fprintf(stderr, "ggml_vk_jit: SPIR-V compiled (%zu words), pipeline pending\n", spirv.size());
+                }
+            }
+            // Fall through to standard dispatch for this token
+        }
+    }
+    if (ctx->device->jit_enabled) {
+        ctx->device->jit_warmup_tokens++;
     }
 
     // Submit after enough work has accumulated, to overlap CPU cmdbuffer generation with GPU execution.
