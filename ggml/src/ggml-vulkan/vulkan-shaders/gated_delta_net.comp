@@ -115,7 +115,7 @@ void main() {
         const uint k_off = q_off;
         const uint v_off = seq_id * sv3 + t * sv2 + head_id * sv1;
         const uint gb_off = seq_id * sb3 + t * sb2 + head_id * sb1;
-        const FLOAT_TYPE beta_val = FLOAT_TYPE(data_beta[gb_off]);
+        const FLOAT_TYPE beta_val = FLOAT_TYPE(1.0) / (FLOAT_TYPE(1.0) + exp(-FLOAT_TYPE(data_beta[gb_off]))); // Phase 16: sigmoid fused
 
         FLOAT_TYPE k_reg[ROWS_PER_LANE];
         FLOAT_TYPE q_reg[ROWS_PER_LANE];

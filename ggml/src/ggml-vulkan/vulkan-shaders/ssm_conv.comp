@@ -46,5 +46,5 @@ void main() {
     }
 
     const uint dst_idx = i3 * (dst_nb2 / 4) + i2 * (dst_nb1 / 4) + i1;
-    dst[dst_idx] = sum;
+    float s = sum; dst[dst_idx] = s / (1.0 + exp(-s));
 }

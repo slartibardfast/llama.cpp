@@ -2102,26 +2102,9 @@ static void ggml_vk_wait_for_fence(ggml_backend_vk_context * ctx) {
         ctx->almost_ready_fence_pending = false;
     }
 
-    // Spin (w/pause) waiting for the graph to finish executing.
-    vk::Result result;
-    while ((result = ctx->device->device.getFenceStatus(ctx->fence)) != vk::Result::eSuccess) {
-        if (result != vk::Result::eNotReady) {
-            fprintf(stderr, "ggml_vulkan: error %s at %s:%d\n", to_string(result).c_str(), __FILE__, __LINE__);
-            exit(1);
-        }
-        for (uint32_t i = 0; i < 100; ++i) {
-            YIELD();
-            YIELD();
-            YIELD();
-            YIELD();
-            YIELD();
-            YIELD();
-            YIELD();
-            YIELD();
-            YIELD();
-            YIELD();
-        }
-    }
+    // Phase 16: Block efficiently instead of busy-wait spinning.
+    VK_CHECK(ctx->device->device.waitForFences({ ctx->fence }, true, UINT64_MAX),
+             "ggml_vk_sync_buffers waitForFences");
     ctx->device->device.resetFences({ ctx->fence });
 }
 
@@ -4021,7 +4004,7 @@ static void ggml_vk_load_shaders(vk_device& device) {
     }
     uint32_t rm_iq = 2 * rm_kq;
 
-    const bool use_subgroups = device->subgroup_arithmetic && device->architecture != vk_device_architecture::AMD_GCN;
+    const bool use_subgroups = device->subgroup_arithmetic; // Phase 16: enable subgroupAdd on GCN
     // Ensure a subgroup size >= 16 is available
     const bool use_subgroups16 = use_subgroups && subgroup_min_size_16;
 
@@ -14416,7 +14399,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     // Estimate the amount of matmul work by looking at the weight matrix size, and submit every 100MB
     // (and scaled down based on model size, so smaller models submit earlier).
     // Also submit at least every 100 nodes, in case there are workloads without as much matmul.
-    int nodes_per_submit = 100;
+    int nodes_per_submit = 2000;
     int submitted_nodes = 0;
     int submit_count = 0;
     uint64_t mul_mat_bytes = 0;
