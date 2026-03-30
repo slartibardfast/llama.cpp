@@ -559,6 +559,9 @@ extern "C" {
         GGML_OP_RWKV_WKV7,
         GGML_OP_SOLVE_TRI,
         GGML_OP_GATED_DELTA_NET,
+        GGML_OP_FUSED_GATE_PREP,
+        GGML_OP_FUSED_GATED_NORM,
+        GGML_OP_FUSED_DUAL_L2_NORM,
 
         GGML_OP_UNARY,
 
@@ -2360,6 +2363,23 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * sx,
             struct ggml_tensor  * c);
+
+    GGML_API struct ggml_tensor * ggml_fused_gate_prep(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * alpha,
+            struct ggml_tensor  * dt_bias,
+            struct ggml_tensor  * ssm_a);
+
+    GGML_API struct ggml_tensor * ggml_fused_gated_norm(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * input,
+            struct ggml_tensor  * norm_weights,
+            struct ggml_tensor  * gate);
+
+    GGML_API struct ggml_tensor * ggml_fused_dual_l2_norm(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k);
 
     GGML_API struct ggml_tensor * ggml_ssm_scan(
             struct ggml_context * ctx,

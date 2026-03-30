@@ -1,0 +1,71 @@
+// Phase 16: Fused gated normalization for Qwen3.5 SSM layers.
+// Combines: rms_norm(input, weights) * silu(gate) into one dispatch.
+// Eliminates 2 dispatch boundaries per SSM layer (54 total → 18).
+//
+// Inputs:
+//   binding 0: input [head_v_dim, num_v_heads, n_seq_tokens, n_seqs]
+//   binding 1: norm_weights [head_v_dim] — RMS norm scale
+//   binding 2: gate [head_v_dim, num_v_heads, n_seq_tokens, n_seqs]
+//   binding 3: output [head_v_dim, num_v_heads, n_seq_tokens, n_seqs]
+//
+// Compute: output[i] = rms_norm(input, weights)[i] * silu(gate[i])
+// Where rms_norm(x) = x / sqrt(mean(x^2) + eps) * weight
+//       silu(x) = x / (1 + exp(-x))
+//
+// Each workgroup handles one [head_v_dim] vector — computes the RMS
+// reduction, normalizes, and multiplies by silu(gate) in one pass.
+
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(constant_id = 0) const uint HEAD_DIM = 128;
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly  buffer Input   { float data_in[];   };
+layout(binding = 1) readonly  buffer Weights { float data_w[];    };
+layout(binding = 2) readonly  buffer Gate    { float data_gate[]; };
+layout(binding = 3) writeonly buffer Dst     { float data_dst[];  };
+
+layout(push_constant) uniform PushConstants {
+    uint ne;        // total elements
+    uint head_dim;  // elements per norm group
+    float eps;      // RMS norm epsilon
+};
+
+shared float sdata[256];  // for reduction
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint group_id = gl_WorkGroupID.x;
+    const uint base = group_id * head_dim;
+
+    if (base >= ne) return;
+
+    // Step 1: Compute sum of squares for RMS norm
+    float sum_sq = 0.0;
+    for (uint i = tid; i < head_dim; i += gl_WorkGroupSize.x) {
+        float v = data_in[base + i];
+        sum_sq += v * v;
+    }
+    sdata[tid] = sum_sq;
+    barrier();
+
+    // Tree reduction
+    for (uint s = gl_WorkGroupSize.x / 2; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        barrier();
+    }
+
+    float rms = sqrt(sdata[0] / float(head_dim) + eps);
+    float inv_rms = 1.0 / rms;
+
+    // Step 2: Normalize, scale by weight, multiply by silu(gate)
+    for (uint i = tid; i < head_dim; i += gl_WorkGroupSize.x) {
+        float normed = data_in[base + i] * inv_rms * data_w[i % head_dim];
+        float g = data_gate[base + i];
+        float silu_g = g / (1.0 + exp(-g));
+        data_dst[base + i] = normed * silu_g;
+    }
+}

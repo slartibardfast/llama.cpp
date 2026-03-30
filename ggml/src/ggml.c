@@ -1040,6 +1040,9 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "RWKV_WKV7",
     "SOLVE_TRI",
     "GATED_DELTA_NET",
+    "FUSED_GATE_PREP",
+    "FUSED_GATED_NORM",
+    "FUSED_DUAL_L2_NORM",
 
     "UNARY",
 
@@ -1057,7 +1060,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 96, "GGML_OP_COUNT != 96");
+static_assert(GGML_OP_COUNT == 99, "GGML_OP_COUNT != 99");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1150,6 +1153,9 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "rwkv_wkv7(r, w, k, v, a, b, s)",
     "A X = B, A triangular, solve X",
     "gated_delta_net(q, k, v, g, beta, s)",
+    "fused_gate_prep(alpha, dt, a)",
+    "fused_gated_norm(x, w, gate)",
+    "fused_dual_l2_norm(q, k)",
 
     "unary(x)",
 
@@ -1167,7 +1173,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 96, "GGML_OP_COUNT != 96");
+static_assert(GGML_OP_COUNT == 99, "GGML_OP_COUNT != 99");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5467,6 +5473,55 @@ struct ggml_tensor * ggml_ssm_conv(
     result->src[0] = sx;
     result->src[1] = c;
 
+    return result;
+}
+
+// ggml_fused_gate_prep
+
+struct ggml_tensor * ggml_fused_gate_prep(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * alpha,
+        struct ggml_tensor  * dt_bias,
+        struct ggml_tensor  * ssm_a) {
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, alpha->ne);
+    result->op     = GGML_OP_FUSED_GATE_PREP;
+    result->src[0] = alpha;
+    result->src[1] = dt_bias;
+    result->src[2] = ssm_a;
+    return result;
+}
+
+// ggml_fused_gated_norm
+
+struct ggml_tensor * ggml_fused_gated_norm(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * input,
+        struct ggml_tensor  * norm_weights,
+        struct ggml_tensor  * gate) {
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, input->ne);
+    result->op     = GGML_OP_FUSED_GATED_NORM;
+    result->src[0] = input;
+    result->src[1] = norm_weights;
+    result->src[2] = gate;
+    return result;
+}
+
+// ggml_fused_dual_l2_norm
+
+struct ggml_tensor * ggml_fused_dual_l2_norm(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k) {
+    // Output is 2x q's first dimension (q_norm then k_norm concatenated)
+    int64_t ne[GGML_MAX_DIMS];
+    for (int i = 0; i < GGML_MAX_DIMS; i++) {
+        ne[i] = q->ne[i];
+    }
+    ne[0] *= 2;
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, ne);
+    result->op     = GGML_OP_FUSED_DUAL_L2_NORM;
+    result->src[0] = q;
+    result->src[1] = k;
     return result;
 }
 

@@ -1,0 +1,38 @@
+// Phase 16: Fused gate preparation for Qwen3.5 SSM layers.
+// Combines: add(alpha, dt_bias) + softplus + mul(ssm_a) into one dispatch.
+// Eliminates 2 dispatch boundaries per SSM layer (54 total → 18).
+//
+// Inputs:
+//   binding 0: alpha [num_v_heads, n_seq_tokens, n_seqs] — from matmul
+//   binding 1: dt_bias [num_v_heads] — per-head bias (model weight)
+//   binding 2: ssm_a [num_v_heads] — per-head scale (model weight, typically negative)
+//   binding 3: output [num_v_heads, n_seq_tokens, n_seqs]
+//
+// Compute: output[i] = softplus(alpha[i] + dt_bias[i % num_v_heads]) * ssm_a[i % num_v_heads]
+// Where softplus(x) = x > 20 ? x : log(1 + exp(x))
+
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly  buffer Alpha  { float data_alpha[]; };
+layout(binding = 1) readonly  buffer DtBias { float data_dt[];    };
+layout(binding = 2) readonly  buffer SsmA   { float data_a[];     };
+layout(binding = 3) writeonly buffer Dst    { float data_dst[];   };
+
+layout(push_constant) uniform PushConstants {
+    uint ne;           // total elements
+    uint num_v_heads;  // head count for bias/scale indexing
+};
+
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    if (i >= ne) return;
+
+    const uint head_idx = i % num_v_heads;
+    const float x = data_alpha[i] + data_dt[head_idx];
+    const float sp = (x > 20.0) ? x : log(1.0 + exp(x));
+    data_dst[i] = sp * data_a[head_idx];
+}

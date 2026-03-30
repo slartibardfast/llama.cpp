@@ -1034,6 +1034,10 @@ void process_shaders() {
 
     string_to_spv("ssm_conv_f32", "ssm_conv.comp", {{"A_TYPE", "float"}});
 
+    string_to_spv("fused_gate_prep_f32", "fused_gate_prep.comp", {});
+    string_to_spv("fused_gated_norm_f32", "fused_gated_norm.comp", {});
+    string_to_spv("fused_dual_l2_norm_f32", "fused_dual_l2_norm.comp", {});
+
     string_to_spv("topk_moe_f32", "topk_moe.comp", {});
 
     for (auto &c : compiles) {

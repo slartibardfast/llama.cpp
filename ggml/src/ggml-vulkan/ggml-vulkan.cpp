@@ -831,6 +831,9 @@ struct vk_device_struct {
     vk_pipeline pipeline_ssm_scan_f32_d128;
     vk_pipeline pipeline_ssm_scan_f32_d256;
     vk_pipeline pipeline_ssm_conv_f32;
+    vk_pipeline pipeline_fused_gate_prep_f32;
+    vk_pipeline pipeline_fused_gated_norm_f32;
+    vk_pipeline pipeline_fused_dual_l2_norm_f32;
     vk_pipeline pipeline_opt_step_adamw_f32;
     vk_pipeline pipeline_opt_step_sgd_f32;
     std::map<vk_conv2d_pipeline_state, vk_pipeline> pipeline_conv2d_f32[CONV_SHAPE_COUNT];
@@ -1496,6 +1499,23 @@ struct vk_op_ssm_conv_push_constants {
     uint32_t nb11;
     uint32_t dst_nb0, dst_nb1, dst_nb2;
     uint32_t nc, ncs, nr, n_t, n_s;
+};
+
+struct vk_op_fused_gate_prep_push_constants {
+    uint32_t ne;
+    uint32_t num_v_heads;
+};
+
+struct vk_op_fused_gated_norm_push_constants {
+    uint32_t ne;
+    uint32_t head_dim;
+    float eps;
+};
+
+struct vk_op_fused_dual_l2_norm_push_constants {
+    uint32_t ne;
+    uint32_t vec_dim;
+    float eps;
 };
 
 struct vk_op_conv2d_push_constants {
@@ -4663,6 +4683,10 @@ static void ggml_vk_load_shaders(vk_device& device) {
     }
 
     ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_f32, "ssm_conv_f32", ssm_conv_f32_len, ssm_conv_f32_data, "main", 3, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16}, 1);
+
+    ggml_vk_create_pipeline(device, device->pipeline_fused_gate_prep_f32, "fused_gate_prep_f32", fused_gate_prep_f32_len, fused_gate_prep_f32_data, "main", 4, sizeof(vk_op_fused_gate_prep_push_constants), {256, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_fused_gated_norm_f32, "fused_gated_norm_f32", fused_gated_norm_f32_len, fused_gated_norm_f32_data, "main", 4, sizeof(vk_op_fused_gated_norm_push_constants), {128, 1, 1}, {128}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_fused_dual_l2_norm_f32, "fused_dual_l2_norm_f32", fused_dual_l2_norm_f32_len, fused_dual_l2_norm_f32_data, "main", 3, sizeof(vk_op_fused_dual_l2_norm_push_constants), {128, 1, 1}, {128}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_opt_step_adamw_f32, "opt_step_adamw_f32", opt_step_adamw_f32_len, opt_step_adamw_f32_data, "main", 5, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
 
@@ -9611,6 +9635,12 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
             return ctx->device->pipeline_ssm_conv_f32;
         }
         return nullptr;
+    case GGML_OP_FUSED_GATE_PREP:
+        return ctx->device->pipeline_fused_gate_prep_f32;
+    case GGML_OP_FUSED_GATED_NORM:
+        return ctx->device->pipeline_fused_gated_norm_f32;
+    case GGML_OP_FUSED_DUAL_L2_NORM:
+        return ctx->device->pipeline_fused_dual_l2_norm_f32;
     case GGML_OP_OPT_STEP_ADAMW:
         if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
             return ctx->device->pipeline_opt_step_adamw_f32;
@@ -10549,6 +10579,26 @@ static void ggml_vk_ssm_conv(ggml_backend_vk_context * ctx, vk_context& subctx, 
         (uint32_t)dst->ne[1],
         (uint32_t)dst->ne[2],
     });
+}
+
+static void ggml_vk_fused_gate_prep(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+    const uint32_t ne = (uint32_t)ggml_nelements(dst);
+    const uint32_t num_v_heads = (uint32_t)dst->src[1]->ne[0];
+    ggml_vk_op_f32<vk_op_fused_gate_prep_push_constants>(ctx, subctx, dst->src[0], dst->src[1], dst->src[2], nullptr, dst, GGML_OP_FUSED_GATE_PREP, { ne, num_v_heads });
+}
+
+static void ggml_vk_fused_gated_norm(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+    const uint32_t ne = (uint32_t)ggml_nelements(dst);
+    const uint32_t head_dim = (uint32_t)dst->src[1]->ne[0];
+    const float eps = 1e-6f;
+    ggml_vk_op_f32<vk_op_fused_gated_norm_push_constants>(ctx, subctx, dst->src[0], dst->src[1], dst->src[2], nullptr, dst, GGML_OP_FUSED_GATED_NORM, { ne, head_dim, eps });
+}
+
+static void ggml_vk_fused_dual_l2_norm(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+    const uint32_t ne = (uint32_t)ggml_nelements(dst->src[0]);
+    const uint32_t vec_dim = (uint32_t)dst->src[0]->ne[0];
+    const float eps = 1e-6f;
+    ggml_vk_op_f32<vk_op_fused_dual_l2_norm_push_constants>(ctx, subctx, dst->src[0], dst->src[1], nullptr, nullptr, dst, GGML_OP_FUSED_DUAL_L2_NORM, { ne, vec_dim, eps });
 }
 
 static void ggml_vk_op_f32_opt_step_adamw(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst, const vk_op_push_constants&& pc) {
@@ -13218,6 +13268,21 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
 
         break;
 
+    case GGML_OP_FUSED_GATE_PREP:
+        ggml_vk_fused_gate_prep(ctx, compute_ctx, node);
+
+        break;
+
+    case GGML_OP_FUSED_GATED_NORM:
+        ggml_vk_fused_gated_norm(ctx, compute_ctx, node);
+
+        break;
+
+    case GGML_OP_FUSED_DUAL_L2_NORM:
+        ggml_vk_fused_dual_l2_norm(ctx, compute_ctx, node);
+
+        break;
+
     case GGML_OP_OPT_STEP_ADAMW:
         ggml_vk_opt_step_adamw(ctx, compute_ctx, node);
 
@@ -15685,6 +15750,9 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 return true;
             }
         case GGML_OP_SSM_CONV:
+        case GGML_OP_FUSED_GATE_PREP:
+        case GGML_OP_FUSED_GATED_NORM:
+        case GGML_OP_FUSED_DUAL_L2_NORM:
             return op->src[0]->type == GGML_TYPE_F32;
         case GGML_OP_CONV_TRANSPOSE_1D:
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32;

@@ -1,0 +1,68 @@
+// Phase 16: Fused dual L2 normalization for Qwen3.5 SSM layers.
+// Combines: l2_norm(q) + l2_norm(k) into one dispatch.
+// Eliminates 1 dispatch boundary per SSM layer (36 total -> 18).
+//
+// Both q and k have the same dimensions and are L2-normalized
+// independently. Fusing avoids an inter-dispatch cache flush.
+//
+// Inputs:
+//   binding 0: q [vec_dim, ...]
+//   binding 1: k [vec_dim, ...]
+//   binding 2: output [2 * vec_dim, ...] (q_norm then k_norm concatenated)
+//
+// Compute: out[0..ne) = q / ||q||, out[ne..2*ne) = k / ||k||
+
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(constant_id = 0) const uint VEC_DIM = 128;
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout(binding = 0) readonly  buffer QIn { float data_q[]; };
+layout(binding = 1) readonly  buffer KIn { float data_k[]; };
+layout(binding = 2) writeonly buffer Out { float data_out[]; };
+
+layout(push_constant) uniform PushConstants {
+    uint ne;       // total elements per input tensor
+    uint vec_dim;  // elements per L2 norm group
+    float eps;     // epsilon for numerical stability
+};
+
+shared float sq[256];
+shared float sk[256];
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint group_id = gl_WorkGroupID.x;
+    const uint base = group_id * vec_dim;
+
+    if (base >= ne) return;
+
+    // Compute sum of squares for both q and k
+    float sum_q = 0.0, sum_k = 0.0;
+    for (uint i = tid; i < vec_dim; i += gl_WorkGroupSize.x) {
+        float qv = data_q[base + i];
+        float kv = data_k[base + i];
+        sum_q += qv * qv;
+        sum_k += kv * kv;
+    }
+    sq[tid] = sum_q;
+    sk[tid] = sum_k;
+    barrier();
+
+    for (uint s = gl_WorkGroupSize.x / 2; s > 0; s >>= 1) {
+        if (tid < s) { sq[tid] += sq[tid + s]; sk[tid] += sk[tid + s]; }
+        barrier();
+    }
+
+    float inv_norm_q = 1.0 / sqrt(sq[0] + eps);
+    float inv_norm_k = 1.0 / sqrt(sk[0] + eps);
+
+    // Write q_norm to [0..ne), k_norm to [ne..2*ne)
+    for (uint i = tid; i < vec_dim; i += gl_WorkGroupSize.x) {
+        data_out[base + i]      = data_q[base + i] * inv_norm_q;
+        data_out[ne + base + i] = data_k[base + i] * inv_norm_k;
+    }
+}
