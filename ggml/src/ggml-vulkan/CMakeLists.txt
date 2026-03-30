@@ -56,6 +56,8 @@ if (Vulkan_FOUND)
 
     ggml_add_backend_library(ggml-vulkan
                              ggml-vulkan.cpp
+                             ggml-vk-jit.cpp
+                             ggml-vk-jit.h
                              ../../include/ggml-vulkan.h
                             )
 
@@ -87,6 +89,15 @@ if (Vulkan_FOUND)
     )
 
     target_link_libraries(ggml-vulkan PRIVATE Vulkan::Vulkan)
+
+    # Phase 17b: JIT shader compilation at runtime
+    find_library(SHADERC_LIB shaderc_shared)
+    if(SHADERC_LIB)
+        target_link_libraries(ggml-vulkan PRIVATE ${SHADERC_LIB})
+        target_compile_definitions(ggml-vulkan PRIVATE GGML_VULKAN_JIT_SHADERC=1)
+        message(STATUS "ggml-vulkan: JIT shader compilation enabled (shaderc)")
+    endif()
+
     target_include_directories(ggml-vulkan PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 
     # Workaround to the "can't dereference invalidated vector iterator" bug in clang-cl debug build
