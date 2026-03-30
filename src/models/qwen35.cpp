@@ -224,7 +224,7 @@ ggml_tensor * llm_build_qwen35::build_layer_attn_linear(
     beta = ggml_reshape_4d(ctx0, beta, 1, num_v_heads, n_seq_tokens, n_seqs);
     cb(beta, "beta", il);
 
-    beta = ggml_sigmoid(ctx0, beta);
+    // beta = ggml_sigmoid(ctx0, beta); // Phase 16: fused into gated_delta_net
 
     ggml_tensor * alpha = build_lora_mm(model.layers[il].ssm_alpha, cur, model.layers[il].ssm_alpha_s);
     alpha = ggml_reshape_3d(ctx0, alpha, num_v_heads, n_seq_tokens, n_seqs);
@@ -279,7 +279,7 @@ ggml_tensor * llm_build_qwen35::build_layer_attn_linear(
     ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
     cb(conv_output_proper, "conv_output_raw", il);
 
-    ggml_tensor * conv_output_silu = ggml_silu(ctx0, conv_output_proper);
+    ggml_tensor * conv_output_silu = conv_output_proper; // Phase 16: SiLU fused into ssm_conv
     cb(conv_output_silu, "conv_output_silu", il);
 
     ggml_tensor * conv_qkv_mix = conv_output_silu;
