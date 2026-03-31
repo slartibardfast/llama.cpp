@@ -42,6 +42,7 @@ struct Op {
 };
 
 layout(binding = 0, std430) readonly buffer Program { uint num_ops; uint _pad0; Op ops[]; };
+layout(push_constant) uniform PC { uint _dummy; };
 layout(local_size_x = 256) in;
 
 shared float smem[4];
