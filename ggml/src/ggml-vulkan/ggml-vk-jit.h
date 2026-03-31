@@ -5,44 +5,57 @@
 #include <vector>
 #include <cstdint>
 #include <functional>
-
-// Phase 17b: JIT shader generator for single-dispatch inference.
-// Walks the ggml compute graph and emits a specialized GLSL shader
-// with hardcoded BDA addresses, baked dimensions, and straight-line
-// op sequence. Compiled at runtime via shaderc.
+#include <memory>
 
 struct ggml_cgraph;
+struct vk_pipeline_struct;
 
 namespace ggml_vk_jit {
 
-// Callback to get BDA address for a tensor
 using bda_fn = std::function<uint64_t(const ggml_tensor*)>;
 
-struct JitConfig {
-    uint32_t num_workgroups = 5;  // 1 per CU on Polaris 12
-    uint32_t workgroup_size = 64; // 1 wavefront on GCN3
+// ===== Fusion Group Architecture (Phase 17c) =====
+
+enum class GroupType {
+    ELEMENTWISE_CHAIN,  // ADD, MUL, SILU, SIGMOID, SCALE, CPY — JIT fused
+    REDUCTION_CHAIN,    // RMS_NORM→MUL, L2_NORM→MUL — JIT fused
+    USE_STANDARD,       // matmul, GDN, flash_attn, etc. — standard dispatch
 };
 
-// Generate GLSL source for the entire compute graph.
-// Returns empty string if any op is unsupported.
-std::string generate_shader(
-    const ggml_cgraph * cgraph,
-    bda_fn get_bda,
-    const JitConfig & config = {});
+struct FusionGroup {
+    int start_node;     // first graph node index (inclusive)
+    int end_node;       // last graph node index (exclusive)
+    GroupType type;
+    std::shared_ptr<vk_pipeline_struct> pipeline;  // JIT pipeline (null = not yet compiled)
+    std::vector<uint32_t> spirv;                   // cached SPIR-V
+    std::string signature;                         // cache key
+};
 
-// Compute a signature for cache lookup.
-// Hash of (op types + dimensions + BDA addresses).
-std::string compute_signature(
+// Walk the graph and identify fusion groups.
+// Uses the same dependency logic as standard dispatch to find barrier points.
+std::vector<FusionGroup> build_fusion_groups(
     const ggml_cgraph * cgraph,
     bda_fn get_bda);
 
-// Compile GLSL source to SPIR-V binary via shaderc.
-// Returns empty vector on failure (error logged to stderr).
+// Generate GLSL for a fusion group (elementwise chain or reduction+tail).
+// Returns empty string if the group can't be JIT-compiled.
+std::string generate_group_shader(
+    const ggml_cgraph * cgraph,
+    const FusionGroup & group,
+    bda_fn get_bda);
+
+// Compute signature for a single fusion group.
+std::string compute_group_signature(
+    const ggml_cgraph * cgraph,
+    const FusionGroup & group,
+    bda_fn get_bda);
+
+// ===== Shared utilities =====
+
 std::vector<uint32_t> compile_glsl(
     const std::string & source,
-    const std::string & name = "jit_uber");
+    const std::string & name = "jit_fused");
 
-// Cache management
 std::string get_cache_path(const std::string & signature);
 bool load_spirv_cache(const std::string & path, std::vector<uint32_t> & spirv);
 bool save_spirv_cache(const std::string & path, const std::vector<uint32_t> & spirv);
