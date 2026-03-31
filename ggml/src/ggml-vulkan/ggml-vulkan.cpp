@@ -14413,7 +14413,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ggml_vk_sync_buffers(ctx, compute_ctx);
     }
 
-    // Phase 17c: JIT fusion group dispatch path
+    // Phase 17c: Dolphin-style GPU interpreter dispatch path
     auto jit_get_bda = [&](const ggml_tensor * t) -> uint64_t {
         if (!t || !t->buffer || !t->buffer->context) return 0;
         auto * buf_ctx = (ggml_backend_vk_buffer_context *)t->buffer->context;
@@ -14424,23 +14424,21 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     };
 
     if (ctx->device->jit_enabled && ctx->device->jit_warmup_tokens >= 2) {
-        // Build fusion groups (identifies barrier points and fusable op chains)
-        auto groups = ggml_vk_jit::build_fusion_groups(cgraph, jit_get_bda);
+        auto segments = ggml_vk_jit::build_segments(cgraph, jit_get_bda);
 
         if (getenv("GGML_VK_JIT_DEBUG")) {
-            int n_ew = 0, n_red = 0, n_std = 0;
-            for (auto & g : groups) {
-                if (g.type == ggml_vk_jit::GroupType::ELEMENTWISE_CHAIN) n_ew++;
-                else if (g.type == ggml_vk_jit::GroupType::REDUCTION_CHAIN) n_red++;
+            int n_interp = 0, n_std = 0, n_interp_ops = 0;
+            for (auto & s : segments) {
+                if (s.interpreter_eligible) { n_interp++; n_interp_ops += (int)s.program.size(); }
                 else n_std++;
             }
-            fprintf(stderr, "ggml_vk_jit: %zu fusion groups (%d elementwise, %d reduction, %d standard)\n",
-                    groups.size(), n_ew, n_red, n_std);
+            fprintf(stderr, "ggml_vk_jit: %zu segments (%d interpreter [%d ops], %d standard)\n",
+                    segments.size(), n_interp, n_interp_ops, n_std);
         }
 
-        // For now: fall through to standard dispatch for ALL groups.
-        // This validates the grouping logic without changing behavior.
-        // TODO: dispatch JIT-compiled fused kernels for ELEMENTWISE_CHAIN groups.
+        // Fall through to standard dispatch for now.
+        // TODO: compile interpreter pipeline, write SSBO programs,
+        // dispatch interpreter for eligible segments.
     }
     if (ctx->device->jit_enabled) {
         ctx->device->jit_warmup_tokens++;

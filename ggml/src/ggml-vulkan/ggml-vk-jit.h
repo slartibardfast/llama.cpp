@@ -14,47 +14,50 @@ namespace ggml_vk_jit {
 
 using bda_fn = std::function<uint64_t(const ggml_tensor*)>;
 
-// ===== Fusion Group Architecture (Phase 17c) =====
+// ===== GPU Interpreter (Phase 17c — Dolphin-style) =====
 
-enum class GroupType {
-    ELEMENTWISE_CHAIN,  // ADD, MUL, SILU, SIGMOID, SCALE, CPY — JIT fused
-    REDUCTION_CHAIN,    // RMS_NORM→MUL, L2_NORM→MUL — JIT fused
-    USE_STANDARD,       // matmul, GDN, flash_attn, etc. — standard dispatch
+// Op types for the interpreter SSBO program
+enum OpType : uint32_t {
+    OP_ADD = 0, OP_MUL = 1, OP_SILU = 2, OP_SIGMOID = 3,
+    OP_SCALE = 4, OP_CPY = 5, OP_SWIGLU_SPLIT = 6,
+    OP_RMS_NORM = 7, OP_L2_NORM = 8,
 };
 
-struct FusionGroup {
-    int start_node;     // first graph node index (inclusive)
-    int end_node;       // last graph node index (exclusive)
-    GroupType type;
-    std::shared_ptr<vk_pipeline_struct> pipeline;  // JIT pipeline (null = not yet compiled)
-    std::vector<uint32_t> spirv;                   // cached SPIR-V
-    std::string signature;                         // cache key
+// SSBO program entry — must match GLSL struct layout (std430, 40 bytes)
+struct alignas(8) JitOp {
+    uint32_t type;
+    uint32_t ne;
+    uint64_t src0;
+    uint64_t src1;
+    uint64_t dst;
+    float    param;
+    uint32_t _pad;
+};
+static_assert(sizeof(JitOp) == 40, "JitOp must be 40 bytes for std430 layout");
+
+// Segment: a group of consecutive ops between hardware barriers
+struct Segment {
+    int start_node;         // graph node index (inclusive)
+    int end_node;           // graph node index (exclusive)
+    bool interpreter_eligible;  // true = use interpreter, false = standard dispatch
+    bool needs_single_wg;       // true = reduction present, dispatch 1 WG
+    std::vector<JitOp> program; // filled when interpreter_eligible
+    uint32_t max_ne;            // largest element count (for WG calculation)
 };
 
-// Walk the graph and identify fusion groups.
-// Uses the same dependency logic as standard dispatch to find barrier points.
-std::vector<FusionGroup> build_fusion_groups(
+// Walk graph, identify segments and build interpreter programs.
+std::vector<Segment> build_segments(
     const ggml_cgraph * cgraph,
     bda_fn get_bda);
 
-// Generate GLSL for a fusion group (elementwise chain or reduction+tail).
-// Returns empty string if the group can't be JIT-compiled.
-std::string generate_group_shader(
-    const ggml_cgraph * cgraph,
-    const FusionGroup & group,
-    bda_fn get_bda);
-
-// Compute signature for a single fusion group.
-std::string compute_group_signature(
-    const ggml_cgraph * cgraph,
-    const FusionGroup & group,
-    bda_fn get_bda);
+// Get the interpreter GLSL source (compiled once, reused for all tokens).
+const std::string & get_interpreter_glsl();
 
 // ===== Shared utilities =====
 
 std::vector<uint32_t> compile_glsl(
     const std::string & source,
-    const std::string & name = "jit_fused");
+    const std::string & name = "jit_interp");
 
 std::string get_cache_path(const std::string & signature);
 bool load_spirv_cache(const std::string & path, std::vector<uint32_t> & spirv);
