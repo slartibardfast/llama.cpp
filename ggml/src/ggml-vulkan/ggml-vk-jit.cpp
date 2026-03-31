@@ -118,7 +118,8 @@ static bool is_interpreter_op(const ggml_tensor * t) {
     case GGML_OP_CONT:
     case GGML_OP_RMS_NORM:
     case GGML_OP_L2_NORM:
-        return true;
+        // Only single-row reductions — multi-row needs per-row reduction
+        return (ggml_nelements(t) == (size_t)t->src[0]->ne[0]);
     case GGML_OP_UNARY: {
         auto uop = ggml_get_unary_op(t);
         return uop == GGML_UNARY_OP_SILU || uop == GGML_UNARY_OP_SIGMOID;
