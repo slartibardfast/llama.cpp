@@ -14442,13 +14442,26 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             auto segments = ggml_vk_jit::build_segments(cgraph, jit_get_bda);
 
             if (getenv("GGML_VK_JIT_DEBUG")) {
-                int n_interp = 0, n_std = 0, n_interp_ops = 0;
+                int n_interp = 0, n_std = 0, n_interp_ops = 0, n_std_ops = 0;
+                std::map<int, int> std_op_counts;
                 for (auto & s : segments) {
                     if (s.interpreter_eligible) { n_interp++; n_interp_ops += (int)s.program.size(); }
-                    else n_std++;
+                    else {
+                        n_std++;
+                        for (int i = s.start_node; i < s.end_node; i++) {
+                            auto * n = cgraph->nodes[i];
+                            if (ggml_is_empty(n) || n->op == GGML_OP_NONE || n->op == GGML_OP_VIEW ||
+                                n->op == GGML_OP_RESHAPE || n->op == GGML_OP_PERMUTE ||
+                                n->op == GGML_OP_TRANSPOSE) continue;
+                            std_op_counts[n->op]++;
+                            n_std_ops++;
+                        }
+                    }
                 }
-                fprintf(stderr, "ggml_vk_jit: %zu segments (%d interpreter [%d ops], %d standard)\n",
-                        segments.size(), n_interp, n_interp_ops, n_std);
+                fprintf(stderr, "ggml_vk_jit: %zu segments (%d interpreter [%d ops], %d standard [%d ops])\n",
+                        segments.size(), n_interp, n_interp_ops, n_std, n_std_ops);
+                for (auto & [op, cnt] : std_op_counts)
+                    fprintf(stderr, "  std: %s × %d\n", ggml_op_name((ggml_op)op), cnt);
             }
 
             // Ensure SSBO is large enough for the largest interpreter program
@@ -14466,33 +14479,59 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 ctx->device->jit_ssbo_size = max_ssbo_bytes;
             }
 
-            // Process all segments: interpreter or standard dispatch
+            // Count interpreter dispatches and pre-allocate descriptor sets
+            int n_interp_dispatches = 0;
+            for (auto & s : segments) {
+                if (s.interpreter_eligible && !s.program.empty()) n_interp_dispatches++;
+            }
+
+            // Pre-allocate all descriptor sets for interpreter dispatches at once
+            ctx->pipeline_descriptor_set_requirements = 0;
+            ctx->descriptor_set_idx = 0;
+            if (n_interp_dispatches > 0) {
+                ggml_pipeline_request_descriptor_sets(ctx, ctx->device->jit_interp_pipeline, n_interp_dispatches);
+                ggml_pipeline_allocate_descriptor_sets(ctx);
+            }
+
+            // Process all segments
             compute_ctx = ggml_vk_get_compute_ctx(ctx);
 
             for (auto & seg : segments) {
                 if (seg.interpreter_eligible && !seg.program.empty()) {
+                    // Barrier before interpreter: needed because standard dispatch may have
+                    // pending writes that the interpreter reads
+                    ggml_vk_sync_buffers(ctx, compute_ctx);
+
                     // Write program to SSBO
                     uint8_t * ptr = (uint8_t *)ctx->device->jit_ssbo_buf->ptr;
                     uint32_t num_ops = (uint32_t)seg.program.size();
                     memcpy(ptr, &num_ops, 4);
-                    memset(ptr + 4, 0, 4); // padding
+                    memset(ptr + 4, 0, 4);
                     memcpy(ptr + 8, seg.program.data(), num_ops * sizeof(ggml_vk_jit::JitOp));
 
-                    // Dispatch interpreter
                     uint32_t num_wgs = seg.needs_single_wg ? 1 : std::max(1u, (seg.max_ne + 255) / 256);
-                    ctx->pipeline_descriptor_set_requirements = 0;
-                    ctx->descriptor_set_idx = 0;
-                    ggml_pipeline_request_descriptor_sets(ctx, ctx->device->jit_interp_pipeline, 1);
-                    ggml_pipeline_allocate_descriptor_sets(ctx);
-                    ggml_vk_sync_buffers(ctx, compute_ctx);
                     struct { uint32_t dummy; } interp_pc = { 0 };
                     ggml_vk_dispatch_pipeline(ctx, compute_ctx,
                         ctx->device->jit_interp_pipeline,
                         { vk::DescriptorBufferInfo{ctx->device->jit_ssbo_buf->buffer, 0, (vk::DeviceSize)(8 + num_ops * sizeof(ggml_vk_jit::JitOp))} },
                         interp_pc,
                         { num_wgs, 1, 1 });
+
+                    // Register interpreter outputs with standard dispatch dependency tracker
+                    // so it properly inserts barriers before the next standard op that reads them
+                    ctx->unsynced_nodes_written.clear();
+                    ctx->unsynced_nodes_read.clear();
+                    for (int i = seg.start_node; i < seg.end_node; i++) {
+                        auto * n = cgraph->nodes[i];
+                        if (ggml_is_empty(n) || n->op == GGML_OP_NONE || n->op == GGML_OP_VIEW ||
+                            n->op == GGML_OP_RESHAPE || n->op == GGML_OP_PERMUTE || n->op == GGML_OP_TRANSPOSE) continue;
+                        ctx->unsynced_nodes_written.push_back(n);
+                        for (int s = 0; s < GGML_MAX_SRC; s++) {
+                            if (n->src[s]) ctx->unsynced_nodes_read.push_back(n->src[s]);
+                        }
+                    }
                 } else {
-                    // Standard dispatch for this segment's ops
+                    // Standard dispatch: ggml_vk_build_graph handles its own barriers
                     for (int i = seg.start_node; i < seg.end_node; i++) {
                         ggml_tensor * node = cgraph->nodes[i];
                         if (ggml_is_empty(node) || ggml_op_is_empty(node->op) || !node->buffer) continue;
