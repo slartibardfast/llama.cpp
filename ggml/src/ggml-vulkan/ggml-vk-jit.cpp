@@ -86,8 +86,8 @@ void main() {
                 FOut(op.dst).d[i] = FBuf(op.src0).d[i] * sc;
         }
 
+        memoryBarrier();
         barrier();
-        memoryBarrierBuffer();
     }
 }
 )";
@@ -97,18 +97,34 @@ const std::string & get_interpreter_glsl() { return interpreter_glsl; }
 // ========== Op Classification ==========
 
 bool is_interpreter_op(const ggml_tensor * t) {
+    // Interpreter only handles contiguous f32 tensors
+    if (t->type != GGML_TYPE_F32) return false;
+    if (t->src[0] && t->src[0]->type != GGML_TYPE_F32) return false;
+
     switch (t->op) {
     case GGML_OP_ADD:
+        // Element-wise only (no broadcasting)
+        if (!t->src[1] || t->src[1]->type != GGML_TYPE_F32) return false;
+        return ggml_nelements(t->src[0]) == ggml_nelements(t)
+            && ggml_nelements(t->src[1]) == ggml_nelements(t);
     case GGML_OP_MUL:
+        // Element-wise only (no broadcasting)
+        if (!t->src[1] || t->src[1]->type != GGML_TYPE_F32) return false;
+        return ggml_nelements(t->src[0]) == ggml_nelements(t)
+            && ggml_nelements(t->src[1]) == ggml_nelements(t);
     case GGML_OP_SCALE:
-    // CPY/CONT disabled — interpreter doesn't handle strided/type-converting copies
-        return false;
+        return true;
+    case GGML_OP_RMS_NORM:
+    case GGML_OP_L2_NORM:
+        // Single-row only — multi-row needs per-row reduction
+        return t->ne[1] == 1 && t->ne[2] == 1 && t->ne[3] == 1;
     case GGML_OP_UNARY: {
         auto uop = ggml_get_unary_op(t);
         return uop == GGML_UNARY_OP_SILU || uop == GGML_UNARY_OP_SIGMOID;
     }
     case GGML_OP_GLU:
-        return ggml_get_glu_op(t) == GGML_GLU_OP_SWIGLU && t->src[1] != nullptr;
+        if (ggml_get_glu_op(t) != GGML_GLU_OP_SWIGLU || !t->src[1]) return false;
+        return t->src[1]->type == GGML_TYPE_F32;
     default:
         return false;
     }
