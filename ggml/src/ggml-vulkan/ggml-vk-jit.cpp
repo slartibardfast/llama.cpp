@@ -36,17 +36,18 @@ struct Op {
     uint64_t src1;
     uint64_t dst;
     float param;
-    uint _pad;
+    uint ne0;  // row length for multi-row reductions (0 = same as ne)
 };
 
 layout(binding = 0, std430) readonly buffer Program { uint num_ops; uint _pad0; Op ops[]; };
 layout(push_constant) uniform PC { uint _dummy; };
 layout(local_size_x = 256) in;
 
-shared float smem[4];
+shared float smem[256];
 
 void main() {
     uint gid = gl_GlobalInvocationID.x;
+    uint tid = gl_LocalInvocationID.x;
     uint stride = gl_NumWorkGroups.x * 256u;
 
     for (uint p = 0u; p < num_ops; p++) {
@@ -67,23 +68,29 @@ void main() {
                 FOut(op.dst).d[i] = v;
             }
         } else if (op.type == OP_RMS_NORM || op.type == OP_L2_NORM) {
-            float sq = 0.0;
-            for (uint i = gl_LocalInvocationID.x; i < op.ne; i += 256u) {
-                float v = FBuf(op.src0).d[i]; sq += v * v;
+            uint row_len = (op.ne0 > 0u) ? op.ne0 : op.ne;
+            uint n_rows = op.ne / row_len;
+            for (uint row = 0u; row < n_rows; row++) {
+                uint base = row * row_len;
+                float sq = 0.0;
+                for (uint i = tid; i < row_len; i += 256u) {
+                    float v = FBuf(op.src0).d[base + i]; sq += v * v;
+                }
+                smem[tid] = sq;
+                barrier();
+                for (uint s = 128u; s > 0u; s >>= 1u) {
+                    if (tid < s) smem[tid] += smem[tid + s];
+                    barrier();
+                }
+                float sc;
+                if (op.type == OP_RMS_NORM)
+                    sc = inversesqrt(smem[0] / float(row_len) + op.param);
+                else
+                    sc = 1.0 / max(sqrt(smem[0]), op.param);
+                for (uint i = tid; i < row_len; i += 256u)
+                    FOut(op.dst).d[base + i] = FBuf(op.src0).d[base + i] * sc;
+                barrier();
             }
-            sq = subgroupAdd(sq);
-            if (gl_SubgroupInvocationID == 0u) smem[gl_SubgroupID] = sq;
-            barrier();
-            if (gl_LocalInvocationID.x == 0u)
-                smem[0] = smem[0] + smem[1] + smem[2] + smem[3];
-            barrier();
-            float sc;
-            if (op.type == OP_RMS_NORM)
-                sc = inversesqrt(smem[0] / float(op.ne) + op.param);
-            else
-                sc = 1.0 / max(sqrt(smem[0]), op.param);
-            for (uint i = gl_LocalInvocationID.x; i < op.ne; i += 256u)
-                FOut(op.dst).d[i] = FBuf(op.src0).d[i] * sc;
         }
 
         memoryBarrier();
@@ -114,9 +121,16 @@ bool is_interpreter_op(const ggml_tensor * t) {
             && ggml_nelements(t->src[1]) == ggml_nelements(t);
     case GGML_OP_SCALE:
         return true;
+    case GGML_OP_CPY:
+    case GGML_OP_CONT:
+        // f32→f32 contiguous, skip large cache-state copies (>32K elements)
+        if (ggml_nelements(t) > 32768) return false;
+        return ggml_is_contiguous(t) && ggml_is_contiguous(t->src[0])
+            && ggml_nelements(t->src[0]) == ggml_nelements(t);
     case GGML_OP_RMS_NORM:
     case GGML_OP_L2_NORM:
-        // Single-row only — multi-row needs per-row reduction
+        // Single-row only — multi-row L2_NORM uses fused_dual_l2_norm (128-thread)
+        // which has different float precision than our 256-thread tree reduction
         return t->ne[1] == 1 && t->ne[2] == 1 && t->ne[3] == 1;
     case GGML_OP_UNARY: {
         auto uop = ggml_get_unary_op(t);
@@ -144,9 +158,11 @@ bool build_jit_op(JitOp & out, const ggml_tensor * t, const bda_fn & get_bda) {
     case GGML_OP_SCALE:     out.type = OP_SCALE; memcpy(&out.param, t->op_params, 4); break;
     case GGML_OP_CPY:
     case GGML_OP_CONT:      out.type = OP_CPY; break;
-    case GGML_OP_RMS_NORM:  out.type = OP_RMS_NORM; memcpy(&out.param, t->op_params, 4); break;
+    case GGML_OP_RMS_NORM:  out.type = OP_RMS_NORM; memcpy(&out.param, t->op_params, 4);
+                             out.ne0 = (uint32_t)t->ne[0]; break;
     case GGML_OP_L2_NORM:   out.type = OP_L2_NORM; out.param = 1e-12f;
-                             if (t->op_params[0]) memcpy(&out.param, t->op_params, 4); break;
+                             if (t->op_params[0]) memcpy(&out.param, t->op_params, 4);
+                             out.ne0 = (uint32_t)t->ne[0]; break;
     case GGML_OP_UNARY:
         if (ggml_get_unary_op(t) == GGML_UNARY_OP_SILU) out.type = OP_SILU;
         else if (ggml_get_unary_op(t) == GGML_UNARY_OP_SIGMOID) out.type = OP_SIGMOID;
