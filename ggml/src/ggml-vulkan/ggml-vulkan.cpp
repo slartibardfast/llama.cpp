@@ -14711,6 +14711,12 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
 
                     uint32_t num_wgs = 1; // TODO: multi-WG needs inter-WG sync
                     compute_ctx = ggml_vk_get_compute_ctx(ctx);
+
+                    // Sync: ensure previous dispatches' writes are visible to interpreter reads
+                    ggml_vk_sync_buffers(ctx, compute_ctx);
+                    ctx->unsynced_nodes_written.clear();
+                    ctx->unsynced_nodes_read.clear();
+
                     ggml_pipeline_request_descriptor_sets(ctx, ctx->device->jit_interp_pipeline, 1);
                     struct { uint32_t dummy; } interp_pc = { 0 };
                     ggml_vk_dispatch_pipeline(ctx, compute_ctx,
@@ -14720,9 +14726,22 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                         interp_pc, { num_wgs, 1, 1 });
                     jit_ssbo_offset += aligned_bytes;
 
+                    // Register batch nodes in dependency tracking so subsequent dispatches barrier correctly
+                    for (int j = i; j < i + batch_nodes; j++) {
+                        const ggml_tensor * bnode = cgraph->nodes[j];
+                        if (ggml_is_empty(bnode) || bnode->op == GGML_OP_NONE || bnode->op == GGML_OP_VIEW ||
+                            bnode->op == GGML_OP_RESHAPE || bnode->op == GGML_OP_TRANSPOSE ||
+                            bnode->op == GGML_OP_PERMUTE) continue;
+                        ctx->unsynced_nodes_written.push_back(bnode);
+                        for (uint32_t s = 0; s < GGML_MAX_SRC; s++) {
+                            if (bnode->src[s]) ctx->unsynced_nodes_read.push_back(bnode->src[s]);
+                        }
+                    }
+
                     ctx->num_additional_fused_ops = batch_nodes - 1;
                     fusion_string = "JIT_INTERP";
                     std::fill_n(op_srcs_fused_elementwise, std::min(batch_nodes, 12), true);
+                    VK_LOG_DEBUG("JIT batch: " << batch_nodes << " nodes, " << program.size() << " ops at graph[" << i << "]");
                 }
             }
         }
