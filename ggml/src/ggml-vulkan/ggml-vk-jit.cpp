@@ -140,14 +140,15 @@ bool is_interpreter_op(const ggml_tensor * t) {
     case GGML_OP_CPY:
     case GGML_OP_CONT:
         if (!(mask & (1u << OP_CPY))) return false;
-        if (ggml_nelements(t) > 32768) return false;
         return ggml_is_contiguous(t) && ggml_is_contiguous(t->src[0])
             && ggml_nelements(t->src[0]) == ggml_nelements(t);
     case GGML_OP_RMS_NORM:
         if (!(mask & (1u << OP_RMS_NORM))) return false;
+        // Multi-row uses fused_gated_norm (128-thread WG) — different precision
         return t->ne[1] == 1 && t->ne[2] == 1 && t->ne[3] == 1;
     case GGML_OP_L2_NORM:
         if (!(mask & (1u << OP_L2_NORM))) return false;
+        // Multi-row uses fused_dual_l2_norm (128-thread WG) — different precision
         return t->ne[1] == 1 && t->ne[2] == 1 && t->ne[3] == 1;
     case GGML_OP_UNARY: {
         auto uop = ggml_get_unary_op(t);
