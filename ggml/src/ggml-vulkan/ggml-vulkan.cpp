@@ -14355,6 +14355,21 @@ static int32_t find_first_set(uint32_t x) {
     return ret;
 }
 
+// Phase 17c: count consecutive interpreter-eligible graph nodes starting at i.
+// Returns number of GRAPH NODES (including noops) to batch, or 0 if < 2 compute ops.
+static int jit_count_batch(const ggml_cgraph * cgraph, int start) {
+    int nodes = 0, ops = 0;
+    for (int i = start; i < cgraph->n_nodes; i++) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        if (ggml_is_empty(node) || node->op == GGML_OP_NONE || node->op == GGML_OP_VIEW ||
+            node->op == GGML_OP_RESHAPE || node->op == GGML_OP_TRANSPOSE ||
+            node->op == GGML_OP_PERMUTE) { nodes++; continue; }
+        if (!ggml_vk_jit::is_interpreter_op(node)) break;
+        nodes++; ops++;
+    }
+    return (ops >= 2) ? nodes : 0;
+}
+
 static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     VK_LOG_DEBUG("ggml_backend_vk_graph_compute(" << cgraph->n_nodes << " nodes)");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
@@ -14426,7 +14441,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ggml_vk_sync_buffers(ctx, compute_ctx);
     }
 
-    // Phase 17c: Dolphin-style GPU interpreter dispatch path
+    // Phase 17c: Compile interpreter pipeline on first use
     auto jit_get_bda = [&](const ggml_tensor * t) -> uint64_t {
         if (!t || !t->buffer || !t->buffer->context) return 0;
         auto * buf_ctx = (ggml_backend_vk_buffer_context *)t->buffer->context;
@@ -14436,148 +14451,28 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         return buf_ctx->dev_buffer->bda_addr + offset;
     };
 
-    if (ctx->device->jit_enabled && ctx->device->jit_warmup_tokens >= 2) {
-        // Compile interpreter pipeline on first use
-        if (!ctx->device->jit_interp_pipeline) {
-            auto spirv = ggml_vk_jit::compile_glsl(ggml_vk_jit::get_interpreter_glsl(), "jit_interp");
-            if (!spirv.empty()) {
-                ctx->device->jit_interp_pipeline = std::make_shared<vk_pipeline_struct>();
-                ctx->device->jit_interp_pipeline->name = "jit_interp";
-                ctx->device->jit_interp_pipeline->push_constant_size = sizeof(uint32_t);
-                ctx->device->jit_interp_pipeline->align = 1;
-                ggml_vk_create_pipeline_func(ctx->device, ctx->device->jit_interp_pipeline,
-                    spirv.size() * 4, spirv.data(), "main",
-                    1, {1, 1, 1}, {}, false, false, 0);
-                ctx->device->jit_interp_pipeline->wg_denoms = {1, 1, 1};
-                ctx->device->jit_interp_pipeline->parameter_count = 1;
-                fprintf(stderr, "ggml_vk_jit: interpreter pipeline compiled (%zu SPIR-V words)\n", spirv.size());
-            }
-        }
-
-        if (ctx->device->jit_interp_pipeline) {
-            auto segments = ggml_vk_jit::build_segments(cgraph, jit_get_bda);
-
-            if (getenv("GGML_VK_JIT_DEBUG")) {
-                int n_interp = 0, n_std = 0, n_interp_ops = 0, n_std_ops = 0;
-                std::map<int, int> std_op_counts;
-                for (auto & s : segments) {
-                    if (s.interpreter_eligible) { n_interp++; n_interp_ops += (int)s.program.size(); }
-                    else {
-                        n_std++;
-                        for (int i = s.start_node; i < s.end_node; i++) {
-                            auto * n = cgraph->nodes[i];
-                            if (ggml_is_empty(n) || n->op == GGML_OP_NONE || n->op == GGML_OP_VIEW ||
-                                n->op == GGML_OP_RESHAPE || n->op == GGML_OP_PERMUTE ||
-                                n->op == GGML_OP_TRANSPOSE) continue;
-                            std_op_counts[n->op]++;
-                            n_std_ops++;
-                        }
-                    }
-                }
-                fprintf(stderr, "ggml_vk_jit: %zu segments (%d interpreter [%d ops], %d standard [%d ops])\n",
-                        segments.size(), n_interp, n_interp_ops, n_std, n_std_ops);
-                for (auto & [op, cnt] : std_op_counts)
-                    fprintf(stderr, "  std: %s × %d\n", ggml_op_name((ggml_op)op), cnt);
-            }
-
-            // Ensure SSBO is large enough for the largest interpreter program
-            size_t max_ssbo_bytes = 0;
-            for (auto & s : segments) {
-                if (!s.interpreter_eligible) continue;
-                size_t needed = 8 + s.program.size() * sizeof(ggml_vk_jit::JitOp);
-                if (needed > max_ssbo_bytes) max_ssbo_bytes = needed;
-            }
-            max_ssbo_bytes = std::max(max_ssbo_bytes, (size_t)256);
-            if (max_ssbo_bytes > ctx->device->jit_ssbo_size) {
-                ctx->device->jit_ssbo_buf = ggml_vk_create_buffer_check(ctx->device, max_ssbo_bytes,
-                    vk::MemoryPropertyFlagBits::eDeviceLocal | vk::MemoryPropertyFlagBits::eHostVisible |
-                    vk::MemoryPropertyFlagBits::eHostCoherent);
-                ctx->device->jit_ssbo_size = max_ssbo_bytes;
-            }
-
-            // Pre-request descriptor sets for interpreter dispatches.
-            // Uses the SHARED pool (same layout for all pipelines).
-            // Standard dispatch ops request their own sets inside ggml_vk_build_graph.
-            // Both paths consume sequentially via ctx->descriptor_set_idx++.
-            fprintf(stderr, "ggml_vk_jit: pre-requesting descriptor sets...\n"); fflush(stderr);
-            for (auto & s : segments) {
-                if (s.interpreter_eligible && !s.program.empty())
-                    ggml_pipeline_request_descriptor_sets(ctx, ctx->device->jit_interp_pipeline, 1);
-            }
-            fprintf(stderr, "ggml_vk_jit: descriptor sets ready, starting dispatch loop\n"); fflush(stderr);
-
-            // Process all segments
-            compute_ctx = ggml_vk_get_compute_ctx(ctx);
-
-            int seg_idx = 0;
-            for (auto & seg : segments) {
-                if (seg.interpreter_eligible && !seg.program.empty()) {
-                    if (getenv("GGML_VK_JIT_DEBUG"))
-                        fprintf(stderr, "ggml_vk_jit: seg %d interp [%zu ops] wgs=%u\n", seg_idx, seg.program.size(),
-                                seg.needs_single_wg ? 1 : std::max(1u, (seg.max_ne + 255) / 256));
-                    ggml_vk_sync_buffers(ctx, compute_ctx);
-
-                    // Write program to SSBO
-                    uint8_t * ptr = (uint8_t *)ctx->device->jit_ssbo_buf->ptr;
-                    uint32_t num_ops = (uint32_t)seg.program.size();
-                    memcpy(ptr, &num_ops, 4);
-                    memset(ptr + 4, 0, 4);
-                    memcpy(ptr + 8, seg.program.data(), num_ops * sizeof(ggml_vk_jit::JitOp));
-
-                    uint32_t num_wgs = seg.needs_single_wg ? 1 : std::max(1u, (seg.max_ne + 255) / 256);
-                    struct { uint32_t dummy; } interp_pc = { 0 };
-                    ggml_vk_dispatch_pipeline(ctx, compute_ctx,
-                        ctx->device->jit_interp_pipeline,
-                        { vk::DescriptorBufferInfo{ctx->device->jit_ssbo_buf->buffer, 0, (vk::DeviceSize)(8 + num_ops * sizeof(ggml_vk_jit::JitOp))} },
-                        interp_pc,
-                        { num_wgs, 1, 1 });
-
-                    // Register interpreter outputs with standard dispatch dependency tracker
-                    // so it properly inserts barriers before the next standard op that reads them
-                    ctx->unsynced_nodes_written.clear();
-                    ctx->unsynced_nodes_read.clear();
-                    for (int i = seg.start_node; i < seg.end_node; i++) {
-                        auto * n = cgraph->nodes[i];
-                        if (ggml_is_empty(n) || n->op == GGML_OP_NONE || n->op == GGML_OP_VIEW ||
-                            n->op == GGML_OP_RESHAPE || n->op == GGML_OP_PERMUTE || n->op == GGML_OP_TRANSPOSE) continue;
-                        ctx->unsynced_nodes_written.push_back(n);
-                        for (int s = 0; s < GGML_MAX_SRC; s++) {
-                            if (n->src[s]) ctx->unsynced_nodes_read.push_back(n->src[s]);
-                        }
-                    }
-                } else {
-                    if (getenv("GGML_VK_JIT_DEBUG"))
-                        fprintf(stderr, "ggml_vk_jit: seg %d standard [%d-%d]\n", seg_idx, seg.start_node, seg.end_node);
-                    for (int i = seg.start_node; i < seg.end_node; i++) {
-                        ggml_tensor * node = cgraph->nodes[i];
-                        if (ggml_is_empty(node) || ggml_op_is_empty(node->op) || !node->buffer) continue;
-                        if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) continue;
-
-                        compute_ctx = ggml_vk_get_compute_ctx(ctx);
-                        ggml_vk_build_graph(ctx, cgraph, i, cgraph->nodes[submit_node_idx],
-                            submit_node_idx, false, false, false);
-                    }
-                }
-                seg_idx++;
-            }
-
-            // Submit everything
-            if (!ctx->compute_ctx.expired()) {
-                compute_ctx = ctx->compute_ctx.lock();
-                ggml_vk_ctx_end(compute_ctx);
-                ggml_vk_submit(compute_ctx, ctx->device->fence);
-                VK_CHECK(ctx->device->device.waitForFences({ ctx->device->fence }, true, UINT64_MAX),
-                         "JIT waitForFences");
-                ctx->device->device.resetFences({ ctx->device->fence });
-            }
-            ctx->compute_ctx.reset();
-            ctx->last_total_mul_mat_bytes = 0;
-            ctx->device->jit_warmup_tokens++;
-            return GGML_STATUS_SUCCESS;
-        }
-    }
     if (ctx->device->jit_enabled) {
         ctx->device->jit_warmup_tokens++;
+    }
+    if (ctx->device->jit_enabled && ctx->device->jit_warmup_tokens >= 3 && !ctx->device->jit_interp_pipeline) {
+        auto spirv = ggml_vk_jit::compile_glsl(ggml_vk_jit::get_interpreter_glsl(), "jit_interp");
+        if (!spirv.empty()) {
+            ctx->device->jit_interp_pipeline = std::make_shared<vk_pipeline_struct>();
+            ctx->device->jit_interp_pipeline->name = "jit_interp";
+            ctx->device->jit_interp_pipeline->push_constant_size = sizeof(uint32_t);
+            ctx->device->jit_interp_pipeline->align = 1;
+            ggml_vk_create_pipeline_func(ctx->device, ctx->device->jit_interp_pipeline,
+                spirv.size() * 4, spirv.data(), "main",
+                1, {1, 1, 1}, {}, false, false, 0);
+            ctx->device->jit_interp_pipeline->wg_denoms = {1, 1, 1};
+            ctx->device->jit_interp_pipeline->parameter_count = 1;
+            // Allocate SSBO (4KB covers ~100 ops × 40 bytes)
+            ctx->device->jit_ssbo_buf = ggml_vk_create_buffer_check(ctx->device, 4096,
+                vk::MemoryPropertyFlagBits::eDeviceLocal | vk::MemoryPropertyFlagBits::eHostVisible |
+                vk::MemoryPropertyFlagBits::eHostCoherent);
+            ctx->device->jit_ssbo_size = 4096;
+            fprintf(stderr, "ggml_vk_jit: interpreter pipeline compiled (%zu SPIR-V words)\n", spirv.size());
+        }
     }
 
     // Submit after enough work has accumulated, to overlap CPU cmdbuffer generation with GPU execution.
@@ -14787,6 +14682,60 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             }
         }
 
+        // Phase 17c: JIT interpreter fusion — batch consecutive interpreter-eligible ops
+        if (!fusion_string && ctx->device->jit_interp_pipeline && ctx->device->jit_ssbo_buf
+            && ggml_vk_jit::is_interpreter_op(cgraph->nodes[i])) {
+            int batch_nodes = jit_count_batch(cgraph, i);
+            if (batch_nodes > 0) {
+                // Build JitOp program from the batch
+                std::vector<ggml_vk_jit::JitOp> program;
+                uint32_t max_ne = 0;
+                bool needs_single_wg = false;
+                for (int j = i; j < i + batch_nodes; j++) {
+                    const ggml_tensor * node = cgraph->nodes[j];
+                    if (ggml_is_empty(node) || node->op == GGML_OP_NONE || node->op == GGML_OP_VIEW ||
+                        node->op == GGML_OP_RESHAPE || node->op == GGML_OP_TRANSPOSE ||
+                        node->op == GGML_OP_PERMUTE) continue;
+                    ggml_vk_jit::JitOp op;
+                    if (ggml_vk_jit::build_jit_op(op, node, jit_get_bda)) {
+                        program.push_back(op);
+                        if (op.ne > max_ne) max_ne = op.ne;
+                        if (node->op == GGML_OP_RMS_NORM || node->op == GGML_OP_L2_NORM) needs_single_wg = true;
+                    }
+                }
+
+                if (!program.empty()) {
+                    // Write SSBO program
+                    size_t needed = 8 + program.size() * sizeof(ggml_vk_jit::JitOp);
+                    if (needed > ctx->device->jit_ssbo_size) {
+                        ctx->device->jit_ssbo_buf = ggml_vk_create_buffer_check(ctx->device, needed * 2,
+                            vk::MemoryPropertyFlagBits::eDeviceLocal | vk::MemoryPropertyFlagBits::eHostVisible |
+                            vk::MemoryPropertyFlagBits::eHostCoherent);
+                        ctx->device->jit_ssbo_size = needed * 2;
+                    }
+                    uint8_t * ptr = (uint8_t *)ctx->device->jit_ssbo_buf->ptr;
+                    uint32_t num_ops = (uint32_t)program.size();
+                    memcpy(ptr, &num_ops, 4);
+                    memset(ptr + 4, 0, 4);
+                    memcpy(ptr + 8, program.data(), num_ops * sizeof(ggml_vk_jit::JitOp));
+
+                    // Request descriptor set from shared pool and dispatch
+                    uint32_t num_wgs = needs_single_wg ? 1 : std::max(1u, (max_ne + 255) / 256);
+                    compute_ctx = ggml_vk_get_compute_ctx(ctx);
+                    ggml_pipeline_request_descriptor_sets(ctx, ctx->device->jit_interp_pipeline, 1);
+                    struct { uint32_t dummy; } interp_pc = { 0 };
+                    ggml_vk_dispatch_pipeline(ctx, compute_ctx,
+                        ctx->device->jit_interp_pipeline,
+                        { vk::DescriptorBufferInfo{ctx->device->jit_ssbo_buf->buffer, 0, (vk::DeviceSize)needed} },
+                        interp_pc, { num_wgs, 1, 1 });
+
+                    ctx->num_additional_fused_ops = batch_nodes - 1;
+                    fusion_string = "JIT_INTERP";
+                    std::fill_n(op_srcs_fused_elementwise, std::min(batch_nodes, 12), true);
+                }
+            }
+        }
+
         // Signal the almost_ready fence when the graph is mostly complete (< 20% remaining)
         bool almost_ready = (cgraph->n_nodes - i) < cgraph->n_nodes / 5;
         bool submit = (submitted_nodes >= nodes_per_submit) ||
@@ -14794,7 +14743,9 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                       (i + ctx->num_additional_fused_ops >= last_node) ||
                       (almost_ready && !ctx->almost_ready_fence_pending);
 
-        bool enqueued = ggml_vk_build_graph(ctx, cgraph, i, cgraph->nodes[submit_node_idx], submit_node_idx, i + ctx->num_additional_fused_ops >= last_node, almost_ready, submit);
+        bool enqueued = fusion_string && strcmp(fusion_string, "JIT_INTERP") == 0
+            ? true  // interpreter already dispatched
+            : ggml_vk_build_graph(ctx, cgraph, i, cgraph->nodes[submit_node_idx], submit_node_idx, i + ctx->num_additional_fused_ops >= last_node, almost_ready, submit);
 
         if (vk_perf_logger_enabled && enqueued) {
             compute_ctx = ggml_vk_get_compute_ctx(ctx);
