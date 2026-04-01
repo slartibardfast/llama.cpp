@@ -144,12 +144,14 @@ bool is_interpreter_op(const ggml_tensor * t) {
             && ggml_nelements(t->src[0]) == ggml_nelements(t);
     case GGML_OP_RMS_NORM:
         if (!(mask & (1u << OP_RMS_NORM))) return false;
-        // Multi-row uses fused_gated_norm (128-thread WG) — different precision
+        // Multi-row: standard fuses RMS_NORM+MUL via fused_gated_norm (128-thread)
+        // Intercepting steals from that fused path → precision mismatch
         return t->ne[1] == 1 && t->ne[2] == 1 && t->ne[3] == 1;
     case GGML_OP_L2_NORM:
         if (!(mask & (1u << OP_L2_NORM))) return false;
-        // Multi-row uses fused_dual_l2_norm (128-thread WG) — different precision
-        return t->ne[1] == 1 && t->ne[2] == 1 && t->ne[3] == 1;
+        // Multi-row OK: graph nodes are plain GGML_OP_L2_NORM, dispatched via
+        // l2_norm_f32 (512-thread). Our 256-thread tree reduction matches from s=64.
+        return true;
     case GGML_OP_UNARY: {
         auto uop = ggml_get_unary_op(t);
         if (uop == GGML_UNARY_OP_SILU) return !!(mask & (1u << OP_SILU));
