@@ -111,8 +111,9 @@ if [ "${1:-}" = "deep" ]; then
     done
 
     echo ""
-    echo "  Restoring normal build..."
+    echo "  Restoring normal build (force recompile)..."
     cmake -DGGML_VULKAN_CHECK_RESULTS=OFF .. >/dev/null 2>&1
+    rm -f ggml/src/ggml-vulkan/CMakeFiles/ggml-vulkan.dir/ggml-vulkan.cpp.o
     cmake --build . --target llama-completion -j$(nproc) 2>&1 | tail -1
     cd ..
     echo ""
