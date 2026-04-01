@@ -2,8 +2,6 @@
 #include "ggml.h"
 #include "ggml-impl.h"
 
-#include <sstream>
-#include <iomanip>
 #include <filesystem>
 #include <fstream>
 #include <cstring>
@@ -55,7 +53,6 @@ void main() {
         Op op = ops[p];
 
         if (op.type <= OP_SWIGLU_SPLIT) {
-            // Elementwise — grid-stride, all threads participate
             for (uint i = gid; i < op.ne; i += stride) {
                 float v = FBuf(op.src0).d[i];
                 switch (op.type) {
@@ -70,11 +67,9 @@ void main() {
                 FOut(op.dst).d[i] = v;
             }
         } else if (op.type == OP_RMS_NORM || op.type == OP_L2_NORM) {
-            // Reduction — single WG only (256 threads, 4 subgroups)
             float sq = 0.0;
             for (uint i = gl_LocalInvocationID.x; i < op.ne; i += 256u) {
-                float v = FBuf(op.src0).d[i];
-                sq += v * v;
+                float v = FBuf(op.src0).d[i]; sq += v * v;
             }
             sq = subgroupAdd(sq);
             if (gl_SubgroupInvocationID == 0u) smem[gl_SubgroupID] = sq;
@@ -99,26 +94,19 @@ void main() {
 
 const std::string & get_interpreter_glsl() { return interpreter_glsl; }
 
-// ========== Helpers ==========
+// ========== Op Classification ==========
 
-static bool is_noop(const ggml_tensor * t) {
-    return !t || ggml_is_empty(t) ||
-           t->op == GGML_OP_NONE || t->op == GGML_OP_VIEW ||
-           t->op == GGML_OP_RESHAPE || t->op == GGML_OP_TRANSPOSE ||
-           t->op == GGML_OP_PERMUTE;
-}
-
-// Can the interpreter handle this op?
-static bool is_interpreter_op(const ggml_tensor * t) {
+bool is_interpreter_op(const ggml_tensor * t) {
     switch (t->op) {
     case GGML_OP_ADD:
     case GGML_OP_MUL:
     case GGML_OP_SCALE:
     case GGML_OP_CPY:
     case GGML_OP_CONT:
+        return true;
     case GGML_OP_RMS_NORM:
     case GGML_OP_L2_NORM:
-        // Only single-row reductions — multi-row needs per-row reduction
+        // Only single-row reductions
         return (ggml_nelements(t) == (size_t)t->src[0]->ne[0]);
     case GGML_OP_UNARY: {
         auto uop = ggml_get_unary_op(t);
@@ -131,12 +119,7 @@ static bool is_interpreter_op(const ggml_tensor * t) {
     }
 }
 
-static bool is_reduction(const ggml_tensor * t) {
-    return t->op == GGML_OP_RMS_NORM || t->op == GGML_OP_L2_NORM;
-}
-
-// Build a JitOp from a tensor node
-static bool build_jit_op(JitOp & out, const ggml_tensor * t, bda_fn & get_bda) {
+bool build_jit_op(JitOp & out, const ggml_tensor * t, const bda_fn & get_bda) {
     out = {};
     out.dst = get_bda(t);
     out.src0 = t->src[0] ? get_bda(t->src[0]) : 0;
@@ -169,113 +152,6 @@ static bool build_jit_op(JitOp & out, const ggml_tensor * t, bda_fn & get_bda) {
     return true;
 }
 
-// ========== Segment Builder ==========
-
-// Check if two tensors share overlapping memory
-static bool tensors_overlap(const ggml_tensor * a, const ggml_tensor * b) {
-    if (!a || !b || !a->data || !b->data) return false;
-    auto a0 = (uintptr_t)a->data, a1 = a0 + ggml_nbytes(a);
-    auto b0 = (uintptr_t)b->data, b1 = b0 + ggml_nbytes(b);
-    return a0 < b1 && b0 < a1;
-}
-
-static bool overlaps_any(const ggml_tensor * t, const std::vector<const ggml_tensor *> & list) {
-    for (const auto * o : list)
-        if (tensors_overlap(t, o)) return true;
-    return false;
-}
-
-std::vector<Segment> build_segments(const ggml_cgraph * cgraph, bda_fn get_bda) {
-    std::vector<Segment> segments;
-    std::vector<const ggml_tensor *> unsynced_written, unsynced_read;
-
-    Segment cur;
-    cur.start_node = 0;
-    cur.interpreter_eligible = true;
-    cur.needs_single_wg = false;
-    cur.max_ne = 0;
-
-    auto finish_segment = [&](int end_node) {
-        cur.end_node = end_node;
-        // Only mark eligible if we have ops AND all ops built successfully
-        if (cur.program.empty()) cur.interpreter_eligible = false;
-        segments.push_back(std::move(cur));
-        cur = {};
-        cur.start_node = end_node;
-        cur.interpreter_eligible = true;
-        cur.needs_single_wg = false;
-        cur.max_ne = 0;
-    };
-
-    for (int i = 0; i < cgraph->n_nodes; i++) {
-        const ggml_tensor * node = cgraph->nodes[i];
-        if (is_noop(node)) continue;
-
-        // Dependency check: need barrier?
-        bool need_sync = false;
-        if (overlaps_any(node, unsynced_read) || overlaps_any(node, unsynced_written))
-            need_sync = true;
-        for (int s = 0; s < GGML_MAX_SRC && !need_sync; s++) {
-            if (node->src[s] && overlaps_any(node->src[s], unsynced_written))
-                need_sync = true;
-        }
-
-        if (need_sync) {
-            finish_segment(i);
-            unsynced_written.clear();
-            unsynced_read.clear();
-        }
-
-        // Split at interpreter/standard boundaries to maximize interpreter coverage.
-        // DO NOT clear unsynced lists at splits — dependency tracking continues.
-        if (is_interpreter_op(node)) {
-            if (!cur.interpreter_eligible && cur.start_node < i) {
-                finish_segment(i);  // finish standard segment, start interpreter
-            }
-            cur.interpreter_eligible = true;
-            JitOp op;
-            if (build_jit_op(op, node, get_bda)) {
-                cur.program.push_back(op);
-                if (op.ne > cur.max_ne) cur.max_ne = op.ne;
-                if (is_reduction(node)) cur.needs_single_wg = true;
-            }
-        } else {
-            if (cur.interpreter_eligible && !cur.program.empty()) {
-                finish_segment(i);  // finish interpreter segment, start standard
-            }
-            cur.interpreter_eligible = false;
-        }
-
-        // Track dependencies
-        unsynced_written.push_back(node);
-        for (int s = 0; s < GGML_MAX_SRC; s++) {
-            if (node->src[s]) unsynced_read.push_back(node->src[s]);
-        }
-    }
-    finish_segment(cgraph->n_nodes);
-
-    // Merge consecutive interpreter-eligible segments.
-    // The interpreter's barrier()+memoryBarrierBuffer() between ops replaces the
-    // hardware barrier between segments. Safe because:
-    // - Elementwise: each thread reads what it wrote (no cross-WG dependency)
-    // - Reductions: forces single-WG dispatch (all threads cooperate via barrier())
-    // When merging, if ANY segment needs single-WG, the merged segment does too.
-    std::vector<Segment> merged;
-    for (auto & s : segments) {
-        if (!merged.empty() && merged.back().interpreter_eligible && s.interpreter_eligible) {
-            auto & prev = merged.back();
-            prev.end_node = s.end_node;
-            prev.program.insert(prev.program.end(), s.program.begin(), s.program.end());
-            if (s.max_ne > prev.max_ne) prev.max_ne = s.max_ne;
-            if (s.needs_single_wg) prev.needs_single_wg = true;
-        } else {
-            merged.push_back(std::move(s));
-        }
-    }
-
-    return merged;
-}
-
 // ========== SPIR-V Compilation & Cache ==========
 
 #ifdef GGML_VULKAN_JIT_SHADERC
@@ -287,8 +163,6 @@ std::vector<uint32_t> compile_glsl(const std::string & source, const std::string
     auto result = compiler.CompileGlslToSpv(source, shaderc_compute_shader, name.c_str(), options);
     if (result.GetCompilationStatus() != shaderc_compilation_status_success) {
         fprintf(stderr, "ggml_vk_jit: compilation failed:\n%s\n", result.GetErrorMessage().c_str());
-        FILE * dbg = fopen("/tmp/jit_debug.glsl", "w");
-        if (dbg) { fputs(source.c_str(), dbg); fclose(dbg); }
         return {};
     }
     return { result.begin(), result.end() };
