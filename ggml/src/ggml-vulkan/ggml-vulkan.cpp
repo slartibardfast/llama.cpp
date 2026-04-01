@@ -14709,7 +14709,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                     memset(ptr + 4, 0, 4);
                     memcpy(ptr + 8, program.data(), num_ops * sizeof(ggml_vk_jit::JitOp));
 
-                    uint32_t num_wgs = needs_single_wg ? 1 : std::max(1u, (max_ne + 255) / 256);
+                    uint32_t num_wgs = 1; // TODO: multi-WG needs inter-WG sync
                     compute_ctx = ggml_vk_get_compute_ctx(ctx);
                     ggml_pipeline_request_descriptor_sets(ctx, ctx->device->jit_interp_pipeline, 1);
                     struct { uint32_t dummy; } interp_pc = { 0 };

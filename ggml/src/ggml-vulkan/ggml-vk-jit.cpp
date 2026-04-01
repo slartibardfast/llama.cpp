@@ -101,13 +101,8 @@ bool is_interpreter_op(const ggml_tensor * t) {
     case GGML_OP_ADD:
     case GGML_OP_MUL:
     case GGML_OP_SCALE:
-    case GGML_OP_CPY:
-    case GGML_OP_CONT:
-        return true;
-    case GGML_OP_RMS_NORM:
-    case GGML_OP_L2_NORM:
-        // Only single-row reductions
-        return (ggml_nelements(t) == (size_t)t->src[0]->ne[0]);
+    // CPY/CONT disabled — interpreter doesn't handle strided/type-converting copies
+        return false;
     case GGML_OP_UNARY: {
         auto uop = ggml_get_unary_op(t);
         return uop == GGML_UNARY_OP_SILU || uop == GGML_UNARY_OP_SIGMOID;
