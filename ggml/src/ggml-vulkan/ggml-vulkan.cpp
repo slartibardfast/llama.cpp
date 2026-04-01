@@ -14454,6 +14454,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     if (ctx->device->jit_enabled) {
         ctx->device->jit_warmup_tokens++;
     }
+    size_t jit_ssbo_offset = 0;  // Track SSBO write position for this token
     if (ctx->device->jit_enabled && ctx->device->jit_warmup_tokens >= 3 && !ctx->device->jit_interp_pipeline) {
         auto spirv = ggml_vk_jit::compile_glsl(ggml_vk_jit::get_interpreter_glsl(), "jit_interp");
         if (!spirv.empty()) {
@@ -14705,29 +14706,35 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 }
 
                 if (!program.empty()) {
-                    // Write SSBO program
-                    size_t needed = 8 + program.size() * sizeof(ggml_vk_jit::JitOp);
-                    if (needed > ctx->device->jit_ssbo_size) {
-                        ctx->device->jit_ssbo_buf = ggml_vk_create_buffer_check(ctx->device, needed * 2,
+                    // Write SSBO program at sequential offset (each batch gets its own slot)
+                    size_t prog_bytes = 8 + program.size() * sizeof(ggml_vk_jit::JitOp);
+                    // Align to 16 bytes for buffer offset alignment
+                    size_t aligned_bytes = (prog_bytes + 15) & ~15;
+                    size_t total_needed = jit_ssbo_offset + aligned_bytes;
+                    if (total_needed > ctx->device->jit_ssbo_size) {
+                        size_t new_size = std::max(total_needed * 2, (size_t)16384);
+                        ctx->device->jit_ssbo_buf = ggml_vk_create_buffer_check(ctx->device, new_size,
                             vk::MemoryPropertyFlagBits::eDeviceLocal | vk::MemoryPropertyFlagBits::eHostVisible |
                             vk::MemoryPropertyFlagBits::eHostCoherent);
-                        ctx->device->jit_ssbo_size = needed * 2;
+                        ctx->device->jit_ssbo_size = new_size;
+                        jit_ssbo_offset = 0;  // new buffer, reset offset
                     }
-                    uint8_t * ptr = (uint8_t *)ctx->device->jit_ssbo_buf->ptr;
+                    uint8_t * ptr = (uint8_t *)ctx->device->jit_ssbo_buf->ptr + jit_ssbo_offset;
                     uint32_t num_ops = (uint32_t)program.size();
                     memcpy(ptr, &num_ops, 4);
                     memset(ptr + 4, 0, 4);
                     memcpy(ptr + 8, program.data(), num_ops * sizeof(ggml_vk_jit::JitOp));
 
-                    // Request descriptor set from shared pool and dispatch
                     uint32_t num_wgs = needs_single_wg ? 1 : std::max(1u, (max_ne + 255) / 256);
                     compute_ctx = ggml_vk_get_compute_ctx(ctx);
                     ggml_pipeline_request_descriptor_sets(ctx, ctx->device->jit_interp_pipeline, 1);
                     struct { uint32_t dummy; } interp_pc = { 0 };
                     ggml_vk_dispatch_pipeline(ctx, compute_ctx,
                         ctx->device->jit_interp_pipeline,
-                        { vk::DescriptorBufferInfo{ctx->device->jit_ssbo_buf->buffer, 0, (vk::DeviceSize)needed} },
+                        { vk::DescriptorBufferInfo{ctx->device->jit_ssbo_buf->buffer,
+                            (vk::DeviceSize)jit_ssbo_offset, (vk::DeviceSize)prog_bytes} },
                         interp_pc, { num_wgs, 1, 1 });
+                    jit_ssbo_offset += aligned_bytes;
 
                     ctx->num_additional_fused_ops = batch_nodes - 1;
                     fusion_string = "JIT_INTERP";
