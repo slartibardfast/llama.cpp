@@ -14349,6 +14349,8 @@ static int jit_count_batch(const ggml_cgraph * cgraph, int start) {
             node->op == GGML_OP_RESHAPE || node->op == GGML_OP_TRANSPOSE ||
             node->op == GGML_OP_PERMUTE) { nodes++; continue; }
         if (!ggml_vk_jit::is_interpreter_op(node)) break;
+        // Large ops (>64K elements) get standard dispatch for multi-WG parallelism
+        if (ggml_nelements(node) > 65536) break;
         nodes++; ops++;
     }
     return (ops >= 2) ? nodes : 0;
@@ -14668,8 +14670,12 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         }
 
         // Phase 17c: JIT interpreter fusion — batch consecutive interpreter-eligible ops
+#ifdef GGML_VULKAN_CHECK_RESULTS
+        if (false) { // When validating, let each op through standard dispatch for CPU comparison
+#else
         if (!fusion_string && ctx->device->jit_interp_pipeline && ctx->device->jit_ssbo_buf
             && ggml_vk_jit::is_interpreter_op(cgraph->nodes[i])) {
+#endif
             int batch_nodes = jit_count_batch(cgraph, i);
             if (batch_nodes > 0) {
                 // Build JitOp program from the batch
