@@ -14469,11 +14469,12 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 1, {1, 1, 1}, {}, false, false, 0);
             ctx->device->jit_interp_pipeline->wg_denoms = {1, 1, 1};
             ctx->device->jit_interp_pipeline->parameter_count = 1;
-            // Allocate SSBO (4KB covers ~100 ops × 40 bytes)
-            ctx->device->jit_ssbo_buf = ggml_vk_create_buffer_check(ctx->device, 4096,
+            // Allocate SSBO — 64KB to avoid mid-token reallocation that
+            // would invalidate descriptor sets bound to the old buffer
+            ctx->device->jit_ssbo_buf = ggml_vk_create_buffer_check(ctx->device, 65536,
                 vk::MemoryPropertyFlagBits::eDeviceLocal | vk::MemoryPropertyFlagBits::eHostVisible |
                 vk::MemoryPropertyFlagBits::eHostCoherent);
-            ctx->device->jit_ssbo_size = 4096;
+            ctx->device->jit_ssbo_size = 65536;
             fprintf(stderr, "ggml_vk_jit: interpreter pipeline compiled (%zu SPIR-V words)\n", spirv.size());
         }
     }
@@ -14717,14 +14718,11 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                     // Align to 16 bytes for buffer offset alignment
                     size_t aligned_bytes = (prog_bytes + 15) & ~15;
                     size_t total_needed = jit_ssbo_offset + aligned_bytes;
-                    if (total_needed > ctx->device->jit_ssbo_size) {
-                        size_t new_size = std::max(total_needed * 2, (size_t)16384);
-                        ctx->device->jit_ssbo_buf = ggml_vk_create_buffer_check(ctx->device, new_size,
-                            vk::MemoryPropertyFlagBits::eDeviceLocal | vk::MemoryPropertyFlagBits::eHostVisible |
-                            vk::MemoryPropertyFlagBits::eHostCoherent);
-                        ctx->device->jit_ssbo_size = new_size;
-                        jit_ssbo_offset = 0;  // new buffer, reset offset
-                    }
+                    // SSBO must be large enough for all batches in one token.
+                    // Reallocation mid-token would invalidate descriptor sets
+                    // bound to the old buffer in the current command buffer.
+                    GGML_ASSERT(total_needed <= ctx->device->jit_ssbo_size &&
+                        "JIT SSBO overflow — increase initial allocation");
                     uint8_t * ptr = (uint8_t *)ctx->device->jit_ssbo_buf->ptr + jit_ssbo_offset;
                     uint32_t num_ops = (uint32_t)program.size();
                     memcpy(ptr, &num_ops, 4);
@@ -14764,6 +14762,19 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                     fusion_string = "JIT_INTERP";
                     std::fill_n(op_srcs_fused_elementwise, std::min(batch_nodes, 12), true);
                     VK_LOG_DEBUG("JIT batch: " << batch_nodes << " nodes, " << program.size() << " ops at graph[" << i << "]");
+                    if (getenv("GGML_VK_JIT_LOG")) {
+                        fprintf(stderr, "JIT[%d] %d/%zu:", i, batch_nodes, program.size());
+                        for (int j = i; j < i + batch_nodes; j++) {
+                            auto *n = cgraph->nodes[j];
+                            if (ggml_is_empty(n) || n->op == GGML_OP_NONE || n->op == GGML_OP_VIEW ||
+                                n->op == GGML_OP_RESHAPE || n->op == GGML_OP_TRANSPOSE ||
+                                n->op == GGML_OP_PERMUTE) continue;
+                            fprintf(stderr, " %s[%lld", ggml_op_name(n->op), (long long)ggml_nelements(n));
+                            if (n->ne[1] > 1) fprintf(stderr, "=%lldx%lld", (long long)n->ne[0], (long long)n->ne[1]);
+                            fprintf(stderr, "]");
+                        }
+                        fprintf(stderr, "\n");
+                    }
                 }
             }
         }
