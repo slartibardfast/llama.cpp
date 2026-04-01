@@ -20,12 +20,12 @@ enum OpType : uint32_t {
 // SSBO program entry — must match GLSL struct layout (std430, 40 bytes)
 struct alignas(8) JitOp {
     uint32_t type;
-    uint32_t ne;
+    uint32_t ne;      // total elements
     uint64_t src0;
     uint64_t src1;
     uint64_t dst;
     float    param;
-    uint32_t _pad;
+    uint32_t ne0;     // row length (for multi-row reductions; 0 = same as ne)
 };
 static_assert(sizeof(JitOp) == 40, "JitOp must be 40 bytes for std430 layout");
 
