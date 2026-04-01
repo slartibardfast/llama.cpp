@@ -103,40 +103,60 @@ const std::string & get_interpreter_glsl() { return interpreter_glsl; }
 
 // ========== Op Classification ==========
 
+// GGML_VK_JIT_OPS bitmask: which op types the interpreter handles
+// Bits: 0=ADD 1=MUL 2=SILU 3=SIGMOID 4=SCALE 5=CPY 6=SWIGLU 7=RMS_NORM 8=L2_NORM
+// Default 0x1FF = all enabled. Set to isolate, e.g. "1" = ADD only, "3" = ADD+MUL
+static uint32_t jit_op_mask() {
+    static uint32_t mask = UINT32_MAX;
+    static bool init = false;
+    if (!init) {
+        init = true;
+        const char * env = getenv("GGML_VK_JIT_OPS");
+        if (env) mask = (uint32_t)strtoul(env, nullptr, 0);
+    }
+    return mask;
+}
+
 bool is_interpreter_op(const ggml_tensor * t) {
     // Interpreter only handles contiguous f32 tensors
     if (t->type != GGML_TYPE_F32) return false;
     if (t->src[0] && t->src[0]->type != GGML_TYPE_F32) return false;
+    uint32_t mask = jit_op_mask();
 
     switch (t->op) {
     case GGML_OP_ADD:
-        // Element-wise only (no broadcasting)
+        if (!(mask & (1u << OP_ADD))) return false;
         if (!t->src[1] || t->src[1]->type != GGML_TYPE_F32) return false;
         return ggml_nelements(t->src[0]) == ggml_nelements(t)
             && ggml_nelements(t->src[1]) == ggml_nelements(t);
     case GGML_OP_MUL:
-        // Element-wise only (no broadcasting)
+        if (!(mask & (1u << OP_MUL))) return false;
         if (!t->src[1] || t->src[1]->type != GGML_TYPE_F32) return false;
         return ggml_nelements(t->src[0]) == ggml_nelements(t)
             && ggml_nelements(t->src[1]) == ggml_nelements(t);
     case GGML_OP_SCALE:
+        if (!(mask & (1u << OP_SCALE))) return false;
         return true;
     case GGML_OP_CPY:
     case GGML_OP_CONT:
-        // f32→f32 contiguous, skip large cache-state copies (>32K elements)
+        if (!(mask & (1u << OP_CPY))) return false;
         if (ggml_nelements(t) > 32768) return false;
         return ggml_is_contiguous(t) && ggml_is_contiguous(t->src[0])
             && ggml_nelements(t->src[0]) == ggml_nelements(t);
     case GGML_OP_RMS_NORM:
+        if (!(mask & (1u << OP_RMS_NORM))) return false;
+        return t->ne[1] == 1 && t->ne[2] == 1 && t->ne[3] == 1;
     case GGML_OP_L2_NORM:
-        // Single-row only — multi-row L2_NORM uses fused_dual_l2_norm (128-thread)
-        // which has different float precision than our 256-thread tree reduction
+        if (!(mask & (1u << OP_L2_NORM))) return false;
         return t->ne[1] == 1 && t->ne[2] == 1 && t->ne[3] == 1;
     case GGML_OP_UNARY: {
         auto uop = ggml_get_unary_op(t);
-        return uop == GGML_UNARY_OP_SILU || uop == GGML_UNARY_OP_SIGMOID;
+        if (uop == GGML_UNARY_OP_SILU) return !!(mask & (1u << OP_SILU));
+        if (uop == GGML_UNARY_OP_SIGMOID) return !!(mask & (1u << OP_SIGMOID));
+        return false;
     }
     case GGML_OP_GLU:
+        if (!(mask & (1u << OP_SWIGLU_SPLIT))) return false;
         if (ggml_get_glu_op(t) != GGML_GLU_OP_SWIGLU || !t->src[1]) return false;
         return t->src[1]->type == GGML_TYPE_F32;
     default:
