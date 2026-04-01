@@ -226,17 +226,23 @@ std::vector<Segment> build_segments(const ggml_cgraph * cgraph, bda_fn get_bda) 
             unsynced_read.clear();
         }
 
-        // Try to add this op to the current segment's interpreter program
+        // Split at interpreter/standard boundaries to maximize interpreter coverage.
+        // DO NOT clear unsynced lists at splits — dependency tracking continues.
         if (is_interpreter_op(node)) {
+            if (!cur.interpreter_eligible && cur.start_node < i) {
+                finish_segment(i);  // finish standard segment, start interpreter
+            }
+            cur.interpreter_eligible = true;
             JitOp op;
             if (build_jit_op(op, node, get_bda)) {
                 cur.program.push_back(op);
                 if (op.ne > cur.max_ne) cur.max_ne = op.ne;
                 if (is_reduction(node)) cur.needs_single_wg = true;
-            } else {
-                cur.interpreter_eligible = false;
             }
         } else {
+            if (cur.interpreter_eligible && !cur.program.empty()) {
+                finish_segment(i);  // finish interpreter segment, start standard
+            }
             cur.interpreter_eligible = false;
         }
 
