@@ -15,19 +15,21 @@ enum OpType : uint32_t {
     OP_ADD = 0, OP_MUL = 1, OP_SILU = 2, OP_SIGMOID = 3,
     OP_SCALE = 4, OP_CPY = 5, OP_SWIGLU_SPLIT = 6,
     OP_RMS_NORM = 7, OP_L2_NORM = 8,
+    OP_FUSED_GATE_PREP = 9, OP_SSM_CONV = 10,
 };
 
-// SSBO program entry — must match GLSL struct layout (std430, 40 bytes)
+// SSBO program entry — must match GLSL struct layout (std430, 48 bytes)
 struct alignas(8) JitOp {
-    uint32_t type;
-    uint32_t ne;      // total elements
-    uint64_t src0;
-    uint64_t src1;
-    uint64_t dst;
-    float    param;
-    uint32_t ne0;     // row length (for multi-row reductions; 0 = same as ne)
+    uint32_t type;    //  0
+    uint32_t ne;      //  4  total elements
+    uint64_t src0;    //  8
+    uint64_t src1;    // 16
+    uint64_t dst;     // 24
+    float    param;   // 32
+    uint32_t ne0;     // 36  row length / num_v_heads / nr
+    uint64_t src2;    // 40  third source (fused_gate_prep: ssm_a, ssm_conv: unused)
 };
-static_assert(sizeof(JitOp) == 40, "JitOp must be 40 bytes for std430 layout");
+static_assert(sizeof(JitOp) == 48, "JitOp must be 48 bytes for std430 layout");
 
 // Check if a tensor op can be handled by the interpreter
 bool is_interpreter_op(const ggml_tensor * t);

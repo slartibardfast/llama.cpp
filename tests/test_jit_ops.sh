@@ -21,10 +21,11 @@ NTOKENS=${JIT_TEST_N:-20}
 ARGS="-p '$PROMPT' -n $NTOKENS -s 42 --simple-io -no-cnv --no-warmup -ngl 100 -c 256"
 TIMEOUT=${JIT_TEST_TIMEOUT:-30}
 
-NUM_OPS=9
+NUM_OPS=11
 declare -A OP_NAMES=(
     [0]="ADD" [1]="MUL" [2]="SILU" [3]="SIGMOID"
     [4]="SCALE" [5]="CPY" [6]="SWIGLU" [7]="RMS_NORM" [8]="L2_NORM"
+    [9]="FUSED_GATE_PREP" [10]="SSM_CONV"
 )
 
 TOTAL_PASS=0; TOTAL_FAIL=0; TOTAL_HANG=0
@@ -252,7 +253,7 @@ echo ""
 
 [ "${1:-}" = "quick" ] && {
     echo "--- Quick: All ops ---"
-    check "all (0x1ff)" "$(run 1 0x1ff)"
+    check "all (0x7ff)" "$(run 1 0x7ff)"
     echo ""
     echo "=== $TOTAL_PASS pass, $TOTAL_FAIL fail, $TOTAL_HANG hang ==="
     exit 0
@@ -272,7 +273,7 @@ echo ""
 echo "--- Phase 4: Cumulative ---"
 cumul=0
 CUMUL_FAIL_MASK=0
-for bit in 0 1 4 7 8 2 3 6 5; do  # ADD MUL SCALE RMS L2 SILU SIGMOID SWIGLU CPY
+for bit in 0 1 4 7 8 2 3 6 5 9 10; do  # ADD MUL SCALE RMS L2 SILU SIGMOID SWIGLU CPY GATE_PREP SSM_CONV
     cumul=$((cumul | (1 << bit)))
     name=${OP_NAMES[$bit]}
     result=$(run 1 "$cumul")
@@ -322,8 +323,8 @@ if (( CUMUL_FAIL_MASK > 0 )); then
 fi
 
 # Phase 6: All ops
-echo "--- Phase 6: All ops (0x1ff) ---"
-check "all ops" "$(run 1 0x1ff)"
+echo "--- Phase 6: All ops (0x7ff) ---"
+check "all ops" "$(run 1 0x7ff)"
 echo ""
 
 echo "=== Summary: $TOTAL_PASS pass, $TOTAL_FAIL fail, $TOTAL_HANG hang ==="
