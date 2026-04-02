@@ -144,9 +144,7 @@ bool is_interpreter_op(const ggml_tensor * t) {
             && ggml_nelements(t->src[0]) == ggml_nelements(t);
     case GGML_OP_RMS_NORM:
         if (!(mask & (1u << OP_RMS_NORM))) return false;
-        // Multi-row: standard fuses RMS_NORM+MUL via fused_gated_norm (128-thread)
-        // Intercepting steals from that fused path → precision mismatch
-        return t->ne[1] == 1 && t->ne[2] == 1 && t->ne[3] == 1;
+        return true;
     case GGML_OP_L2_NORM:
         if (!(mask & (1u << OP_L2_NORM))) return false;
         // Multi-row OK: graph nodes are plain GGML_OP_L2_NORM, dispatched via
