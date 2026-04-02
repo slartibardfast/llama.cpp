@@ -14349,7 +14349,8 @@ static int jit_count_batch(const ggml_cgraph * cgraph, int start) {
             node->op == GGML_OP_RESHAPE || node->op == GGML_OP_TRANSPOSE ||
             node->op == GGML_OP_PERMUTE) { nodes++; continue; }
         if (!ggml_vk_jit::is_interpreter_op(node)) break;
-        // Large ops (>64K elements) get standard dispatch for multi-WG parallelism
+        // Large ops get standard dispatch — 1 WG can't match multi-WG bandwidth,
+        // and mixing large elementwise with small reductions causes memory ordering issues
         if (ggml_nelements(node) > 65536) break;
         nodes++; ops++;
     }
