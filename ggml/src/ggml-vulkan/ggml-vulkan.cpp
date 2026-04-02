@@ -2815,6 +2815,31 @@ static void ggml_vk_sync_buffers(ggml_backend_vk_context* ctx, vk_context& subct
     );
 }
 
+// Check if a tensor overlaps in memory with any tensor in the unsynced list.
+// Used by both standard dispatch and JIT interpreter for dependency tracking.
+static bool ggml_vk_overlaps_unsynced(const ggml_tensor *node, const std::vector<const ggml_tensor *> &unsynced_nodes) {
+    if (unsynced_nodes.empty()) {
+        return false;
+    }
+    auto n_base = vk_tensor_offset(node) + node->view_offs;
+    auto n_size = ggml_nbytes(node);
+    ggml_backend_vk_buffer_context * a_buf_ctx = (ggml_backend_vk_buffer_context *)node->buffer->context;
+    vk_buffer a_buf = a_buf_ctx->dev_buffer;
+    for (auto &other : unsynced_nodes) {
+        ggml_backend_vk_buffer_context * o_buf_ctx = (ggml_backend_vk_buffer_context *)other->buffer->context;
+        vk_buffer o_buf = o_buf_ctx->dev_buffer;
+        if (a_buf == o_buf) {
+            auto o_base = vk_tensor_offset(other) + other->view_offs;
+            auto o_size = ggml_nbytes(other);
+            if ((o_base <= n_base && n_base < o_base + o_size) ||
+                (n_base <= o_base && o_base < n_base + n_size)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 static void ggml_vk_reset_event(vk_context& ctx, vk::Event& event) {
     VK_LOG_DEBUG("ggml_vk_set_event()");
 
@@ -4632,7 +4657,9 @@ static void ggml_vk_load_shaders(vk_device& device) {
 
             uint32_t lanes_per_column;
             if (S_V >= 128u && device->subgroup_clustered) {
-                lanes_per_column = 8u;
+                // GCN3 (subgroup_size=64): lanes_per_column=8 → ROWS_PER_LANE=16 → ~128 VGPRs (25% occ).
+                // LANES=64: ROWS_PER_LANE=2 → ~32 VGPRs → 8 waves (100% occ), best latency hiding.
+                lanes_per_column = (device->subgroup_size >= 64u) ? 64u : 8u;
             } else {
                 // Use largest power-of-two that divides both S_V and subgroup_size so that
                 // (1) S_V % lanes_per_column == 0 and (2) S_V % (subgroup_size / lanes_per_column) == 0.
@@ -12853,29 +12880,7 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         // Destination nodes are checked against both the written/read lists. Source nodes are only
         // checked against the written list. Two nodes overlap in memory if they come from the same
         // buffer and the tensor or view ranges overlap.
-        auto const &overlaps_unsynced = [&](const ggml_tensor *node, const std::vector<const ggml_tensor *> &unsynced_nodes) -> bool {
-            if (unsynced_nodes.size() == 0) {
-                return false;
-            }
-            auto n_base = vk_tensor_offset(node) + node->view_offs;
-            auto n_size = ggml_nbytes(node);
-            ggml_backend_vk_buffer_context * a_buf_ctx = (ggml_backend_vk_buffer_context *)node->buffer->context;
-            vk_buffer a_buf = a_buf_ctx->dev_buffer;
-            for (auto &other : unsynced_nodes) {
-                ggml_backend_vk_buffer_context * o_buf_ctx = (ggml_backend_vk_buffer_context *)other->buffer->context;
-                vk_buffer o_buf = o_buf_ctx->dev_buffer;
-                if (a_buf == o_buf) {
-                    auto o_base = vk_tensor_offset(other) + other->view_offs;
-                    auto o_size = ggml_nbytes(other);
-
-                    if ((o_base <= n_base && n_base < o_base + o_size) ||
-                        (n_base <= o_base && o_base < n_base + n_size)) {
-                        return true;
-                    }
-                }
-            }
-            return false;
-        };
+        auto const &overlaps_unsynced = ggml_vk_overlaps_unsynced;
 
         // For all fused ops, check if the destination node or any of the source
         // nodes require synchronization.
@@ -14733,10 +14738,31 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                     uint32_t num_wgs = 1; // TODO: multi-WG needs inter-WG sync
                     compute_ctx = ggml_vk_get_compute_ctx(ctx);
 
-                    // Sync: ensure previous dispatches' writes are visible to interpreter reads
-                    ggml_vk_sync_buffers(ctx, compute_ctx);
-                    ctx->unsynced_nodes_written.clear();
-                    ctx->unsynced_nodes_read.clear();
+                    // Check dependencies: only barrier if batch tensors overlap unsynced writes/reads
+                    {
+                        bool need_sync = false;
+                        for (int j = i; j < i + batch_nodes && !need_sync; j++) {
+                            const ggml_tensor * bnode = cgraph->nodes[j];
+                            if (ggml_is_empty(bnode) || bnode->op == GGML_OP_NONE || bnode->op == GGML_OP_VIEW ||
+                                bnode->op == GGML_OP_RESHAPE || bnode->op == GGML_OP_TRANSPOSE ||
+                                bnode->op == GGML_OP_PERMUTE) continue;
+                            if (ggml_vk_overlaps_unsynced(bnode, ctx->unsynced_nodes_read) ||
+                                ggml_vk_overlaps_unsynced(bnode, ctx->unsynced_nodes_written)) {
+                                need_sync = true;
+                                break;
+                            }
+                            for (uint32_t s = 0; s < GGML_MAX_SRC && !need_sync; s++) {
+                                if (bnode->src[s] && ggml_vk_overlaps_unsynced(bnode->src[s], ctx->unsynced_nodes_written)) {
+                                    need_sync = true;
+                                }
+                            }
+                        }
+                        if (need_sync) {
+                            ggml_vk_sync_buffers(ctx, compute_ctx);
+                        }
+                        ctx->unsynced_nodes_written.clear();
+                        ctx->unsynced_nodes_read.clear();
+                    }
 
                     ggml_pipeline_request_descriptor_sets(ctx, ctx->device->jit_interp_pipeline, 1);
                     struct { uint32_t dummy; } interp_pc = { 0 };
