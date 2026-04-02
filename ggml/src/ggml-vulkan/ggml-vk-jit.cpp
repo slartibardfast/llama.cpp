@@ -27,7 +27,11 @@ layout(buffer_reference, std430, buffer_reference_align = 4) writeonly buffer FO
 
 const uint OP_ADD = 0u, OP_MUL = 1u, OP_SILU = 2u, OP_SIGMOID = 3u;
 const uint OP_SCALE = 4u, OP_CPY = 5u, OP_SWIGLU_SPLIT = 6u;
+// Elementwise ops: 0-6 (processed in if branch with stride loop)
+// Reduction ops: 7-8 (processed in else-if branch with tree reduction)
+// Fused ops: 9-10 (processed in dedicated else-if branches)
 const uint OP_RMS_NORM = 7u, OP_L2_NORM = 8u;
+const uint OP_FUSED_GATE_PREP = 9u, OP_SSM_CONV = 10u;
 
 struct Op {
     uint type;
@@ -36,7 +40,8 @@ struct Op {
     uint64_t src1;
     uint64_t dst;
     float param;
-    uint ne0;  // row length for multi-row reductions (0 = same as ne)
+    uint ne0;
+    uint64_t src2;
 };
 
 layout(binding = 0, std430) readonly buffer Program { uint num_ops; uint _pad0; Op ops[]; };
@@ -53,7 +58,7 @@ void main() {
     for (uint p = 0u; p < num_ops; p++) {
         Op op = ops[p];
 
-        if (op.type <= OP_SWIGLU_SPLIT) {
+        if (op.type <= OP_SWIGLU_SPLIT || op.type == OP_FUSED_GATE_PREP) {
             for (uint i = gid; i < op.ne; i += stride) {
                 float v = FBuf(op.src0).d[i];
                 switch (op.type) {
@@ -64,8 +69,30 @@ void main() {
                 case OP_SCALE:        v = v * op.param; break;
                 case OP_CPY:          break;
                 case OP_SWIGLU_SPLIT: { float g = v; v = (g / (1.0 + exp(-g))) * FBuf(op.src1).d[i]; break; }
+                case OP_FUSED_GATE_PREP: {
+                    uint head = i % op.ne0;
+                    float x = v + FBuf(op.src1).d[head];
+                    v = ((x > 20.0) ? x : log(1.0 + exp(x))) * FBuf(op.src2).d[head];
+                    break;
+                }
                 }
                 FOut(op.dst).d[i] = v;
+            }
+        } else if (op.type == OP_SSM_CONV) {
+            // Strided dot product + silu, hardcoded nc=4
+            // param = row stride (as uint bits), src2 = group stride (as uint64)
+            uint row_stride = floatBitsToUint(op.param);
+            uint grp_stride = uint(op.src2);
+            for (uint idx = gid; idx < op.ne; idx += stride) {
+                uint i1 = idx % op.ne0;
+                uint i3 = idx / op.ne0;
+                uint s0 = i3 * grp_stride + i1 * row_stride;
+                uint s1 = i1 * 4u;
+                float sum = FBuf(op.src0).d[s0]   * FBuf(op.src1).d[s1]
+                          + FBuf(op.src0).d[s0+1] * FBuf(op.src1).d[s1+1]
+                          + FBuf(op.src0).d[s0+2] * FBuf(op.src1).d[s1+2]
+                          + FBuf(op.src0).d[s0+3] * FBuf(op.src1).d[s1+3];
+                FOut(op.dst).d[idx] = sum / (1.0 + exp(-sum));
             }
         } else if (op.type == OP_RMS_NORM || op.type == OP_L2_NORM) {
             uint row_len = (op.ne0 > 0u) ? op.ne0 : op.ne;
@@ -105,7 +132,8 @@ const std::string & get_interpreter_glsl() { return interpreter_glsl; }
 
 // GGML_VK_JIT_OPS bitmask: which op types the interpreter handles
 // Bits: 0=ADD 1=MUL 2=SILU 3=SIGMOID 4=SCALE 5=CPY 6=SWIGLU 7=RMS_NORM 8=L2_NORM
-// Default 0x1FF = all enabled. Set to isolate, e.g. "1" = ADD only, "3" = ADD+MUL
+//       9=FUSED_GATE_PREP 10=SSM_CONV
+// Default all enabled. Set to isolate, e.g. "1" = ADD only, "3" = ADD+MUL
 static uint32_t jit_op_mask() {
     static uint32_t mask = UINT32_MAX;
     static bool init = false;
@@ -156,6 +184,13 @@ bool is_interpreter_op(const ggml_tensor * t) {
         if (uop == GGML_UNARY_OP_SIGMOID) return !!(mask & (1u << OP_SIGMOID));
         return false;
     }
+    case GGML_OP_FUSED_GATE_PREP:
+        if (!(mask & (1u << OP_FUSED_GATE_PREP))) return false;
+        return t->src[0] && t->src[1] && t->src[2];
+    case GGML_OP_SSM_CONV:
+        if (!(mask & (1u << OP_SSM_CONV))) return false;
+        // Only generation (n_t=1), hardcoded nc=4
+        return t->ne[1] == 1 && t->src[0] && t->src[1];
     case GGML_OP_GLU:
         if (!(mask & (1u << OP_SWIGLU_SPLIT))) return false;
         if (ggml_get_glu_op(t) != GGML_GLU_OP_SWIGLU || !t->src[1]) return false;
@@ -170,6 +205,7 @@ bool build_jit_op(JitOp & out, const ggml_tensor * t, const bda_fn & get_bda) {
     out.dst = get_bda(t);
     out.src0 = t->src[0] ? get_bda(t->src[0]) : 0;
     out.src1 = t->src[1] ? get_bda(t->src[1]) : 0;
+    out.src2 = t->src[2] ? get_bda(t->src[2]) : 0;
     out.ne = (uint32_t)ggml_nelements(t);
     if (!out.dst || !out.src0) return false;
 
@@ -193,6 +229,21 @@ bool build_jit_op(JitOp & out, const ggml_tensor * t, const bda_fn & get_bda) {
         if (ggml_get_glu_op(t) != GGML_GLU_OP_SWIGLU || !t->src[1]) return false;
         out.type = OP_SWIGLU_SPLIT;
         if (!out.src1) return false;
+        break;
+    case GGML_OP_FUSED_GATE_PREP:
+        out.type = OP_FUSED_GATE_PREP;
+        if (!out.src1 || !out.src2) return false;
+        out.ne0 = (uint32_t)t->src[1]->ne[0]; // num_v_heads from dt_bias shape
+        break;
+    case GGML_OP_SSM_CONV:
+        out.type = OP_SSM_CONV;
+        out.ne = (uint32_t)(t->ne[0] * t->ne[2]); // nr * n_s
+        out.ne0 = (uint32_t)t->ne[0]; // nr
+        // Pack src0 strides: row stride in low 16, group stride in high 16
+        { uint32_t rs = (uint32_t)(t->src[0]->nb[1] / 4);
+          uint32_t gs = (uint32_t)(t->src[0]->nb[2] / 4);
+          memcpy(&out.param, &rs, 4);   // param = row stride (as float bits)
+          out.src2 = gs; }              // src2 = group stride (reuse as uint)
         break;
     default:
         return false;
