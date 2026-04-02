@@ -35,6 +35,7 @@ DispatchLoaderDynamic & ggml_vk_default_dispatcher();
 #include <map>
 #include <set>
 #include <unordered_map>
+#include <unordered_set>
 #include <memory>
 #include <mutex>
 #include <future>
@@ -850,6 +851,7 @@ struct vk_device_struct {
     uint32_t gdn_state_cache_layers = 0;
     uint32_t gdn_state_cache_elements = 0; // elements per layer
     uint32_t gdn_dispatch_idx = 0;         // reset per graph_compute
+    bool gdn_cache_initialized = false;    // Phase 20: true after first gen token populates BDA cache
     bool jit_enabled = false;
     int jit_warmup_tokens = 0;
     std::map<vk_conv2d_pipeline_state, vk_pipeline> pipeline_conv2d_f16_f32[CONV_SHAPE_COUNT];
@@ -10593,6 +10595,10 @@ static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& s
         if (ctx->device->gdn_state_cache_bda) {
             uint32_t layer_idx = ctx->device->gdn_dispatch_idx++;
             state_cache_bda = ctx->device->gdn_state_cache_bda + layer_idx * cache_per_layer;
+            // Phase 20: first gen token after prompt — init cache from binding, not from stale zeros
+            if (!ctx->device->gdn_cache_initialized) {
+                state_cache_bda |= 1;  // bit 0 = init flag: read binding, write cache + f32 dst
+            }
         }
     }
 
@@ -14541,6 +14547,44 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
     }
     size_t jit_ssbo_offset = 0;  // Track SSBO write position for this token
     ctx->device->gdn_dispatch_idx = 0; // Phase 19: reset per-token GDN layer counter
+
+    // Phase 20: detect prompt eval (n_tokens > 1) to reset cache init state
+    // On prompt eval, state is computed fresh — cache must re-init on next gen token
+    {
+        bool has_gdn = false;
+        bool is_generation = true;
+        for (int i = 0; i < cgraph->n_nodes && !has_gdn; i++) {
+            if (cgraph->nodes[i]->op == GGML_OP_GATED_DELTA_NET) {
+                has_gdn = true;
+                is_generation = (cgraph->nodes[i]->src[0]->ne[2] == 1); // n_seq_tokens == 1
+            }
+        }
+        if (has_gdn && !is_generation) {
+            ctx->device->gdn_cache_initialized = false;
+        }
+    }
+
+    // Phase 20: identify SSM state GET_ROWS and CPY nodes to skip when BDA cache is initialized
+    // These nodes are redundant: GDN reads/writes its own f16 BDA cache during generation
+    std::unordered_set<const ggml_tensor *> skip_ssm_nodes;
+    if (ctx->device->gdn_cache_initialized && ctx->device->gdn_state_cache) {
+        // Collect GDN result tensors and their state input sources
+        for (int i = 0; i < cgraph->n_nodes; i++) {
+            ggml_tensor * node = cgraph->nodes[i];
+            if (node->op == GGML_OP_GATED_DELTA_NET) {
+                // src[5] = state input (reshape of GET_ROWS output)
+                // src[5]->view_src = GET_ROWS output tensor → skip that GET_ROWS
+                if (node->src[5] && node->src[5]->view_src) {
+                    skip_ssm_nodes.insert(node->src[5]->view_src);
+                }
+            }
+            // CPY whose src is a view of a GDN result → SSM state writeback
+            if (node->op == GGML_OP_CPY && node->src[0] && node->src[0]->view_src &&
+                node->src[0]->view_src->op == GGML_OP_GATED_DELTA_NET) {
+                skip_ssm_nodes.insert(node);
+            }
+        }
+    }
     if (ctx->device->jit_enabled && ctx->device->jit_warmup_tokens >= 3 && !ctx->device->jit_interp_pipeline) {
         auto spirv = ggml_vk_jit::compile_glsl(ggml_vk_jit::get_interpreter_glsl(), "jit_interp");
         if (!spirv.empty()) {
@@ -14891,6 +14935,12 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                       (i + ctx->num_additional_fused_ops >= last_node) ||
                       (almost_ready && !ctx->almost_ready_fence_pending);
 
+        // Phase 20: skip SSM state I/O nodes when BDA cache handles state
+        if (!skip_ssm_nodes.empty() && skip_ssm_nodes.count(cgraph->nodes[i])) {
+            first_node_in_batch = true;
+            continue;
+        }
+
         bool enqueued = fusion_string && strcmp(fusion_string, "JIT_INTERP") == 0
             ? true  // interpreter already dispatched
             : ggml_vk_build_graph(ctx, cgraph, i, cgraph->nodes[submit_node_idx], submit_node_idx, i + ctx->num_additional_fused_ops >= last_node, almost_ready, submit);
@@ -14976,6 +15026,11 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             }
         }
         ctx->perf_logger->print_timings();
+    }
+
+    // Phase 20: mark BDA cache as initialized after first generation token
+    if (ctx->device->gdn_state_cache && ctx->device->gdn_dispatch_idx > 0 && !ctx->device->gdn_cache_initialized) {
+        ctx->device->gdn_cache_initialized = true;
     }
 
     if (!ctx->device->support_async) {

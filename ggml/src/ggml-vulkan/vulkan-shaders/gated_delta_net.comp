@@ -111,10 +111,16 @@ void main() {
     const uint state_size = S_V * S_V;
     const uint state_base = (seq_id * H + head_id) * state_size;
 
-    // State load: from f16 BDA cache if available, else f32 binding
+    // State cache protocol (state_cache push constant):
+    //   0              = no cache: read from binding, write f32 dst (prompt eval)
+    //   addr | 1       = init: read from binding, write cache + f32 dst (first gen token)
+    //   addr (aligned) = cached: read from cache, write cache only (subsequent gen tokens)
+    const uint64_t cache_addr = state_cache & ~uint64_t(1);
+    const bool cache_init = (state_cache & uint64_t(1)) != 0;
+
     float s_shard[ROWS_PER_LANE];
-    if (state_cache != 0) {
-        F16In sc = F16In(state_cache);
+    if (cache_addr != 0 && !cache_init) {
+        F16In sc = F16In(cache_addr);
         [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
             s_shard[r] = float(sc.d[state_base + col * S_V + r * LANES_PER_COLUMN + lane]);
         }
@@ -179,14 +185,18 @@ void main() {
         attn_off += S_V * H;
     }
 
-    // State write: to f16 BDA cache if available, always to f32 dst for graph compat
-    if (state_cache != 0) {
-        F16Out sc_out = F16Out(state_cache);
+    // State write: depends on cache mode
+    if (cache_addr != 0) {
+        // Write to f16 BDA cache
+        F16Out sc_out = F16Out(cache_addr);
         [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
             sc_out.d[state_base + col * S_V + r * LANES_PER_COLUMN + lane] = float16_t(s_shard[r]);
         }
     }
-    [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
-        data_dst[s_off + state_base + col * S_V + r * LANES_PER_COLUMN + lane] = FLOAT_TYPE(s_shard[r]);
+    if (cache_addr == 0 || cache_init) {
+        // Write f32 state to dst: required for prompt eval and first gen token (graph compat)
+        [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
+            data_dst[s_off + state_base + col * S_V + r * LANES_PER_COLUMN + lane] = FLOAT_TYPE(s_shard[r]);
+        }
     }
 }
