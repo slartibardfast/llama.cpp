@@ -829,6 +829,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_rwkv_wkv7_f32;
     // [size_idx][kda] where size_idx: 0=d32, 1=d64, 2=d128
     vk_pipeline pipeline_gated_delta_net[3][2];
+    vk_pipeline pipeline_gated_delta_net_f16s[3][2]; // Phase 19: f16 state variant
     vk_pipeline pipeline_ssm_scan_f32_d128;
     vk_pipeline pipeline_ssm_scan_f32_d256;
     vk_pipeline pipeline_ssm_conv_f32;
@@ -843,6 +844,12 @@ struct vk_device_struct {
     vk_pipeline jit_interp_pipeline;  // compiled interpreter shader
     vk_buffer jit_ssbo_buf;           // SSBO for interpreter program
     size_t jit_ssbo_size = 0;         // allocated SSBO size
+    vk_buffer gdn_state_cache;        // Phase 19: f16 BDA state cache for GDN
+    size_t gdn_state_cache_size = 0;  // total f16 state cache bytes
+    uint64_t gdn_state_cache_bda = 0; // BDA address of state cache
+    uint32_t gdn_state_cache_layers = 0;
+    uint32_t gdn_state_cache_elements = 0; // elements per layer
+    uint32_t gdn_dispatch_idx = 0;         // reset per graph_compute
     bool jit_enabled = false;
     int jit_warmup_tokens = 0;
     std::map<vk_conv2d_pipeline_state, vk_pipeline> pipeline_conv2d_f16_f32[CONV_SHAPE_COUNT];
@@ -1493,6 +1500,7 @@ struct vk_op_gated_delta_net_push_constants {
     uint32_t sb1, sb2, sb3;
     uint32_t neq1, rq3;
     float scale;
+    uint64_t state_cache; // Phase 19: BDA pointer to f16 state cache (0 = disabled)
 };
 
 struct vk_op_ssm_scan_push_constants {
@@ -4687,6 +4695,30 @@ static void ggml_vk_load_shaders(vk_device& device) {
             for (uint32_t kda = 0; kda < 2; kda++) {
                 ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net[si][kda],
                     gdn_names[si][kda], gdn_len, gdn_data, "main", 7, sizeof(vk_op_gated_delta_net_push_constants),
+                    wg_denoms, {S_V, kda, device->subgroup_size, lanes_per_column}, 1, true, use_subgroup_reduce, device->subgroup_size);
+            }
+
+            // Phase 19: f16 state pipelines (same params, different shader binary)
+            size_t gdn_f16s_len;
+            const void * gdn_f16s_data;
+            if (use_subgroup_reduce && need_clustered_shader) {
+                gdn_f16s_len = gated_delta_net_f16s_len;
+                gdn_f16s_data = (const void *)gated_delta_net_f16s_data;
+            } else if (use_subgroup_reduce) {
+                gdn_f16s_len = gated_delta_net_f16s_nocluster_len;
+                gdn_f16s_data = (const void *)gated_delta_net_f16s_nocluster_data;
+            } else {
+                gdn_f16s_len = gated_delta_net_f16s_shmem_len;
+                gdn_f16s_data = (const void *)gated_delta_net_f16s_shmem_data;
+            }
+            const char * gdn_f16s_names[][2] = {
+                {"gated_delta_net_f16s_d32",  "gated_delta_net_f16s_d32_kda"},
+                {"gated_delta_net_f16s_d64",  "gated_delta_net_f16s_d64_kda"},
+                {"gated_delta_net_f16s_d128", "gated_delta_net_f16s_d128_kda"},
+            };
+            for (uint32_t kda = 0; kda < 2; kda++) {
+                ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net_f16s[si][kda],
+                    gdn_f16s_names[si][kda], gdn_f16s_len, gdn_f16s_data, "main", 7, sizeof(vk_op_gated_delta_net_push_constants),
                     wg_denoms, {S_V, kda, device->subgroup_size, lanes_per_column}, 1, true, use_subgroup_reduce, device->subgroup_size);
             }
         }
@@ -9642,6 +9674,10 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
                 case 128: si = 2; break;
                 default: return nullptr;
             }
+            // Phase 19: select f16-state pipeline when state tensor is f16
+            if (dst->src[5] && dst->src[5]->type == GGML_TYPE_F16) {
+                return ctx->device->pipeline_gated_delta_net_f16s[si][kda];
+            }
             return ctx->device->pipeline_gated_delta_net[si][kda];
         }
         return nullptr;
@@ -10520,13 +10556,54 @@ static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& s
     const uint32_t rq3  = (uint32_t)(src_v->ne[3] / src_q->ne[3]);
 
     const float scale = 1.0f / sqrtf((float)S_v);
+
+    // Phase 19: BDA state cache — f16 shadow for GDN state, bypasses f32 GET_ROWS path
+    uint64_t state_cache_bda = 0;
+    static int gdn_cache_enabled = -1;
+    if (gdn_cache_enabled < 0) {
+        const char * env = getenv("GGML_VK_GDN_CACHE");
+        gdn_cache_enabled = env ? atoi(env) : 1;
+    }
+    if (gdn_cache_enabled && n_tokens == 1 && ctx->device->buffer_device_address) {
+        const uint32_t state_elements = S_v * S_v * H * n_seqs;
+        const size_t cache_per_layer = state_elements * sizeof(uint16_t);
+
+        if (!ctx->device->gdn_state_cache) {
+            // Estimate layer count: 24 layers for Qwen3.5 (generous, covers all models)
+            const uint32_t n_layers_est = 24;
+            const size_t total_cache = cache_per_layer * n_layers_est;
+            // Use host-visible + device-local so we can zero from CPU
+            ctx->device->gdn_state_cache = ggml_vk_create_buffer_check(ctx->device, total_cache,
+                vk::MemoryPropertyFlagBits::eDeviceLocal | vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent,
+                vk::MemoryPropertyFlagBits::eDeviceLocal);
+            if (ctx->device->gdn_state_cache) {
+                ctx->device->gdn_state_cache_size = total_cache;
+                ctx->device->gdn_state_cache_bda = ctx->device->gdn_state_cache->bda_addr;
+                // Zero the cache — initial SSM state must be zero
+                if (ctx->device->gdn_state_cache->ptr) {
+                    memset(ctx->device->gdn_state_cache->ptr, 0, total_cache);
+                }
+                fprintf(stderr, "ggml_vk_gdn: f16 state cache: %.1f MiB (%u layers, BDA=0x%lx, ptr=%p)\n",
+                    (float)total_cache / (1024*1024), n_layers_est,
+                    (unsigned long)ctx->device->gdn_state_cache_bda,
+                    ctx->device->gdn_state_cache->ptr);
+            }
+        }
+
+        if (ctx->device->gdn_state_cache_bda) {
+            uint32_t layer_idx = ctx->device->gdn_dispatch_idx++;
+            state_cache_bda = ctx->device->gdn_state_cache_bda + layer_idx * cache_per_layer;
+        }
+    }
+
     const vk_op_gated_delta_net_push_constants pc = {
         H, n_tokens, n_seqs, s_off,
         sq1, sq2, sq3,
         sv1, sv2, sv3,
         sb1, sb2, sb3,
         neq1, rq3,
-        scale
+        scale,
+        state_cache_bda
     };
 
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
@@ -14463,6 +14540,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ctx->device->jit_warmup_tokens++;
     }
     size_t jit_ssbo_offset = 0;  // Track SSBO write position for this token
+    ctx->device->gdn_dispatch_idx = 0; // Phase 19: reset per-token GDN layer counter
     if (ctx->device->jit_enabled && ctx->device->jit_warmup_tokens >= 3 && !ctx->device->jit_interp_pipeline) {
         auto spirv = ggml_vk_jit::compile_glsl(ggml_vk_jit::get_interpreter_glsl(), "jit_interp");
         if (!spirv.empty()) {

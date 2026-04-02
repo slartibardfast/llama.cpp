@@ -1,6 +1,9 @@
 #version 450
 
 #extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types : require
 #extension GL_KHR_shader_subgroup_basic : enable
 #if USE_SUBGROUP_CLUSTERED
 #extension GL_KHR_shader_subgroup_clustered : enable
@@ -21,6 +24,10 @@ const uint ROWS_PER_LANE = S_V / LANES_PER_COLUMN;
 
 layout(local_size_x_id = 2, local_size_y = 1, local_size_z = 1) in;
 
+// BDA buffer references for f16 state cache
+layout(buffer_reference, std430, buffer_reference_align = 2) readonly  buffer F16In  { float16_t d[]; };
+layout(buffer_reference, std430, buffer_reference_align = 2) writeonly buffer F16Out { float16_t d[]; };
+
 layout(push_constant) uniform Parameters {
     uint H;
     uint n_tokens;
@@ -31,6 +38,7 @@ layout(push_constant) uniform Parameters {
     uint sb1, sb2, sb3;
     uint neq1, rq3;
     float scale;
+    uint64_t state_cache; // BDA pointer to f16 state cache (0 = use data_state)
 };
 
 layout(binding = 0) readonly  buffer QBuf     { FLOAT_TYPE data_q[];     };
@@ -38,7 +46,7 @@ layout(binding = 1) readonly  buffer KBuf     { FLOAT_TYPE data_k[];     };
 layout(binding = 2) readonly  buffer VBuf     { FLOAT_TYPE data_v[];     };
 layout(binding = 3) readonly  buffer GBuf     { FLOAT_TYPE data_g[];     };
 layout(binding = 4) readonly  buffer BetaBuf  { FLOAT_TYPE data_beta[];  };
-layout(binding = 5) readonly  buffer StateBuf { FLOAT_TYPE data_state[]; };
+layout(binding = 5) readonly  buffer StateBuf { STATE_TYPE  data_state[]; };
 layout(binding = 6)           buffer DstBuf   { FLOAT_TYPE data_dst[];   };
 
 #if !USE_SUBGROUP_ADD && !USE_SUBGROUP_CLUSTERED
@@ -103,9 +111,17 @@ void main() {
     const uint state_size = S_V * S_V;
     const uint state_base = (seq_id * H + head_id) * state_size;
 
-    FLOAT_TYPE s_shard[ROWS_PER_LANE];
-    [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
-        s_shard[r] = FLOAT_TYPE(data_state[state_base + col * S_V + r * LANES_PER_COLUMN + lane]);
+    // State load: from f16 BDA cache if available, else f32 binding
+    float s_shard[ROWS_PER_LANE];
+    if (state_cache != 0) {
+        F16In sc = F16In(state_cache);
+        [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
+            s_shard[r] = float(sc.d[state_base + col * S_V + r * LANES_PER_COLUMN + lane]);
+        }
+    } else {
+        [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
+            s_shard[r] = float(data_state[state_base + col * S_V + r * LANES_PER_COLUMN + lane]);
+        }
     }
 
     uint attn_off = (seq_id * n_tokens * H + head_id) * S_V;
@@ -163,7 +179,14 @@ void main() {
         attn_off += S_V * H;
     }
 
+    // State write: to f16 BDA cache if available, always to f32 dst for graph compat
+    if (state_cache != 0) {
+        F16Out sc_out = F16Out(state_cache);
+        [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
+            sc_out.d[state_base + col * S_V + r * LANES_PER_COLUMN + lane] = float16_t(s_shard[r]);
+        }
+    }
     [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
-        data_dst[s_off + state_base + col * S_V + r * LANES_PER_COLUMN + lane] = s_shard[r];
+        data_dst[s_off + state_base + col * S_V + r * LANES_PER_COLUMN + lane] = FLOAT_TYPE(s_shard[r]);
     }
 }
