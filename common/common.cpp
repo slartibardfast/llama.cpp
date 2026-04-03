@@ -1335,6 +1335,13 @@ common_init_result_ptr common_init_from_params(common_params & params) {
         common_set_adapter_lora(lctx, params.lora_adapters);
     }
 
+    // Skip warmup when JIT interpreter is enabled — RADV/GCN3 driver bug:
+    // pipeline creation after warmup GPU work corrupts internal driver state
+    if (params.warmup && getenv("POLARIS_JIT")) {
+        LOG_WRN("%s: warmup disabled (POLARIS_JIT active — RADV pipeline creation bug)\n", __func__);
+        params.warmup = false;
+    }
+
     if (params.warmup) {
         LOG_WRN("%s: warming up the model with an empty run - please wait ... (--no-warmup to disable)\n", __func__);
 

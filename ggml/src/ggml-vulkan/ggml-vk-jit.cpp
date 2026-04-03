@@ -45,10 +45,27 @@ struct Op {
 };
 
 layout(binding = 0, std430) readonly buffer Program { uint num_ops; uint _pad0; Op ops[]; };
-layout(push_constant) uniform PC { uint _dummy; };
+layout(binding = 1, std430) buffer BarrierBuf { uint flags[]; };
+layout(push_constant) uniform PC { uint num_wgs; };
 layout(local_size_x = 256) in;
 
 shared float smem[256];
+
+// Flag-based barrier: each WG writes to its own cache-line-aligned slot.
+// Uses atomics for cross-WG visibility. 16-uint stride = 64B = L2 cache line.
+void global_barrier(uint step) {
+    memoryBarrierBuffer();
+    barrier();
+    if (num_wgs <= 1u) return;
+    uint target = step + 1u;
+    if (gl_LocalInvocationID.x == 0u) {
+        atomicMax(flags[gl_WorkGroupID.x * 16u], target);
+        for (uint w = 0u; w < num_wgs; w++) {
+            while (atomicOr(flags[w * 16u], 0u) < target) {}
+        }
+    }
+    barrier();
+}
 
 void main() {
     uint gid = gl_GlobalInvocationID.x;
@@ -120,8 +137,7 @@ void main() {
             }
         }
 
-        memoryBarrier();
-        barrier();
+        global_barrier(p);
     }
 }
 )";
@@ -130,7 +146,7 @@ const std::string & get_interpreter_glsl() { return interpreter_glsl; }
 
 // ========== Op Classification ==========
 
-// GGML_VK_JIT_OPS bitmask: which op types the interpreter handles
+// LLAMA_VULKAN_JIT_OPS bitmask: which op types the interpreter handles
 // Bits: 0=ADD 1=MUL 2=SILU 3=SIGMOID 4=SCALE 5=CPY 6=SWIGLU 7=RMS_NORM 8=L2_NORM
 //       9=FUSED_GATE_PREP 10=SSM_CONV
 // Default all enabled. Set to isolate, e.g. "1" = ADD only, "3" = ADD+MUL
@@ -139,7 +155,7 @@ static uint32_t jit_op_mask() {
     static bool init = false;
     if (!init) {
         init = true;
-        const char * env = getenv("GGML_VK_JIT_OPS");
+        const char * env = getenv("LLAMA_VULKAN_JIT_OPS");
         if (env) mask = (uint32_t)strtoul(env, nullptr, 0);
     }
     return mask;

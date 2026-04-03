@@ -845,6 +845,8 @@ struct vk_device_struct {
     vk_pipeline jit_interp_pipeline;  // compiled interpreter shader
     vk_buffer jit_ssbo_buf;           // SSBO for interpreter program
     size_t jit_ssbo_size = 0;         // allocated SSBO size
+    vk_buffer jit_barrier_buf;        // Multi-WG atomic barrier counters
+    size_t jit_barrier_size = 0;
     vk_buffer gdn_state_cache;        // Phase 19: f16 BDA state cache for GDN
     size_t gdn_state_cache_size = 0;  // total f16 state cache bytes
     uint64_t gdn_state_cache_bda = 0; // BDA address of state cache
@@ -5278,7 +5280,7 @@ static vk_device ggml_vk_get_device(size_t idx) {
         device->vulkan_memory_model = vk12_features.vulkanMemoryModel;
 
         // Phase 17b: JIT ubershader
-        const char * jit_env = getenv("GGML_VK_JIT");
+        const char * jit_env = getenv("POLARIS_JIT");
         if (jit_env && atoi(jit_env) && device->buffer_device_address && device->shader_int64) {
             device->jit_enabled = true;
             GGML_LOG_INFO("ggml_vulkan: JIT ubershader enabled for %s\n", device->name.c_str());
@@ -5579,6 +5581,28 @@ static vk_device ggml_vk_get_device(size_t idx) {
         device->dsl = device->device.createDescriptorSetLayout(descriptor_set_layout_create_info);
 
         ggml_vk_load_shaders(device);
+
+        // JIT interpreter: compile pipeline at init
+        // Pipeline compiled lazily in graph_compute instead (see below)
+        if (false && device->jit_enabled) {
+            auto spirv = ggml_vk_jit::compile_glsl(ggml_vk_jit::get_interpreter_glsl(), "jit_interp");
+            if (!spirv.empty()) {
+                device->jit_interp_pipeline = std::make_shared<vk_pipeline_struct>();
+                device->jit_interp_pipeline->name = "jit_interp";
+                device->jit_interp_pipeline->push_constant_size = sizeof(uint32_t);
+                device->jit_interp_pipeline->align = 1;
+                ggml_vk_create_pipeline_func(device, device->jit_interp_pipeline,
+                    spirv.size() * 4, spirv.data(), "main",
+                    2, {1, 1, 1}, {}, false, false, 0);
+                device->jit_interp_pipeline->wg_denoms = {1, 1, 1};
+                device->jit_interp_pipeline->parameter_count = 2;
+                // Buffers allocated lazily on first JIT dispatch (after warmup)
+                GGML_LOG_INFO("ggml_vulkan: JIT interpreter compiled (%zu SPIR-V words)\n", spirv.size());
+            } else {
+                device->jit_enabled = false;
+                GGML_LOG_WARN("ggml_vulkan: JIT shader compilation failed, disabling\n");
+            }
+        }
 
         // Only use transfer queue on AMD non-GCN, when the graphics queue is not enabled
         const bool prefers_transfer_queue = device->vendor_id == VK_VENDOR_ID_AMD && device->architecture != AMD_GCN && !allow_graphics_queue;
@@ -14532,7 +14556,10 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         ggml_vk_sync_buffers(ctx, compute_ctx);
     }
 
-    // Phase 17c: Compile interpreter pipeline on first use
+    if (ctx->device->jit_enabled) {
+        ctx->device->jit_warmup_tokens++;
+    }
+
     auto jit_get_bda = [&](const ggml_tensor * t) -> uint64_t {
         if (!t || !t->buffer || !t->buffer->context) return 0;
         auto * buf_ctx = (ggml_backend_vk_buffer_context *)t->buffer->context;
@@ -14542,10 +14569,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         return buf_ctx->dev_buffer->bda_addr + offset;
     };
 
-    if (ctx->device->jit_enabled) {
-        ctx->device->jit_warmup_tokens++;
-    }
-    size_t jit_ssbo_offset = 0;  // Track SSBO write position for this token
+    size_t jit_ssbo_offset = 0;
+    size_t jit_barrier_offset = 0;
     ctx->device->gdn_dispatch_idx = 0; // Phase 19: reset per-token GDN layer counter
 
     // Phase 20: detect prompt eval (n_tokens > 1) to reset cache init state
@@ -14585,7 +14610,10 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             }
         }
     }
-    if (ctx->device->jit_enabled && ctx->device->jit_warmup_tokens >= 3 && !ctx->device->jit_interp_pipeline) {
+    // Lazy JIT: compile pipeline (token 3), allocate buffers (token 4), activate (token 5)
+    // Separating these across graph_compute calls avoids RADV/GCN3 warmup interaction
+    if (ctx->device->jit_enabled && ctx->device->jit_warmup_tokens >= 3
+        && !ctx->device->jit_interp_pipeline) {
         auto spirv = ggml_vk_jit::compile_glsl(ggml_vk_jit::get_interpreter_glsl(), "jit_interp");
         if (!spirv.empty()) {
             ctx->device->jit_interp_pipeline = std::make_shared<vk_pipeline_struct>();
@@ -14594,19 +14622,23 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
             ctx->device->jit_interp_pipeline->align = 1;
             ggml_vk_create_pipeline_func(ctx->device, ctx->device->jit_interp_pipeline,
                 spirv.size() * 4, spirv.data(), "main",
-                1, {1, 1, 1}, {}, false, false, 0);
+                2, {1, 1, 1}, {}, false, false, 0);
             ctx->device->jit_interp_pipeline->wg_denoms = {1, 1, 1};
-            ctx->device->jit_interp_pipeline->parameter_count = 1;
-            // Allocate SSBO — 64KB to avoid mid-token reallocation that
-            // would invalidate descriptor sets bound to the old buffer
-            ctx->device->jit_ssbo_buf = ggml_vk_create_buffer_check(ctx->device, 65536,
-                vk::MemoryPropertyFlagBits::eDeviceLocal | vk::MemoryPropertyFlagBits::eHostVisible |
-                vk::MemoryPropertyFlagBits::eHostCoherent);
-            ctx->device->jit_ssbo_size = 65536;
-            fprintf(stderr, "ggml_vk_jit: interpreter pipeline compiled (%zu SPIR-V words)\n", spirv.size());
+            ctx->device->jit_interp_pipeline->parameter_count = 2;
         }
     }
-
+    if (ctx->device->jit_interp_pipeline && !ctx->device->jit_ssbo_buf
+        && ctx->device->jit_warmup_tokens >= 4) {
+        ctx->device->jit_ssbo_buf = ggml_vk_create_buffer_check(ctx->device, 65536,
+            vk::MemoryPropertyFlagBits::eDeviceLocal | vk::MemoryPropertyFlagBits::eHostVisible |
+            vk::MemoryPropertyFlagBits::eHostCoherent);
+        ctx->device->jit_ssbo_size = 65536;
+        ctx->device->jit_barrier_buf = ggml_vk_create_buffer_check(ctx->device, 4096,
+            vk::MemoryPropertyFlagBits::eDeviceLocal | vk::MemoryPropertyFlagBits::eHostVisible |
+            vk::MemoryPropertyFlagBits::eHostCoherent);
+        ctx->device->jit_barrier_size = 4096;
+        memset(ctx->device->jit_barrier_buf->ptr, 0, 4096);
+    }
     // Submit after enough work has accumulated, to overlap CPU cmdbuffer generation with GPU execution.
     // Estimate the amount of matmul work by looking at the weight matrix size, and submit every 100MB
     // (and scaled down based on model size, so smaller models submit earlier).
@@ -14819,6 +14851,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         if (false) { // When validating, let each op through standard dispatch for CPU comparison
 #else
         if (!fusion_string && ctx->device->jit_interp_pipeline && ctx->device->jit_ssbo_buf
+            && ctx->device->jit_warmup_tokens >= 5
             && ggml_vk_jit::is_interpreter_op(cgraph->nodes[i])) {
 #endif
             int batch_nodes = jit_count_batch(cgraph, i);
@@ -14841,6 +14874,29 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                 }
 
                 if (!program.empty()) {
+                    // BDA validation: dump all addresses and check validity
+                    static int jit_batch_id = 0;
+                    {
+                        bool any_bad = false;
+                        for (uint32_t d = 0; d < program.size(); d++) {
+                            auto & op = program[d];
+                            bool bad_src0 = (op.src0 == 0);
+                            bool bad_dst = (op.dst == 0);
+                            bool bad_src1 = (op.type <= 1 || op.type == 6) && op.src1 == 0; // ADD/MUL/SWIGLU need src1
+                            if (bad_src0 || bad_dst || bad_src1) any_bad = true;
+                            fprintf(stderr, "BDA[%d.%u] type=%u ne=%u src0=0x%lx src1=0x%lx src2=0x%lx dst=0x%lx ne0=%u%s\n",
+                                jit_batch_id, d, op.type, op.ne,
+                                (unsigned long)op.src0, (unsigned long)op.src1,
+                                (unsigned long)op.src2, (unsigned long)op.dst, op.ne0,
+                                (bad_src0||bad_dst||bad_src1) ? " *** BAD ***" : "");
+                        }
+                        jit_batch_id++;
+                        if (any_bad) {
+                            fprintf(stderr, "BDA VALIDATION FAILED — skipping JIT dispatch\n");
+                            continue; // skip to next node, let standard dispatch handle it
+                        }
+                    }
+
                     // Write SSBO program at sequential offset (each batch gets its own slot)
                     size_t prog_bytes = 8 + program.size() * sizeof(ggml_vk_jit::JitOp);
                     // Align to 16 bytes for buffer offset alignment
@@ -14857,7 +14913,12 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                     memset(ptr + 4, 0, 4);
                     memcpy(ptr + 8, program.data(), num_ops * sizeof(ggml_vk_jit::JitOp));
 
-                    uint32_t num_wgs = 1; // TODO: multi-WG needs inter-WG sync
+                    static int jit_max_wgs = -1;
+                    if (jit_max_wgs < 0) {
+                        const char * env = getenv("LLAMA_VULKAN_JIT_WGS");
+                        jit_max_wgs = env ? atoi(env) : 1;
+                    }
+                    uint32_t num_wgs = needs_single_wg ? 1 : (uint32_t)jit_max_wgs;
                     compute_ctx = ggml_vk_get_compute_ctx(ctx);
 
                     // Check dependencies: only barrier if batch tensors overlap unsynced writes/reads
@@ -14886,14 +14947,30 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                         ctx->unsynced_nodes_read.clear();
                     }
 
+                    // Barrier buffer: each batch uses unique offset (zeroed at recording time)
+                    size_t barrier_bytes = program.size() * sizeof(uint32_t);
+                    size_t barrier_aligned = (barrier_bytes + 15) & ~15;
+                    GGML_ASSERT(jit_barrier_offset + barrier_aligned <= ctx->device->jit_barrier_size);
+                    memset((uint8_t *)ctx->device->jit_barrier_buf->ptr + jit_barrier_offset, 0, barrier_bytes);
+
+                    // DRY_RUN: skip dispatch, fall through to standard path
+                    static bool jit_dry_run = getenv("LLAMA_VULKAN_JIT_DRY") != nullptr;
+                    if (jit_dry_run) {
+                        // Don't dispatch, don't set fusion_string — standard dispatch handles it
+                        continue;
+                    }
+
                     ggml_pipeline_request_descriptor_sets(ctx, ctx->device->jit_interp_pipeline, 1);
-                    struct { uint32_t dummy; } interp_pc = { 0 };
+                    struct { uint32_t num_wgs; } interp_pc = { num_wgs };
                     ggml_vk_dispatch_pipeline(ctx, compute_ctx,
                         ctx->device->jit_interp_pipeline,
                         { vk::DescriptorBufferInfo{ctx->device->jit_ssbo_buf->buffer,
-                            (vk::DeviceSize)jit_ssbo_offset, (vk::DeviceSize)prog_bytes} },
+                            (vk::DeviceSize)jit_ssbo_offset, (vk::DeviceSize)prog_bytes},
+                          vk::DescriptorBufferInfo{ctx->device->jit_barrier_buf->buffer,
+                            (vk::DeviceSize)jit_barrier_offset, (vk::DeviceSize)barrier_bytes} },
                         interp_pc, { num_wgs, 1, 1 });
                     jit_ssbo_offset += aligned_bytes;
+                    jit_barrier_offset += barrier_aligned;
 
                     // Register batch nodes in dependency tracking so subsequent dispatches barrier correctly
                     for (int j = i; j < i + batch_nodes; j++) {
@@ -14911,7 +14988,7 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                     fusion_string = "JIT_INTERP";
                     std::fill_n(op_srcs_fused_elementwise, std::min(batch_nodes, 12), true);
                     VK_LOG_DEBUG("JIT batch: " << batch_nodes << " nodes, " << program.size() << " ops at graph[" << i << "]");
-                    if (getenv("GGML_VK_JIT_LOG")) {
+                    if (getenv("LLAMA_VULKAN_JIT_LOG")) {
                         fprintf(stderr, "JIT[%d] %d/%zu:", i, batch_nodes, program.size());
                         for (int j = i; j < i + batch_nodes; j++) {
                             auto *n = cgraph->nodes[j];
