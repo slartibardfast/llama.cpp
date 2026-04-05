@@ -401,6 +401,82 @@ void quantize_row_q8_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, i
         _mm_storeu_si128((__m128i *)(y[i].qs + 16), ni4);
 #endif
     }
+#elif defined(__SSE4_1__)
+    for (int i = 0; i < nb; i++) {
+        // Load elements into 8 SSE vectors
+        __m128 v0 = _mm_loadu_ps( x );
+        __m128 v1 = _mm_loadu_ps( x + 4 );
+        __m128 v2 = _mm_loadu_ps( x + 8 );
+        __m128 v3 = _mm_loadu_ps( x + 12 );
+        __m128 v4 = _mm_loadu_ps( x + 16 );
+        __m128 v5 = _mm_loadu_ps( x + 20 );
+        __m128 v6 = _mm_loadu_ps( x + 24 );
+        __m128 v7 = _mm_loadu_ps( x + 28 );
+        x += 32;
+
+        // Compute max(abs(e)) for the block
+        const __m128 signBit = _mm_set1_ps( -0.0f );
+        __m128 maxAbs = _mm_andnot_ps( signBit, v0 );
+        maxAbs = _mm_max_ps( maxAbs, _mm_andnot_ps( signBit, v1 ) );
+        maxAbs = _mm_max_ps( maxAbs, _mm_andnot_ps( signBit, v2 ) );
+        maxAbs = _mm_max_ps( maxAbs, _mm_andnot_ps( signBit, v3 ) );
+        maxAbs = _mm_max_ps( maxAbs, _mm_andnot_ps( signBit, v4 ) );
+        maxAbs = _mm_max_ps( maxAbs, _mm_andnot_ps( signBit, v5 ) );
+        maxAbs = _mm_max_ps( maxAbs, _mm_andnot_ps( signBit, v6 ) );
+        maxAbs = _mm_max_ps( maxAbs, _mm_andnot_ps( signBit, v7 ) );
+
+        __m128 max4 = _mm_max_ps( maxAbs, _mm_movehl_ps( maxAbs, maxAbs ) );
+        max4 = _mm_max_ss( max4, _mm_movehdup_ps( max4 ) );
+        const float maxScalar = _mm_cvtss_f32( max4 );
+
+        // Quantize these floats
+        const float d = maxScalar / 127.f;
+        y[i].d = GGML_CPU_FP32_TO_FP16(d);
+        const float id = ( maxScalar != 0.0f ) ? 127.f / maxScalar : 0.0f;
+        const __m128 mul = _mm_set1_ps( id );
+
+        // Apply the multiplier
+        v0 = _mm_mul_ps( v0, mul );
+        v1 = _mm_mul_ps( v1, mul );
+        v2 = _mm_mul_ps( v2, mul );
+        v3 = _mm_mul_ps( v3, mul );
+        v4 = _mm_mul_ps( v4, mul );
+        v5 = _mm_mul_ps( v5, mul );
+        v6 = _mm_mul_ps( v6, mul );
+        v7 = _mm_mul_ps( v7, mul );
+
+        // Round to nearest integer
+        v0 = _mm_round_ps( v0, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC );
+        v1 = _mm_round_ps( v1, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC );
+        v2 = _mm_round_ps( v2, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC );
+        v3 = _mm_round_ps( v3, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC );
+        v4 = _mm_round_ps( v4, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC );
+        v5 = _mm_round_ps( v5, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC );
+        v6 = _mm_round_ps( v6, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC );
+        v7 = _mm_round_ps( v7, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC );
+
+        // Convert floats to integers
+        __m128i ni0 = _mm_cvtps_epi32( v0 );
+        __m128i ni1 = _mm_cvtps_epi32( v1 );
+        __m128i ni2 = _mm_cvtps_epi32( v2 );
+        __m128i ni3 = _mm_cvtps_epi32( v3 );
+        __m128i ni4 = _mm_cvtps_epi32( v4 );
+        __m128i ni5 = _mm_cvtps_epi32( v5 );
+        __m128i ni6 = _mm_cvtps_epi32( v6 );
+        __m128i ni7 = _mm_cvtps_epi32( v7 );
+
+        // Convert int32 to int16
+        ni0 = _mm_packs_epi32( ni0, ni1 );
+        ni2 = _mm_packs_epi32( ni2, ni3 );
+        ni4 = _mm_packs_epi32( ni4, ni5 );
+        ni6 = _mm_packs_epi32( ni6, ni7 );
+        // Convert int16 to int8
+        ni0 = _mm_packs_epi16( ni0, ni2 );
+        ni4 = _mm_packs_epi16( ni4, ni6 );
+
+        _mm_storeu_si128((__m128i *)(y[i].qs +  0), ni0);
+        _mm_storeu_si128((__m128i *)(y[i].qs + 16), ni4);
+    }
 #else
     GGML_UNUSED(nb);
     // scalar
