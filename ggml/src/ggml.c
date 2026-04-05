@@ -14,6 +14,12 @@
 #include <hbwmalloc.h>
 #endif
 
+#if defined(__linux__)
+#include <sys/mman.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
+
 #if defined(_MSC_VER) || defined(__MINGW32__)
 #include <malloc.h> // using malloc.h with MSC/MINGW
 #elif !defined(__FreeBSD__) && !defined(__NetBSD__) && !defined(__OpenBSD__)
@@ -349,7 +355,83 @@ void * ggml_aligned_malloc(size_t size) {
             break;
     }
   #else
+    // Try huge pages for large allocations (reduces TLB misses for large models)
+    #if defined(__linux__) && defined(MAP_HUGETLB)
+    if (size >= (256ULL << 20)) { // >= 256 MB
+        // NUMA interleave: set policy before mmap so MAP_POPULATE faults round-robin
+        #if defined(__NR_set_mempolicy)
+        unsigned long nodemask = ~0UL;
+        long mempolicy_set = syscall(__NR_set_mempolicy, 2 /*MPOL_INTERLEAVE*/,
+                                     &nodemask, sizeof(nodemask) * 8 + 1);
+        #endif
+
+        #if defined(MAP_HUGE_1GB)
+        // Try 1GB pages first for allocations >= 512MB
+        if (size >= (512ULL << 20)) {
+            size_t mmap_size = (size + (1ULL << 30) - 1) & ~((1ULL << 30) - 1);
+            aligned_memory = mmap(NULL, mmap_size, PROT_READ | PROT_WRITE,
+                                  MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | MAP_HUGE_1GB | MAP_POPULATE, -1, 0);
+            if (aligned_memory != MAP_FAILED) {
+                GGML_LOG_INFO("%s: using 1GB huge pages for %6.2f MB allocation (%zu pages)\n",
+                              __func__, size/(1024.0*1024.0), mmap_size >> 30);
+                #if defined(__NR_set_mempolicy)
+                if (mempolicy_set == 0) {
+                    syscall(__NR_set_mempolicy, 0 /*MPOL_DEFAULT*/, NULL, 0);
+                }
+                #endif
+                return aligned_memory;
+            }
+            aligned_memory = NULL;
+        }
+        #endif
+        #if defined(MAP_HUGE_2MB)
+        // Fall back to 2MB pages
+        {
+            size_t mmap_size = (size + (2ULL << 20) - 1) & ~((2ULL << 20) - 1);
+            aligned_memory = mmap(NULL, mmap_size, PROT_READ | PROT_WRITE,
+                                  MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | MAP_HUGE_2MB | MAP_POPULATE, -1, 0);
+            if (aligned_memory != MAP_FAILED) {
+                GGML_LOG_INFO("%s: using 2MB huge pages for %6.2f MB allocation\n",
+                              __func__, size/(1024.0*1024.0));
+                #if defined(__NR_set_mempolicy)
+                if (mempolicy_set == 0) {
+                    syscall(__NR_set_mempolicy, 0 /*MPOL_DEFAULT*/, NULL, 0);
+                }
+                #endif
+                return aligned_memory;
+            }
+            aligned_memory = NULL;
+        }
+        #endif
+
+        // Restore default NUMA policy if hugetlb failed
+        #if defined(__NR_set_mempolicy)
+        if (mempolicy_set == 0) {
+            syscall(__NR_set_mempolicy, 0 /*MPOL_DEFAULT*/, NULL, 0);
+        }
+        #endif
+    }
+    #endif
     int result = posix_memalign(&aligned_memory, alignment, size);
+    #if defined(__linux__)
+    if (result == 0 && aligned_memory != NULL && size >= (2ULL << 20)) {
+        // Transparent huge pages for non-hugetlb allocations (KV cache, SSM state, scratch)
+        madvise(aligned_memory, size, MADV_HUGEPAGE);
+        // NUMA interleave for multi-socket systems
+        #if defined(__NR_mbind)
+        {
+            unsigned long nodemask = ~0UL;
+            syscall(__NR_mbind, (unsigned long)aligned_memory, size,
+                    2 /*MPOL_INTERLEAVE*/, &nodemask,
+                    sizeof(nodemask) * 8 + 1, 0);
+        }
+        #endif
+        // Pre-fault with NUMA policy active (avoids lazy fault clustering on one node)
+        #if defined(MADV_POPULATE_WRITE)
+        madvise(aligned_memory, size, MADV_POPULATE_WRITE);
+        #endif
+    }
+    #endif
   #endif
     if (result != 0) {
         // Handle allocation failure
@@ -370,10 +452,11 @@ void * ggml_aligned_malloc(size_t size) {
 }
 
 void ggml_aligned_free(void * ptr, size_t size) {
-    GGML_UNUSED(size);
 #if defined(_MSC_VER) || defined(__MINGW32__)
+    GGML_UNUSED(size);
     _aligned_free(ptr);
 #elif GGML_USE_CPU_HBM
+    GGML_UNUSED(size);
     if (ptr != NULL) {
         hbw_free(ptr);
     }
@@ -382,10 +465,43 @@ void ggml_aligned_free(void * ptr, size_t size) {
         vm_deallocate((vm_map_t)mach_task_self(), (vm_address_t)ptr, size);
     }
 #else
+    // If allocated with huge pages (mmap), must use munmap
+    #if defined(__linux__) && defined(MAP_HUGETLB)
+    if (ptr != NULL && size >= (256ULL << 20)) {
+        // Check 1GB alignment first, then 2MB
+        if (((uintptr_t)ptr & ((1ULL << 30) - 1)) == 0 && size >= (512ULL << 20)) {
+            size_t mmap_size = (size + (1ULL << 30) - 1) & ~((1ULL << 30) - 1);
+            munmap(ptr, mmap_size);
+            return;
+        }
+        if (((uintptr_t)ptr & ((2ULL << 20) - 1)) == 0) {
+            size_t mmap_size = (size + (2ULL << 20) - 1) & ~((2ULL << 20) - 1);
+            munmap(ptr, mmap_size);
+            return;
+        }
+    }
+    #endif
     free(ptr);
 #endif
 }
 
+
+bool ggml_is_hugetlb(const void * ptr, size_t size) {
+#if defined(__linux__) && defined(MAP_HUGETLB)
+    if (ptr != NULL && size >= (256ULL << 20)) {
+        if (((uintptr_t)ptr & ((1ULL << 30) - 1)) == 0 && size >= (512ULL << 20)) {
+            return true;  // 1GB-aligned, large allocation — hugetlb
+        }
+        if (((uintptr_t)ptr & ((2ULL << 20) - 1)) == 0) {
+            return true;  // 2MB-aligned, large allocation — hugetlb
+        }
+    }
+#else
+    GGML_UNUSED(ptr);
+    GGML_UNUSED(size);
+#endif
+    return false;
+}
 
 inline static void * ggml_malloc(size_t size) {
     if (size == 0) {

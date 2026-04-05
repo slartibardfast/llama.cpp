@@ -7,6 +7,10 @@
 layout(constant_id = 0) const uint BLOCK_SIZE = 32;
 layout(constant_id = 1) const uint TOKENS_PER_WG = 16;
 
+#ifndef FUSE_SILU
+#define FUSE_SILU 0
+#endif
+
 layout(local_size_x_id = 0, local_size_y_id = 1, local_size_z = 1) in;
 
 layout(binding = 0) readonly buffer Src0 { float src0[]; };
@@ -46,5 +50,9 @@ void main() {
     }
 
     const uint dst_idx = i3 * (dst_nb2 / 4) + i2 * (dst_nb1 / 4) + i1;
-    float s = sum; dst[dst_idx] = s / (1.0 + exp(-s));
+#if FUSE_SILU
+    dst[dst_idx] = sum / (1.0 + exp(-sum));
+#else
+    dst[dst_idx] = sum;
+#endif
 }

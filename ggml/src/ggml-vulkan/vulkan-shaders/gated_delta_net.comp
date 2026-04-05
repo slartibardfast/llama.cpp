@@ -18,6 +18,7 @@ layout(constant_id = 0) const uint S_V = 128;
 layout(constant_id = 1) const uint KDA = 0;
 layout(constant_id = 2) const uint SUBGROUP_SIZE = 32;
 layout(constant_id = 3) const uint LANES_PER_COLUMN = 32;
+layout(constant_id = 4) const uint FUSE_SIGMOID_BETA = 0;
 
 const uint COLS_PER_WG = SUBGROUP_SIZE / LANES_PER_COLUMN;
 const uint ROWS_PER_LANE = S_V / LANES_PER_COLUMN;
@@ -137,7 +138,10 @@ void main() {
         const uint k_off = q_off;
         const uint v_off = seq_id * sv3 + t * sv2 + head_id * sv1;
         const uint gb_off = seq_id * sb3 + t * sb2 + head_id * sb1;
-        const FLOAT_TYPE beta_val = FLOAT_TYPE(1.0) / (FLOAT_TYPE(1.0) + exp(-FLOAT_TYPE(data_beta[gb_off]))); // Phase 16: sigmoid fused
+        const FLOAT_TYPE beta_raw = FLOAT_TYPE(data_beta[gb_off]);
+        const FLOAT_TYPE beta_val = FUSE_SIGMOID_BETA != 0u
+            ? FLOAT_TYPE(1.0) / (FLOAT_TYPE(1.0) + exp(-beta_raw))
+            : beta_raw;
 
         FLOAT_TYPE k_reg[ROWS_PER_LANE];
         FLOAT_TYPE q_reg[ROWS_PER_LANE];

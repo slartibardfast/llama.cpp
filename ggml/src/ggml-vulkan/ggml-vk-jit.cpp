@@ -109,7 +109,7 @@ void main() {
                           + FBuf(op.src0).d[s0+1] * FBuf(op.src1).d[s1+1]
                           + FBuf(op.src0).d[s0+2] * FBuf(op.src1).d[s1+2]
                           + FBuf(op.src0).d[s0+3] * FBuf(op.src1).d[s1+3];
-                FOut(op.dst).d[idx] = sum / (1.0 + exp(-sum));
+                FOut(op.dst).d[idx] = sum;
             }
         } else if (op.type == OP_RMS_NORM || op.type == OP_L2_NORM) {
             uint row_len = (op.ne0 > 0u) ? op.ne0 : op.ne;

@@ -830,10 +830,13 @@ struct vk_device_struct {
     vk_pipeline pipeline_rwkv_wkv7_f32;
     // [size_idx][kda] where size_idx: 0=d32, 1=d64, 2=d128
     vk_pipeline pipeline_gated_delta_net[3][2];
+    vk_pipeline pipeline_gated_delta_net_sigmoid[3][2]; // sigmoid fused into beta read
     vk_pipeline pipeline_gated_delta_net_f16s[3][2]; // Phase 19: f16 state variant
+    vk_pipeline pipeline_gated_delta_net_f16s_sigmoid[3][2];
     vk_pipeline pipeline_ssm_scan_f32_d128;
     vk_pipeline pipeline_ssm_scan_f32_d256;
     vk_pipeline pipeline_ssm_conv_f32;
+    vk_pipeline pipeline_ssm_conv_silu_f32;
     vk_pipeline pipeline_fused_gate_prep_f32;
     vk_pipeline pipeline_fused_gated_norm_f32;
     vk_pipeline pipeline_fused_dual_l2_norm_f32;
@@ -4699,7 +4702,10 @@ static void ggml_vk_load_shaders(vk_device& device) {
             for (uint32_t kda = 0; kda < 2; kda++) {
                 ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net[si][kda],
                     gdn_names[si][kda], gdn_len, gdn_data, "main", 7, sizeof(vk_op_gated_delta_net_push_constants),
-                    wg_denoms, {S_V, kda, device->subgroup_size, lanes_per_column}, 1, true, use_subgroup_reduce, device->subgroup_size);
+                    wg_denoms, {S_V, kda, device->subgroup_size, lanes_per_column, 0}, 1, true, use_subgroup_reduce, device->subgroup_size);
+                ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net_sigmoid[si][kda],
+                    gdn_names[si][kda], gdn_len, gdn_data, "main", 7, sizeof(vk_op_gated_delta_net_push_constants),
+                    wg_denoms, {S_V, kda, device->subgroup_size, lanes_per_column, 1}, 1, true, use_subgroup_reduce, device->subgroup_size);
             }
 
             // Phase 19: f16 state pipelines (same params, different shader binary)
@@ -4723,7 +4729,10 @@ static void ggml_vk_load_shaders(vk_device& device) {
             for (uint32_t kda = 0; kda < 2; kda++) {
                 ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net_f16s[si][kda],
                     gdn_f16s_names[si][kda], gdn_f16s_len, gdn_f16s_data, "main", 7, sizeof(vk_op_gated_delta_net_push_constants),
-                    wg_denoms, {S_V, kda, device->subgroup_size, lanes_per_column}, 1, true, use_subgroup_reduce, device->subgroup_size);
+                    wg_denoms, {S_V, kda, device->subgroup_size, lanes_per_column, 0}, 1, true, use_subgroup_reduce, device->subgroup_size);
+                ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net_f16s_sigmoid[si][kda],
+                    gdn_f16s_names[si][kda], gdn_f16s_len, gdn_f16s_data, "main", 7, sizeof(vk_op_gated_delta_net_push_constants),
+                    wg_denoms, {S_V, kda, device->subgroup_size, lanes_per_column, 1}, 1, true, use_subgroup_reduce, device->subgroup_size);
             }
         }
     }
@@ -4736,7 +4745,8 @@ static void ggml_vk_load_shaders(vk_device& device) {
         ggml_vk_create_pipeline(device, device->pipeline_ssm_scan_f32_d256, "ssm_scan_256_f32", ssm_scan_f32_len, ssm_scan_f32_data, "main", 8, sizeof(vk_op_ssm_scan_push_constants), {1, 1, 1}, {256, device->subgroup_size, 16}, 1, true, true);
     }
 
-    ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_f32, "ssm_conv_f32", ssm_conv_f32_len, ssm_conv_f32_data, "main", 3, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_f32,      "ssm_conv_f32",      ssm_conv_f32_len,      ssm_conv_f32_data,      "main", 3, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_ssm_conv_silu_f32, "ssm_conv_silu_f32", ssm_conv_silu_f32_len, ssm_conv_silu_f32_data, "main", 3, sizeof(vk_op_ssm_conv_push_constants), {32, 16, 1}, {32, 16}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_fused_gate_prep_f32, "fused_gate_prep_f32", fused_gate_prep_f32_len, fused_gate_prep_f32_data, "main", 4, sizeof(vk_op_fused_gate_prep_push_constants), {256, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_fused_gated_norm_f32, "fused_gated_norm_f32", fused_gated_norm_f32_len, fused_gated_norm_f32_data, "main", 4, sizeof(vk_op_fused_gated_norm_push_constants), {128, 1, 1}, {128}, 1);
@@ -9719,7 +9729,9 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
         return nullptr;
     case GGML_OP_SSM_CONV:
         if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
-            return ctx->device->pipeline_ssm_conv_f32;
+            return ctx->num_additional_fused_ops > 0
+                ? ctx->device->pipeline_ssm_conv_silu_f32
+                : ctx->device->pipeline_ssm_conv_f32;
         }
         return nullptr;
     case GGML_OP_FUSED_GATE_PREP:
@@ -10546,7 +10558,11 @@ static void ggml_vk_rwkv_wkv7(ggml_backend_vk_context * ctx, vk_context& subctx,
 static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
     const ggml_tensor * src_q     = dst->src[0];
     const ggml_tensor * src_v     = dst->src[2];
-    const ggml_tensor * src_beta  = dst->src[4];
+
+    // Sigmoid fusion: if beta came from sigmoid, bind pre-sigmoid data and use fused shader
+    const bool fuse_sigmoid = dst->src[4]->op == GGML_OP_UNARY &&
+                              ggml_get_unary_op(dst->src[4]) == GGML_UNARY_OP_SIGMOID;
+    const ggml_tensor * src_beta = fuse_sigmoid ? dst->src[4]->src[0] : dst->src[4];
 
     GGML_ASSERT(dst->buffer != nullptr);
 
@@ -10560,12 +10576,30 @@ static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& s
     vk_pipeline pipeline = ggml_vk_op_get_pipeline(ctx, dst->src[0], dst->src[1], dst->src[2], dst, dst->op);
     GGML_ASSERT(pipeline != nullptr);
 
+    // Override pipeline when sigmoid is fused into beta read
+    if (fuse_sigmoid) {
+        // Find which pipeline array entry we got, and switch to sigmoid variant
+        for (int si = 0; si < 3; si++) {
+            for (int kda = 0; kda < 2; kda++) {
+                if (pipeline == ctx->device->pipeline_gated_delta_net[si][kda]) {
+                    pipeline = ctx->device->pipeline_gated_delta_net_sigmoid[si][kda];
+                } else if (pipeline == ctx->device->pipeline_gated_delta_net_f16s[si][kda]) {
+                    pipeline = ctx->device->pipeline_gated_delta_net_f16s_sigmoid[si][kda];
+                }
+            }
+        }
+    }
+
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
 
     vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx, dst);
     vk_subbuffer src_buf[6] = {};
     for (int i = 0; i < 6; i++) {
         src_buf[i] = ggml_vk_tensor_subbuffer(ctx, dst->src[i]);
+    }
+    // Override beta buffer to pre-sigmoid data when fusing
+    if (fuse_sigmoid) {
+        src_buf[4] = ggml_vk_tensor_subbuffer(ctx, src_beta);
     }
 
     const uint32_t sq1 = (uint32_t)(src_q->nb[1] / sizeof(float));
@@ -10697,19 +10731,19 @@ static void ggml_vk_ssm_scan(ggml_backend_vk_context * ctx, vk_context& subctx, 
         pc, elements);
 }
 
-static void ggml_vk_ssm_conv(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
-    const ggml_tensor * src0 = dst->src[0];
-    const ggml_tensor * src1 = dst->src[1];
+static void ggml_vk_ssm_conv(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * node, ggml_tensor * out) {
+    const ggml_tensor * src0 = node->src[0];
+    const ggml_tensor * src1 = node->src[1];
 
-    ggml_vk_op_f32<vk_op_ssm_conv_push_constants>(ctx, subctx, src0, src1, nullptr, nullptr, dst, GGML_OP_SSM_CONV, {
+    ggml_vk_op_f32<vk_op_ssm_conv_push_constants>(ctx, subctx, src0, src1, nullptr, nullptr, out, GGML_OP_SSM_CONV, {
         (uint32_t)src0->nb[1], (uint32_t)src0->nb[2],
         (uint32_t)src1->nb[1],
-        (uint32_t)dst->nb[0], (uint32_t)dst->nb[1], (uint32_t)dst->nb[2],
+        (uint32_t)out->nb[0], (uint32_t)out->nb[1], (uint32_t)out->nb[2],
         (uint32_t)src1->ne[0],
         (uint32_t)src0->ne[0],
         (uint32_t)src0->ne[1],
-        (uint32_t)dst->ne[1],
-        (uint32_t)dst->ne[2],
+        (uint32_t)out->ne[1],
+        (uint32_t)out->ne[2],
     });
 }
 
@@ -13374,8 +13408,10 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         break;
 
     case GGML_OP_SSM_CONV:
-        ggml_vk_ssm_conv(ctx, compute_ctx, node);
-
+        {
+            ggml_tensor * out = cgraph->nodes[node_idx + ctx->num_additional_fused_ops];
+            ggml_vk_ssm_conv(ctx, compute_ctx, node, out);
+        }
         break;
 
     case GGML_OP_FUSED_GATE_PREP:
@@ -13759,6 +13795,13 @@ static void ggml_backend_vk_host_buffer_free_buffer(ggml_backend_buffer_t buffer
 
 static ggml_backend_buffer_t ggml_backend_vk_host_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
     VK_LOG_MEMORY("ggml_backend_vk_host_buffer_type_alloc_buffer(" << size << ")");
+
+    // For large allocations (>= 256MB), use CPU buffer to enable huge pages
+    if (size >= (256ULL << 20)) {
+        GGML_LOG_INFO("ggml_vulkan: redirecting %.2f MB host alloc to CPU buffer (huge pages)\n",
+                      size/(1024.0*1024.0));
+        return ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), size);
+    }
 
     size += 32;  // Behave like the CPU buffer type
     void * ptr = nullptr;
@@ -14780,6 +14823,21 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
                     ctx->fused_topk_moe_scale = true;
                     ctx->num_additional_fused_ops++;
                     op_srcs_fused_elementwise[ctx->num_additional_fused_ops] = false;
+                }
+            }
+            // SSM_CONV + SILU fusion: specialization constant selects SiLU variant
+            if (!fusion_string && i + 1 < cgraph->n_nodes) {
+                const ggml_tensor * cur  = cgraph->nodes[i];
+                const ggml_tensor * next = cgraph->nodes[i + 1];
+                if (cur->op == GGML_OP_SSM_CONV &&
+                    next->op == GGML_OP_UNARY &&
+                    ggml_get_unary_op(next) == GGML_UNARY_OP_SILU &&
+                    next->src[0] == cur &&
+                    ggml_node_has_n_uses(cgraph, i, 1)) {
+                    ctx->num_additional_fused_ops = 1;
+                    fusion_string = "SSM_CONV_SILU";
+                    op_srcs_fused_elementwise[0] = false;
+                    op_srcs_fused_elementwise[1] = true;
                 }
             }
         }
