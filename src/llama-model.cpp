@@ -2652,12 +2652,22 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         splits[i] /= split_sum;
     }
 
+    // Hybrid attention-only offload: when LLAMA_OFFLOAD_ATTN_ONLY is set,
+    // offload only attention (non-recurrent) layers to GPU, keep SSM/MoE on CPU.
+    // This maximizes GPU utility for hybrid models (Qwen3.5 MoE) on limited VRAM.
+    const bool attn_only_offload = getenv("LLAMA_OFFLOAD_ATTN_ONLY") != nullptr;
+
     const int i_gpu_start = std::max(int(hparams.n_layer) + 1 - n_gpu_layers, 0);
     const int act_gpu_layers = devices.empty() ? 0 : std::min(n_gpu_layers, int(n_layer) + 1);
     auto get_layer_buft_list = [&](int il) -> llama_model::impl::layer_dev {
         const bool is_swa = il < int(hparams.n_layer) && hparams.is_swa(il);
         if (il < i_gpu_start || (il - i_gpu_start) >= act_gpu_layers) {
             LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(cpu_dev), is_swa);
+            return {cpu_dev, &pimpl->cpu_buft_list};
+        }
+        // In attn-only mode, keep recurrent (SSM/MoE) layers on CPU even if in GPU range
+        if (attn_only_offload && il < int(hparams.n_layer) && hparams.is_recurrent(il)) {
+            LLAMA_LOG_DEBUG("load_tensors: layer %3d (recurrent) kept on CPU (attn-only offload)\n", il);
             return {cpu_dev, &pimpl->cpu_buft_list};
         }
         const int layer_gpu = std::upper_bound(splits.begin(), splits.begin() + n_devices(), float(il - i_gpu_start)/act_gpu_layers) - splits.begin();
