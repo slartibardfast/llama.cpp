@@ -274,6 +274,14 @@ static inline __m256 quad_mx_delta_float(const uint8_t x0, const float y0, const
 }
 #endif
 #elif defined(__SSSE3__)
+
+// signed*signed multiply-add via abs+sign trick (SSSE3)
+static inline __m128i mul_add_epi8_sse(const __m128i x, const __m128i y) {
+    const __m128i ax = _mm_sign_epi8(x, x);
+    const __m128i sy = _mm_sign_epi8(y, x);
+    return _mm_maddubs_epi16(ax, sy);
+}
+
 // horizontally add 4x4 floats
 static inline float hsum_float_4x4(const __m128 a, const __m128 b, const __m128 c, const __m128 d) {
     __m128 res_0 =_mm_hadd_ps(a, b);
@@ -1063,6 +1071,36 @@ void ggml_vec_dot_q8_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
     }
 
     sumf = hsum_float_8(accum);
+#elif defined(__SSSE3__)
+    __m128 acc_0 = _mm_setzero_ps();
+    __m128 acc_1 = _mm_setzero_ps();
+
+    for (; ib + 1 < nb; ib += 2) {
+        const __m128i qx_1_0 = _mm_loadu_si128((const __m128i *)x[ib].qs);
+        const __m128i qx_1_1 = _mm_loadu_si128((const __m128i *)x[ib].qs + 1);
+        const __m128i qx_2_0 = _mm_loadu_si128((const __m128i *)x[ib + 1].qs);
+        const __m128i qx_2_1 = _mm_loadu_si128((const __m128i *)x[ib + 1].qs + 1);
+        const __m128i qy_1_0 = _mm_loadu_si128((const __m128i *)y[ib].qs);
+        const __m128i qy_1_1 = _mm_loadu_si128((const __m128i *)y[ib].qs + 1);
+        const __m128i qy_2_0 = _mm_loadu_si128((const __m128i *)y[ib + 1].qs);
+        const __m128i qy_2_1 = _mm_loadu_si128((const __m128i *)y[ib + 1].qs + 1);
+
+        const __m128i ones = _mm_set1_epi16(1);
+        const __m128i p1 = _mm_add_epi32(_mm_madd_epi16(mul_add_epi8_sse(qx_1_0, qy_1_0), ones),
+                                          _mm_madd_epi16(mul_add_epi8_sse(qx_1_1, qy_1_1), ones));
+        const __m128i p2 = _mm_add_epi32(_mm_madd_epi16(mul_add_epi8_sse(qx_2_0, qy_2_0), ones),
+                                          _mm_madd_epi16(mul_add_epi8_sse(qx_2_1, qy_2_1), ones));
+
+        acc_0 = _mm_add_ps(_mm_mul_ps(_mm_set1_ps(GGML_CPU_FP16_TO_FP32(x[ib].d)*GGML_CPU_FP16_TO_FP32(y[ib].d)),
+                _mm_cvtepi32_ps(p1)), acc_0);
+        acc_1 = _mm_add_ps(_mm_mul_ps(_mm_set1_ps(GGML_CPU_FP16_TO_FP32(x[ib+1].d)*GGML_CPU_FP16_TO_FP32(y[ib+1].d)),
+                _mm_cvtepi32_ps(p2)), acc_1);
+    }
+
+    __m128 acc = _mm_add_ps(acc_0, acc_1);
+    __m128 tmp = _mm_add_ps(acc, _mm_movehl_ps(acc, acc));
+    tmp = _mm_add_ss(tmp, _mm_shuffle_ps(tmp, tmp, 1));
+    sumf = _mm_cvtss_f32(tmp);
 #endif
     for (; ib < nb; ++ib) {
         int sumi = 0;
