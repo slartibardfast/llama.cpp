@@ -756,6 +756,35 @@ void ggml_vec_dot_q4_1_q8_1(int n, float * GGML_RESTRICT s, size_t bs, const voi
     }
 
     *s = hsum_float_8(acc) + summs;
+#elif defined(__SSSE3__)
+    const __m128i m4 = _mm_set1_epi8(0xF);
+    __m128 acc_0 = _mm_setzero_ps();
+    __m128 acc_1 = _mm_setzero_ps();
+    float summs = 0;
+
+    for (; ib < nb; ++ib) {
+        const float dd = GGML_CPU_FP16_TO_FP32(x[ib].d) * GGML_CPU_FP16_TO_FP32(y[ib].d);
+        summs += GGML_CPU_FP16_TO_FP32(x[ib].m) * GGML_CPU_FP16_TO_FP32(y[ib].s);
+
+        const __m128i raw = _mm_loadu_si128((const __m128i *)x[ib].qs);
+        const __m128i qx_lo = _mm_and_si128(raw, m4);
+        const __m128i qx_hi = _mm_and_si128(_mm_srli_epi16(raw, 4), m4);
+
+        const __m128i qy_lo = _mm_loadu_si128((const __m128i *)y[ib].qs);
+        const __m128i qy_hi = _mm_loadu_si128((const __m128i *)(y[ib].qs + 16));
+
+        // unsigned × signed: maddubs gives i16, madd with ones gives i32
+        const __m128i dot_lo = _mm_madd_epi16(_mm_maddubs_epi16(qx_lo, qy_lo), _mm_set1_epi16(1));
+        const __m128i dot_hi = _mm_madd_epi16(_mm_maddubs_epi16(qx_hi, qy_hi), _mm_set1_epi16(1));
+
+        acc_0 = _mm_add_ps(_mm_mul_ps(_mm_set1_ps(dd), _mm_cvtepi32_ps(dot_lo)), acc_0);
+        acc_1 = _mm_add_ps(_mm_mul_ps(_mm_set1_ps(dd), _mm_cvtepi32_ps(dot_hi)), acc_1);
+    }
+
+    __m128 acc = _mm_add_ps(acc_0, acc_1);
+    __m128 tmp = _mm_add_ps(acc, _mm_movehl_ps(acc, acc));
+    tmp = _mm_add_ss(tmp, _mm_shuffle_ps(tmp, tmp, 1));
+    *s = _mm_cvtss_f32(tmp) + summs;
 #else
     UNUSED(nb);
     UNUSED(x);
