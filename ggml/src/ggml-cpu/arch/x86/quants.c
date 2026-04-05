@@ -673,7 +673,81 @@ void quantize_row_q8_1(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, i
 
 // placeholder implementation for Apple targets
 void quantize_row_q8_K(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+#if defined(__SSE4_1__)
+    assert(k % QK_K == 0);
+    const int64_t nb = k / QK_K;
+    block_q8_K * GGML_RESTRICT yb = y;
+
+    for (int i = 0; i < nb; i++) {
+        // Find max abs value across 256 floats
+        const __m128 signBit = _mm_set1_ps(-0.0f);
+        __m128 maxAbs = _mm_setzero_ps();
+        for (int j = 0; j < QK_K; j += 4) {
+            __m128 v = _mm_loadu_ps(x + j);
+            maxAbs = _mm_max_ps(maxAbs, _mm_andnot_ps(signBit, v));
+        }
+        __m128 max4 = _mm_max_ps(maxAbs, _mm_movehl_ps(maxAbs, maxAbs));
+        max4 = _mm_max_ss(max4, _mm_movehdup_ps(max4));
+        const float amax = _mm_cvtss_f32(max4);
+
+        if (!amax) {
+            yb[i].d = 0;
+            memset(yb[i].qs, 0, QK_K);
+            memset(yb[i].bsums, 0, QK_K/16 * sizeof(int16_t));
+            x += QK_K;
+            continue;
+        }
+
+        // Find actual max (signed) for scale computation
+        float max = 0;
+        for (int j = 0; j < QK_K; ++j) {
+            if (fabsf(x[j]) == amax) { max = x[j]; break; }
+        }
+
+        const float iscale = -127.f / max;
+        const __m128 mul = _mm_set1_ps(iscale);
+        const __m128i maxv = _mm_set1_epi8(127);
+
+        // Quantize 256 floats in groups of 16 and compute bsums
+        for (int j = 0; j < QK_K; j += 16) {
+            __m128 v0 = _mm_mul_ps(_mm_loadu_ps(x + j +  0), mul);
+            __m128 v1 = _mm_mul_ps(_mm_loadu_ps(x + j +  4), mul);
+            __m128 v2 = _mm_mul_ps(_mm_loadu_ps(x + j +  8), mul);
+            __m128 v3 = _mm_mul_ps(_mm_loadu_ps(x + j + 12), mul);
+
+            v0 = _mm_round_ps(v0, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+            v1 = _mm_round_ps(v1, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+            v2 = _mm_round_ps(v2, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+            v3 = _mm_round_ps(v3, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+
+            __m128i i0 = _mm_cvtps_epi32(v0);
+            __m128i i1 = _mm_cvtps_epi32(v1);
+            __m128i i2 = _mm_cvtps_epi32(v2);
+            __m128i i3 = _mm_cvtps_epi32(v3);
+
+            // Pack to int8 and clamp to [-127, 127]
+            i0 = _mm_packs_epi32(i0, i1);
+            i2 = _mm_packs_epi32(i2, i3);
+            __m128i packed = _mm_packs_epi16(i0, i2);
+            packed = _mm_min_epi8(packed, maxv);
+
+            _mm_storeu_si128((__m128i *)(yb[i].qs + j), packed);
+
+            // Compute bsum: sum of 16 signed int8 values
+            __m128i lo16 = _mm_cvtepi8_epi16(packed);
+            __m128i hi16 = _mm_cvtepi8_epi16(_mm_srli_si128(packed, 8));
+            __m128i sum_lo = _mm_madd_epi16(lo16, _mm_set1_epi16(1));
+            __m128i sum_hi = _mm_madd_epi16(hi16, _mm_set1_epi16(1));
+            __m128i sum32 = _mm_add_epi32(sum_lo, sum_hi);
+            yb[i].bsums[j/16] = hsum_i32_4(sum32);
+        }
+
+        yb[i].d = 1.0f / iscale;
+        x += QK_K;
+    }
+#else
     quantize_row_q8_K_ref(x, y, k);
+#endif
 }
 
 //===================================== Dot products =================================
