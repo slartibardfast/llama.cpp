@@ -4,6 +4,8 @@
 
 #include "ggml.h"
 
+extern "C" bool ggml_is_hugetlb(const void * ptr, size_t size);
+
 #include <cstring>
 #include <climits>
 #include <stdexcept>
@@ -212,6 +214,13 @@ struct llama_file::impl {
         if (fp == NULL) {
             throw std::runtime_error(format("failed to open %s: %s", fname.c_str(), strerror(errno)));
         }
+#ifdef __linux__
+        // Hint kernel for sequential readahead (doubles readahead window for large model files)
+        int fid = fileno(fp);
+        if (fid >= 0) {
+            posix_fadvise(fid, 0, 0, POSIX_FADV_SEQUENTIAL);
+        }
+#endif
         seek(0, SEEK_END);
         size = tell();
         seek(0, SEEK_SET);
@@ -735,6 +744,11 @@ struct llama_mlock::impl {
     void grow_to(size_t target_size) {
         GGML_ASSERT(addr);
         if (failed_already) {
+            return;
+        }
+        // Hugetlb pages are already pinned — mlock is redundant and may fail
+        if (ggml_is_hugetlb(addr, target_size)) {
+            size = target_size;
             return;
         }
         size_t granularity = lock_granularity();
