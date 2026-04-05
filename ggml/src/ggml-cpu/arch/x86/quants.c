@@ -1843,6 +1843,71 @@ void ggml_vec_dot_tq2_0_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
 
     *s = hsum_float_8(sumf);
 
+#elif defined(__SSSE3__)
+    __m128 sumf_0 = _mm_setzero_ps();
+    __m128 sumf_1 = _mm_setzero_ps();
+
+    const __m128i mask3 = _mm_set1_epi8(3);
+
+    for (int i = 0; i < nb; ++i) {
+        // _0 = low 128 bits (bsums 0-7), _1 = high 128 bits (bsums 8-15)
+        __m128i sumi0_0 = _mm_setzero_si128();
+        __m128i sumi0_1 = _mm_setzero_si128();
+        __m128i sumi1_0 = _mm_setzero_si128();
+        __m128i sumi1_1 = _mm_setzero_si128();
+
+        for (size_t j = 0; j < sizeof(x->qs); j += 32) {
+            // Process low 16 bytes → accumulate into _0
+            __m128i qx0 = _mm_loadu_si128((const __m128i *)(x[i].qs + j));
+            __m128i qx1 = _mm_and_si128(_mm_srli_epi16(qx0, 2), mask3);
+            __m128i qx2 = _mm_and_si128(_mm_srli_epi16(qx0, 4), mask3);
+            __m128i qx3 = _mm_and_si128(_mm_srli_epi16(qx0, 6), mask3);
+            qx0 = _mm_and_si128(qx0, mask3);
+
+            qx0 = _mm_maddubs_epi16(qx0, _mm_loadu_si128((const __m128i *)(y[i].qs + j*4 +  0)));
+            qx1 = _mm_maddubs_epi16(qx1, _mm_loadu_si128((const __m128i *)(y[i].qs + j*4 + 16)));
+            qx2 = _mm_maddubs_epi16(qx2, _mm_loadu_si128((const __m128i *)(y[i].qs + j*4 + 32)));
+            qx3 = _mm_maddubs_epi16(qx3, _mm_loadu_si128((const __m128i *)(y[i].qs + j*4 + 48)));
+
+            sumi0_0 = _mm_add_epi16(sumi0_0, _mm_add_epi16(qx0, qx1));
+            sumi1_0 = _mm_add_epi16(sumi1_0, _mm_add_epi16(qx2, qx3));
+
+            // Process high 16 bytes → accumulate into _1
+            qx0 = _mm_loadu_si128((const __m128i *)(x[i].qs + j + 16));
+            qx1 = _mm_and_si128(_mm_srli_epi16(qx0, 2), mask3);
+            qx2 = _mm_and_si128(_mm_srli_epi16(qx0, 4), mask3);
+            qx3 = _mm_and_si128(_mm_srli_epi16(qx0, 6), mask3);
+            qx0 = _mm_and_si128(qx0, mask3);
+
+            qx0 = _mm_maddubs_epi16(qx0, _mm_loadu_si128((const __m128i *)(y[i].qs + j*4 +  64)));
+            qx1 = _mm_maddubs_epi16(qx1, _mm_loadu_si128((const __m128i *)(y[i].qs + j*4 +  80)));
+            qx2 = _mm_maddubs_epi16(qx2, _mm_loadu_si128((const __m128i *)(y[i].qs + j*4 +  96)));
+            qx3 = _mm_maddubs_epi16(qx3, _mm_loadu_si128((const __m128i *)(y[i].qs + j*4 + 112)));
+
+            sumi0_1 = _mm_add_epi16(sumi0_1, _mm_add_epi16(qx0, qx1));
+            sumi1_1 = _mm_add_epi16(sumi1_1, _mm_add_epi16(qx2, qx3));
+        }
+
+        const __m128i ysum_0 = _mm_loadu_si128((const __m128i *)y[i].bsums);
+        const __m128i ysum_1 = _mm_loadu_si128((const __m128i *)y[i].bsums + 1);
+        const __m128 d = _mm_set1_ps(y[i].d * GGML_CPU_FP16_TO_FP32(x[i].d));
+
+        sumi0_0 = _mm_add_epi16(sumi0_0, sumi1_0);
+        sumi0_1 = _mm_add_epi16(sumi0_1, sumi1_1);
+        sumi0_0 = _mm_sub_epi16(sumi0_0, ysum_0);
+        sumi0_1 = _mm_sub_epi16(sumi0_1, ysum_1);
+        sumi0_0 = _mm_madd_epi16(sumi0_0, _mm_set1_epi16(1));
+        sumi0_1 = _mm_madd_epi16(sumi0_1, _mm_set1_epi16(1));
+
+        sumf_0 = _mm_add_ps(_mm_mul_ps(_mm_cvtepi32_ps(sumi0_0), d), sumf_0);
+        sumf_1 = _mm_add_ps(_mm_mul_ps(_mm_cvtepi32_ps(sumi0_1), d), sumf_1);
+    }
+
+    __m128 tmp = _mm_add_ps(sumf_0, sumf_1);
+    tmp = _mm_hadd_ps(tmp, tmp);
+    tmp = _mm_hadd_ps(tmp, tmp);
+    *s = _mm_cvtss_f32(tmp);
+
 #else
     UNUSED(x);
     UNUSED(y);
