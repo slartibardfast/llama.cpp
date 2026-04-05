@@ -1489,10 +1489,17 @@ static void ggml_compute_forward_mul_mat_id_one_chunk(
                 float * dst_col = (float *) ((char *) dst->data + (i1*nb1 + i2*nb2));
 
                 for (int64_t ir0 = iir0; ir0 < iir0 + blck_0 && ir0 < ir0_end; ++ir0) {
+                    if (ir0 + 1 < ir0_end) {
+                        __builtin_prefetch(src0_cur + (ir0 + 1)*nb01, 0, 0); // next row, L1
+                    }
                     vec_dot(ne00, &tmp[ir0 - iir0], 0, src0_cur + ir0*nb01, 0, src1_col, 0, 1);
                 }
 
-                memcpy(&dst_col[iir0], tmp, (MIN(iir0 + blck_0, ir0_end) - iir0)*sizeof(float));
+                // Non-temporal store: output data not reused by this kernel
+                {
+                    const int64_t count = MIN(iir0 + blck_0, ir0_end) - iir0;
+                    memcpy(&dst_col[iir0], tmp, count*sizeof(float));
+                }
             }
         }
     }
@@ -1629,6 +1636,8 @@ static void ggml_compute_forward_mul_mat_id(
         const char * src0_cur = (const char *) src0->data + cur_a * nb02;
         const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
         const size_t row_size = ggml_row_size(vec_dot_type, ne10);
+
+
 
         const int64_t nr0 = ne01;
         const int64_t nr1 = cne1;
@@ -2032,6 +2041,20 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_gated_delta_net(params, tensor);
             } break;
         case GGML_OP_FUSED_GATE_PREP:
+            {
+                // output[i] = softplus(alpha[i] + dt_bias[i % H]) * ssm_a[i % H]
+                const float * alpha  = (const float *) tensor->src[0]->data;
+                const float * dt_bias = (const float *) tensor->src[1]->data;
+                const float * ssm_a  = (const float *) tensor->src[2]->data;
+                float * dst = (float *) tensor->data;
+                const int64_t ne = ggml_nelements(tensor);
+                const int64_t H = tensor->src[1]->ne[0];
+                for (int64_t i = 0; i < ne; i++) {
+                    const float x = alpha[i] + dt_bias[i % H];
+                    const float sp = (x > 20.0f) ? x : logf(1.0f + expf(x));
+                    dst[i] = sp * ssm_a[i % H];
+                }
+            } break;
         case GGML_OP_FUSED_GATED_NORM:
         case GGML_OP_FUSED_DUAL_L2_NORM:
             {
@@ -2221,6 +2244,9 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
                 n_tasks = n_threads;
             } break;
         case GGML_OP_FUSED_GATE_PREP:
+            {
+                n_tasks = 1; // element-wise, fast enough single-threaded
+            } break;
         case GGML_OP_FUSED_GATED_NORM:
         case GGML_OP_FUSED_DUAL_L2_NORM:
             {
@@ -3452,6 +3478,16 @@ void ggml_cpu_bf16_to_fp32(const ggml_bf16_t * x, float * y, int64_t n) {
                                     _mm_loadu_si128(
                                         (const __m128i *)(x + i))),
                                 16)));
+    }
+#elif defined(__SSE4_1__)
+    for (; i + 3 < n; i += 4) {
+        _mm_storeu_ps(y + i,
+                      _mm_castsi128_ps(
+                          _mm_slli_epi32(
+                              _mm_cvtepu16_epi32(
+                                  _mm_loadl_epi64(
+                                      (const __m128i *)(x + i))),
+                              16)));
     }
 #elif defined(__riscv_v_intrinsic) && defined(__riscv_zvfbfmin)
     // calculate step size

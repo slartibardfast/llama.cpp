@@ -195,6 +195,23 @@ void ggml_vec_dot_bf16(int n, float * GGML_RESTRICT s, size_t bs, ggml_bf16_t * 
     sumf += (ggml_float)_mm_cvtss_f32(g);
 
 #undef LOAD
+#elif defined(__SSE4_1__)
+#define LOAD(p) _mm_castsi128_ps(_mm_slli_epi32(_mm_cvtepu16_epi32(_mm_loadl_epi64((const __m128i *)(p))), 16))
+    __m128 c1 = _mm_setzero_ps();
+    __m128 c2 = _mm_setzero_ps();
+    __m128 c3 = _mm_setzero_ps();
+    __m128 c4 = _mm_setzero_ps();
+    for (; i + 16 <= n; i += 16) {
+        c1 = _mm_add_ps(_mm_mul_ps(LOAD(x + i), LOAD(y + i)), c1);
+        c2 = _mm_add_ps(_mm_mul_ps(LOAD(x + i + 4), LOAD(y + i + 4)), c2);
+        c3 = _mm_add_ps(_mm_mul_ps(LOAD(x + i + 8), LOAD(y + i + 8)), c3);
+        c4 = _mm_add_ps(_mm_mul_ps(LOAD(x + i + 12), LOAD(y + i + 12)), c4);
+    }
+    __m128 g = _mm_add_ps(_mm_add_ps(c1, c3), _mm_add_ps(c2, c4));
+    g = _mm_add_ps(g, _mm_movehl_ps(g, g));
+    g = _mm_add_ss(g, _mm_movehdup_ps(g));
+    sumf += (ggml_float)_mm_cvtss_f32(g);
+#undef LOAD
 #elif defined(__riscv_v_intrinsic) && defined(__riscv_zvfbfwma)
     size_t vl = __riscv_vsetvlmax_e32m4();
 
