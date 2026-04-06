@@ -11,6 +11,8 @@
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
+#include <type_traits>
+#include <vector>
 
 // ggml_compute_forward_dup
 
@@ -472,6 +474,33 @@ static void ggml_compute_forward_dup_bytes(
     }
 }
 
+template<typename dst_t>
+static inline void ggml_dup_from_float_row(const float * src, dst_t * dst, int64_t n) {
+    for (int64_t i = 0; i < n; ++i) {
+        dst[i] = (dst_t) src[i];
+    }
+}
+
+template<>
+inline void ggml_dup_from_float_row<float>(const float * src, float * dst, int64_t n) {
+    ggml_vec_cpy_f32(n, dst, src);
+}
+
+template<>
+inline void ggml_dup_from_float_row<ggml_fp16_t>(const float * src, ggml_fp16_t * dst, int64_t n) {
+    for (int64_t i = 0; i < n; ++i) {
+        dst[i] = GGML_CPU_FP32_TO_FP16(src[i]);
+    }
+}
+
+template<>
+inline void ggml_dup_from_float_row<ggml_bf16_t>(const float * src, ggml_bf16_t * dst, int64_t n) {
+    for (int64_t i = 0; i < n; ++i) {
+        dst[i] = GGML_FP32_TO_BF16(src[i]);
+    }
+}
+
+template<typename dst_t>
 static void ggml_compute_forward_dup_from_q(
         const ggml_compute_params * params,
               ggml_tensor * dst) {
@@ -517,9 +546,19 @@ static void ggml_compute_forward_dup_from_q(
         const int64_t i10 = i - i13*ne10*ne11*ne12 - i12*ne10*ne11 - i11*ne10;
         const int64_t dst_offset = i10*nb10 + i11*nb11 + i12*nb12 + i13*nb13;
 
-        dequantize_row_q(
-                (const void *) ((char *) src0->data + x_offset),
-                     (float *) ((char *)  dst->data + dst_offset), qk);
+        if constexpr (std::is_same_v<dst_t, float>) {
+            dequantize_row_q(
+                    (const void *) ((char *) src0->data + x_offset),
+                    (float *) ((char *) dst->data + dst_offset), qk);
+        } else {
+            std::vector<float> tmp(qk);
+
+            dequantize_row_q(
+                    (const void *) ((char *) src0->data + x_offset),
+                    tmp.data(), qk);
+
+            ggml_dup_from_float_row(tmp.data(), (dst_t *) ((char *) dst->data + dst_offset), qk);
+        }
     }
 }
 
@@ -564,9 +603,19 @@ void ggml_compute_forward_dup(
             } break;
         default:
             {
-                if (ggml_is_quantized(src0->type) && dst->type == GGML_TYPE_F32) {
-                    ggml_compute_forward_dup_from_q(params, dst);
-                    break;
+                if (ggml_is_quantized(src0->type)) {
+                    if (dst->type == GGML_TYPE_F32) {
+                        ggml_compute_forward_dup_from_q<float>(params, dst);
+                        break;
+                    }
+                    if (dst->type == GGML_TYPE_F16) {
+                        ggml_compute_forward_dup_from_q<ggml_fp16_t>(params, dst);
+                        break;
+                    }
+                    if (dst->type == GGML_TYPE_BF16) {
+                        ggml_compute_forward_dup_from_q<ggml_bf16_t>(params, dst);
+                        break;
+                    }
                 }
                 GGML_ABORT("fatal error");
             }
@@ -678,6 +727,8 @@ void ggml_compute_forward_add(
         case GGML_TYPE_Q6_K:
         case GGML_TYPE_TQ1_0:
         case GGML_TYPE_TQ2_0:
+        case GGML_TYPE_TBQ3_0:
+        case GGML_TYPE_TBQ4_0:
         case GGML_TYPE_IQ2_XXS:
         case GGML_TYPE_IQ2_XS:
         case GGML_TYPE_IQ3_XXS:
@@ -1128,6 +1179,8 @@ void ggml_compute_forward_add1(
         case GGML_TYPE_Q6_K:
         case GGML_TYPE_TQ1_0:
         case GGML_TYPE_TQ2_0:
+        case GGML_TYPE_TBQ3_0:
+        case GGML_TYPE_TBQ4_0:
         case GGML_TYPE_IQ2_XXS:
         case GGML_TYPE_IQ2_XS:
         case GGML_TYPE_IQ3_XXS:
@@ -1257,6 +1310,8 @@ void ggml_compute_forward_acc(
         case GGML_TYPE_Q6_K:
         case GGML_TYPE_TQ1_0:
         case GGML_TYPE_TQ2_0:
+        case GGML_TYPE_TBQ3_0:
+        case GGML_TYPE_TBQ4_0:
         case GGML_TYPE_IQ2_XXS:
         case GGML_TYPE_IQ2_XS:
         case GGML_TYPE_IQ3_XXS:
@@ -4345,6 +4400,8 @@ void ggml_compute_forward_out_prod(
         case GGML_TYPE_Q6_K:
         case GGML_TYPE_TQ1_0:
         case GGML_TYPE_TQ2_0:
+        case GGML_TYPE_TBQ3_0:
+        case GGML_TYPE_TBQ4_0:
         case GGML_TYPE_IQ2_XXS:
         case GGML_TYPE_IQ2_XS:
         case GGML_TYPE_IQ3_XXS:
@@ -4621,6 +4678,8 @@ void ggml_compute_forward_set(
         case GGML_TYPE_Q6_K:
         case GGML_TYPE_TQ1_0:
         case GGML_TYPE_TQ2_0:
+        case GGML_TYPE_TBQ3_0:
+        case GGML_TYPE_TBQ4_0:
         case GGML_TYPE_IQ2_XXS:
         case GGML_TYPE_IQ2_XS:
         case GGML_TYPE_IQ3_XXS:
@@ -4844,6 +4903,8 @@ void ggml_compute_forward_get_rows(
         case GGML_TYPE_Q6_K:
         case GGML_TYPE_TQ1_0:
         case GGML_TYPE_TQ2_0:
+        case GGML_TYPE_TBQ3_0:
+        case GGML_TYPE_TBQ4_0:
         case GGML_TYPE_IQ2_XXS:
         case GGML_TYPE_IQ2_XS:
         case GGML_TYPE_IQ3_XXS:
@@ -5569,6 +5630,8 @@ void ggml_compute_forward_clamp(
         case GGML_TYPE_Q6_K:
         case GGML_TYPE_TQ1_0:
         case GGML_TYPE_TQ2_0:
+        case GGML_TYPE_TBQ3_0:
+        case GGML_TYPE_TBQ4_0:
         case GGML_TYPE_IQ2_XXS:
         case GGML_TYPE_IQ2_XS:
         case GGML_TYPE_IQ3_XXS:
