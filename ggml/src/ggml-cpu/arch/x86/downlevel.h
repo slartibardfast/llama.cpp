@@ -30,6 +30,28 @@
 #include <smmintrin.h>   /* SSE4.1 */
 #include <nmmintrin.h>   /* SSE4.2 (for _mm_popcnt_u64 where available) */
 
+/* LTO + per-source -march=native interaction:
+ *
+ * ggml-turbo-quant.c and ggml-cpu.c are both compiled with -march=native
+ * via set_source_files_properties/target flags, which enables SSE4.1 and
+ * POPCNT on the Westmere target. With LTO, however, the link-time
+ * optimiser may inline functions from these TUs into callers in
+ * ggml-base (which is compiled without -march=native). That re-
+ * compilation strips the per-TU target attribute and can cause
+ * intrinsic emission to fail, or worse, silently fall back to a
+ * scalar-ish sequence.
+ *
+ * The fix: annotate our helpers with __attribute__((target(...)))
+ * so the function-level target survives LTO inlining. GCC and Clang
+ * both honour this at LTO time. */
+#if defined(__GNUC__) && !defined(__clang__)
+#define GGML_X86_TARGET_DOWNLEVEL __attribute__((target("sse2,ssse3,sse4.1,sse4.2,popcnt")))
+#else
+/* Clang does not need per-function target when -march=native is set
+ * on the TU; its LTO preserves target attributes by default. */
+#define GGML_X86_TARGET_DOWNLEVEL
+#endif
+
 #if defined(__AVX__) || defined(__F16C__)
 #define GGML_X86_HAS_NATIVE_AVX 1
 #endif
@@ -60,6 +82,7 @@ extern "C" {
 
 /* 4 fp16 values in the low 8 bytes of the input → 4 fp32 values.
  * The upper 8 bytes of the input are ignored. */
+GGML_X86_TARGET_DOWNLEVEL
 static inline __m128 ggml_x86_cvtph_ps(__m128i h) {
 #if defined(__F16C__)
     /* On native F16C hosts we hand off to the hardware instruction
@@ -104,6 +127,7 @@ static inline __m128 ggml_x86_cvtph_ps(__m128i h) {
 }
 
 /* 8 fp16 → 8 fp32. Writes 8 floats to `out`. */
+GGML_X86_TARGET_DOWNLEVEL
 static inline void ggml_x86_cvtph_ps_8(const void * src_fp16_bytes, float * out) {
     __m128i h = _mm_loadu_si128((const __m128i *) src_fp16_bytes);
 #if defined(__F16C__)
@@ -135,6 +159,7 @@ static inline void ggml_x86_cvtph_ps_8(const void * src_fp16_bytes, float * out)
  *   out[0..15] come from low nibbles (qs[0..15] & 0x0F) - 8
  *   out[16..31] come from high nibbles (qs[0..15] >> 4) - 8
  * both scaled by `scale`. */
+GGML_X86_TARGET_DOWNLEVEL
 static inline void ggml_x86_q4_0_unpack_32(const uint8_t * qs, float scale, float * out) {
     const __m128i mask_0f = _mm_set1_epi8(0x0F);
     const __m128i bias8   = _mm_set1_epi32(8);
