@@ -2939,23 +2939,25 @@ struct ggml_cplan ggml_graph_plan(
                         // Per-thread: Q_q + KQ + mask + VKQ32 + V32 + K_f32 + padding
                         size_t prefill  = sizeof(float)*(GGML_FA_TILE_Q*DK + 2*GGML_FA_TILE_Q*GGML_FA_TILE_KV + GGML_FA_TILE_Q*DV + GGML_FA_TILE_KV*DV + GGML_FA_TILE_KV*DK)*n_tasks;
 
-                        // Decode path: n_kv_chunks = n_tasks (one chunk per thread)
-                        // Per-thread: VKQ accmulator (DV), partial M, partial S + intra-thread scratch for V, Q and VKQ
-                        size_t n_chunks = n_tasks;
-                        size_t decode   = sizeof(float)*(neq2*n_chunks*(2+DV) + n_tasks*(DK + 2*DV));
+                        // Decode path layout in wdata (must match
+                        // ggml_compute_forward_flash_attn_ext_f16_one_chunk):
+                        //   [0 ... n_tasks * scratch_stride]   per-thread Q_q/VKQ scratch
+                        //       scratch_stride = DK + 2*DV + CACHE_LINE_SIZE_F32
+                        //   [... + n_tasks * tq_stride]        TQ_KV_1B scores (when TQ K)
+                        //       tq_stride = ceil(nek1 / CACHE_LINE_SIZE_F32) * CACHE_LINE_SIZE_F32
+                        //   [... + neq2 * n_tasks * (2 + DV)]  split-KV partials (when split-KV)
+                        //
+                        // Sum the components so that TQ and split-KV can coexist.
+                        const size_t cache_line_f32 = CACHE_LINE_SIZE/sizeof(float);
+                        const size_t scratch_stride = (size_t)(DK + 2*DV + cache_line_f32);
+                        size_t decode = sizeof(float) * (size_t) n_tasks * scratch_stride;
+                        if (node->src[1]->type == GGML_TYPE_TQ_KV_1B) {
+                            const size_t tq_stride = ((nek1 + cache_line_f32 - 1) / cache_line_f32) * cache_line_f32;
+                            decode += sizeof(float) * (size_t) n_tasks * tq_stride;
+                        }
+                        decode += sizeof(float) * (size_t) neq2 * (size_t) n_tasks * (size_t)(2 + DV);
 
                         cur += MAX(prefill, decode);
-
-                        // Reserve per-thread cache-line-aligned scores buffer for
-                        // TQ_KV_1B Hamming attention. Lives at offset
-                        //   nth * (DK + 2*DV + CACHE_LINE_SIZE_F32) floats
-                        // from the start of wdata, after the per-thread Q_q/VKQ scratch
-                        // used by ggml_compute_forward_flash_attn_ext_f16_one_chunk.
-                        if (node->src[1]->type == GGML_TYPE_TQ_KV_1B) {
-                            const size_t cache_line_f32 = CACHE_LINE_SIZE/sizeof(float);
-                            const size_t tq_stride = ((nek1 + cache_line_f32 - 1) / cache_line_f32) * cache_line_f32;
-                            cur += sizeof(float) * (size_t) n_tasks * tq_stride;
-                        }
                     } break;
                 case GGML_OP_FLASH_ATTN_BACK:
                     {

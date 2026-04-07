@@ -8850,15 +8850,37 @@ static void ggml_compute_forward_flash_attn_ext_f16(
     // When use_ref is set, force the vec-only reference implementation (no tiling, no KV-chunking)
     const bool use_ref = params->use_ref;
 
+    // Keep the original F32/F16 predicate available — the tiled flash
+    // attention path below still requires it (the tiled kernel has no
+    // TQ support).
     const bool kv_is_f32_or_f16 = (k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_F16);
-    const bool use_split_kv_path = !use_ref && (neq1 == 1 && neq3 == 1) && kv_is_f32_or_f16 && (k->type == v->type) && q->type == GGML_TYPE_F32 && nek1 >= 512;
+
+    // Split-KV path admits F32, F16, and TQ_KV_1B keys. For TQ_KV_1B we
+    // drop the k->type == v->type constraint because V is independently
+    // typed (q4_0 or TQ_V_4B). The _one_chunk function's TQ_KV_1B fast
+    // path already handles per-chunk ic_start..ic_end correctly.
+    const bool kv_is_supported_for_split =
+        kv_is_f32_or_f16 || (k->type == GGML_TYPE_TQ_KV_1B);
+    const bool split_kv_type_match =
+        (k->type == GGML_TYPE_TQ_KV_1B) ? true : (k->type == v->type);
+    const bool use_split_kv_path = !use_ref && (neq1 == 1 && neq3 == 1) &&
+        kv_is_supported_for_split && split_kv_type_match &&
+        q->type == GGML_TYPE_F32 && nek1 >= 512;
 
     if (use_split_kv_path) {
         const int64_t chunk_size = (nek1 + nth - 1) / nth;
 
         // Partials buffer layout: [q_head][kv_chunk][M, S, VKQ]
+        // TQ_KV_1B reserves per-thread scratch IMMEDIATELY after the per-
+        // thread scratch slab; partials must come after BOTH. See the
+        // work_size calc in ggml-cpu.c GGML_OP_FLASH_ATTN_EXT.
         const int64_t partial_size  = 2 + DV;
-        float *       partials_base = (float *) params->wdata + nth * (DK + 2*DV + CACHE_LINE_SIZE_F32);
+        size_t partials_offset = (size_t) nth * (DK + 2*DV + CACHE_LINE_SIZE_F32);
+        if (k->type == GGML_TYPE_TQ_KV_1B) {
+            const size_t tq_stride = ((nek1 + CACHE_LINE_SIZE_F32 - 1) / CACHE_LINE_SIZE_F32) * CACHE_LINE_SIZE_F32;
+            partials_offset += (size_t) nth * tq_stride;
+        }
+        float * partials_base = (float *) params->wdata + partials_offset;
 
         const int64_t ic_start = ith * chunk_size;
         const int64_t ic_end   = std::min(ic_start + chunk_size, nek1);
