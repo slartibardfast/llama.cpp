@@ -66,46 +66,39 @@ static inline __m128 ggml_x86_cvtph_ps(__m128i h) {
      * so that this header is a drop-in on any x86 target. */
     return _mm_cvtph_ps(h);
 #else
+    /* Constants, following Giesen's half-to-float SSE2 gist. */
     const __m128i mask_nosign   = _mm_set1_epi32(0x7FFF);
     const __m128i mask_justsign = _mm_set1_epi32(0x8000);
-    const __m128i was_infnan    = _mm_set1_epi32(0x7BFF);
-    const __m128i was_nan       = _mm_set1_epi32(0x7C00);
+    const __m128i was_infnan    = _mm_set1_epi32(0x7BFF);   /* threshold: > this means inf/NaN */
     const __m128  magic         = _mm_castsi128_ps(_mm_set1_epi32((254 - 15) << 23));
-    const __m128  was_infnan_f  = _mm_castsi128_ps(_mm_set1_epi32((127 + 16) << 23));
+    const __m128i inf_exp_fp32  = _mm_set1_epi32(0x7F800000); /* fp32 +inf exponent pattern */
 
     /* Zero-extend the 4 packed fp16 values to 32-bit lanes */
-    __m128i expmant = _mm_cvtepu16_epi32(h);
+    __m128i expmant_full = _mm_cvtepu16_epi32(h);
 
-    /* Split sign and magnitude */
-    __m128i sign    = _mm_and_si128(expmant, mask_justsign);
-    __m128i magn    = _mm_and_si128(expmant, mask_nosign);
+    /* Split sign and magnitude (15-bit) */
+    __m128i sign    = _mm_and_si128(expmant_full, mask_justsign);
+    __m128i expmant = _mm_and_si128(expmant_full, mask_nosign);
 
-    /* Shift sign to bit 31 of the fp32 lane, shift magnitude up 13
-     * bits to align mantissa and exponent with fp32 positions. */
+    /* Shift sign to bit 31 and magnitude up 13 bits */
     __m128i sign32  = _mm_slli_epi32(sign, 16);
-    __m128i shifted = _mm_slli_epi32(magn, 13);
+    __m128i shifted = _mm_slli_epi32(expmant, 13);
 
-    /* Multiply by the magic constant to rebias the exponent from
-     * fp16's (bias=15) to fp32's (bias=127). This handles denormal
-     * fp16 inputs in one shot because fp32 can represent them as
-     * normalised values. */
+    /* Multiply by magic (2^(254-15-127) = 2^112) to rebias the exponent
+     * from fp16 (bias 15) to fp32 (bias 127). This conveniently
+     * renormalises fp16 denormals as a side effect. */
     __m128  scaled  = _mm_mul_ps(_mm_castsi128_ps(shifted), magic);
 
-    /* Restore the sign bit */
-    __m128i result  = _mm_or_si128(_mm_castps_si128(scaled), sign32);
+    /* Special case: fp16 inf/NaN when expmant > 0x7BFF (i.e. exp == 0x1F).
+     * We need to OR in 0x7F800000 to bump the fp32 exponent to 0xFF. The
+     * mantissa carried through from `shifted` preserves NaN payloads. */
+    __m128i b_was_infnan = _mm_cmpgt_epi32(expmant, was_infnan);
+    __m128i inf_patch    = _mm_and_si128(b_was_infnan, inf_exp_fp32);
 
-    /* Special case: fp16 infinity / NaN. Detect by magnitude > 0x7BFF
-     * and force the fp32 exponent to 0xFF while preserving sign and
-     * mantissa. */
-    __m128i b_was_infnan = _mm_cmpgt_epi32(magn, was_infnan);
-    __m128i infnan_val   = _mm_or_si128(
-        _mm_castps_si128(was_infnan_f),
-        sign32);
-    result = _mm_or_si128(
-        _mm_andnot_si128(b_was_infnan, result),
-        _mm_and_si128(b_was_infnan, infnan_val));
+    /* Assemble final: scaled-or-inf_patch OR sign32 */
+    __m128i result = _mm_or_si128(_mm_castps_si128(scaled), inf_patch);
+    result         = _mm_or_si128(result, sign32);
 
-    (void) was_nan; /* reserved for future NaN-preservation refinement */
     return _mm_castsi128_ps(result);
 #endif
 }
