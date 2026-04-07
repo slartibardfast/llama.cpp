@@ -146,6 +146,15 @@ extern "C" {
     GGML_BACKEND_API void ggml_cpu_fp32_to_bf16(const float *, ggml_bf16_t *, int64_t);
     GGML_BACKEND_API void ggml_cpu_bf16_to_fp32(const ggml_bf16_t *, float *, int64_t);
 
+    /* ggml-base's dequantize_row_q4_0 is a scalar loop compiled without
+     * -march=native. This is the ggml-cpu override that ops.cpp's flash
+     * attention dispatches to when v->type == GGML_TYPE_Q4_0, providing
+     * an SSE4.1 vectorised body via simde/native AVX intrinsics.
+     * block_q4_0 is a typedef in ggml-common.h; we opaque-pointer it
+     * through void* and let the caller/callee cast — keeping ggml-common.h
+     * out of the public ggml-cpu.h include chain. */
+    GGML_BACKEND_API void ggml_cpu_dequantize_row_q4_0(const void *, float *, int64_t);
+
 #ifdef __cplusplus
 }
 #endif

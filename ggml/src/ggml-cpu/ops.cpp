@@ -8217,7 +8217,18 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     ggml_type         const k_vec_dot_type = ggml_get_type_traits_cpu(k->type)->vec_dot_type;
     ggml_from_float_t const q_to_vec_dot   = ggml_get_type_traits_cpu(k_vec_dot_type)->from_float;
     ggml_vec_dot_t    const kq_vec_dot     = ggml_get_type_traits_cpu(k->type)->vec_dot;
-    ggml_to_float_t   const v_to_float     = ggml_get_type_traits(v->type)->to_float;
+    ggml_to_float_t         v_to_float     = ggml_get_type_traits(v->type)->to_float;
+
+    // Override scalar ggml-base dequant with SSE4.1/AVX vectorised ggml-cpu
+    // versions for the V cache types that actually get hit in the flash
+    // attention V loop. On Westmere these replace per-element table lookups
+    // (fp16) and scalar nibble unpack (q4_0) — both of which dominate the
+    // per-K cost at filled context before this override.
+    if (v->type == GGML_TYPE_F16) {
+        v_to_float = (ggml_to_float_t) ggml_cpu_fp16_to_fp32;
+    } else if (v->type == GGML_TYPE_Q4_0) {
+        v_to_float = (ggml_to_float_t) ggml_cpu_dequantize_row_q4_0;
+    }
 
     GGML_ASSERT((                            q_to_vec_dot) && "fattn: unsupported K-type");
     GGML_ASSERT((v->type == GGML_TYPE_F32 || v_to_float  ) && "fattn: unsupported V-type");

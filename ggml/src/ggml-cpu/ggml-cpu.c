@@ -206,6 +206,17 @@ typedef pthread_t ggml_thread_t;
 
 #include "ggml-turbo-quant.h"
 
+/* Layer 1 of the systematic shimming architecture: hand-rolled SSE4.1
+ * implementations of AVX / AVX2 / F16C intrinsics for Westmere-class
+ * x86 (SSE4.1 + POPCNT, no F16C, no AVX). See
+ *   ggml/src/ggml-cpu/arch/x86/downlevel.h
+ * for the API and the systematic plan in serene-bubbling-orbit.md
+ * for the full shimming architecture. */
+#if defined(__SSE4_1__) && !defined(__ARM_NEON)
+#include "arch/x86/downlevel.h"
+#define GGML_CPU_HAVE_DOWNLEVEL_X86 1
+#endif
+
 // Reference vec_dot for TQ_KV_1B used by ggml's generic compute paths
 // (anything that is not the specialised flash attention loop in
 // ggml_compute_forward_flash_attn_ext_f16_one_chunk, which dispatches
@@ -3404,6 +3415,20 @@ void ggml_cpu_fp16_to_fp32(const ggml_fp16_t * x, float * y, int64_t n) {
         _mm_storeu_ps(y + i, y_vec);
     }
 
+#elif defined(GGML_CPU_HAVE_DOWNLEVEL_X86)
+    /* Westmere class (SSE4.1 + POPCNT, no F16C, no AVX) via Layer 1 shim.
+     * ggml_x86_cvtph_ps_8 vendors Giesen's half_to_float_SSE2 algorithm
+     * (public domain) and stays register-resident: ~19 SSE2 instructions
+     * per 4 fp16 values, no stack spills. Correct on denormals, ±inf,
+     * NaN, ±zero. See ggml-cpu/arch/x86/downlevel.h. */
+    for (; i + 7 < n; i += 8) {
+        ggml_x86_cvtph_ps_8(x + i, y + i);
+    }
+    for (; i + 3 < n; i += 4) {
+        __m128i h = _mm_loadl_epi64((const __m128i *)(x + i));
+        _mm_storeu_ps(y + i, ggml_x86_cvtph_ps(h));
+    }
+
 #elif defined(__riscv_v_intrinsic) && defined(__riscv_zvfhmin)
     // calculate step size
     const int epr = __riscv_vsetvlmax_e16m2();
@@ -3436,6 +3461,33 @@ void ggml_cpu_fp16_to_fp32(const ggml_fp16_t * x, float * y, int64_t n) {
         y[i] = GGML_CPU_FP16_TO_FP32(x[i]);
     }
 }
+
+#if defined(GGML_CPU_HAVE_DOWNLEVEL_X86) || defined(__AVX__) || defined(__AVX2__) || defined(__AVX512F__)
+/* SSE4.1 vectorised q4_0 dequantize via the Layer 1 shim helper.
+ *
+ * ggml-base's `dequantize_row_q4_0` is a scalar loop. On Westmere the V
+ * cache with -ctv q4_0 passes its dequant through that scalar path in
+ * the flash attention loop where it dominates per-K iteration cost.
+ * This is a drop-in faster version that ops.cpp's flash attention
+ * dispatches to via a v_to_float override.
+ *
+ * The per-block SSE4.1 body lives in
+ * ggml-cpu/arch/x86/downlevel.h:ggml_x86_q4_0_unpack_32; this function
+ * just unwraps the block header (fp16 scale) and calls the helper per
+ * block. */
+void ggml_cpu_dequantize_row_q4_0(const void * GGML_RESTRICT vx,
+                                   float * GGML_RESTRICT y, int64_t k) {
+    const block_q4_0 * GGML_RESTRICT x = (const block_q4_0 *) vx;
+    const int qk = QK4_0;
+    assert(k % qk == 0);
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        const float d = GGML_CPU_FP16_TO_FP32(x[i].d);
+        ggml_x86_q4_0_unpack_32(x[i].qs, d, y + i*qk);
+    }
+}
+#endif /* GGML_CPU_HAVE_DOWNLEVEL_X86 || AVX / AVX2 / AVX512F */
 
 void ggml_cpu_fp32_to_bf16(const float * x, ggml_bf16_t * y, int64_t n) {
     int64_t i = 0;
