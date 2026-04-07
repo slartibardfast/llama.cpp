@@ -8377,7 +8377,13 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
                 }
 
                 // V += v*expf(s - M)
-                if (v_to_float) {
+                // Fast path for TurboQuant V 4-bit: fused dequant+mad in
+                // one register-resident SSE4.1 pass, no intermediate V32
+                // buffer. See ggml-turbo-quant.c:tq_v_4b_vec_mad_f32.
+                if (v->type == GGML_TYPE_TQ_V_4B) {
+                    tq_v_4b_vec_mad_f32(DV, VKQ32,
+                                        (const block_tq_v_4b *) v_data, vs);
+                } else if (v_to_float) {
                     v_to_float(v_data, V32, DV);
                     ggml_vec_mad_f32(DV, VKQ32, V32, vs);
                 } else {

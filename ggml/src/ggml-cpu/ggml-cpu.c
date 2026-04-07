@@ -316,6 +316,16 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .vec_dot_type             = GGML_TYPE_F32,
         .nrows                    = 1,
     },
+    [GGML_TYPE_TQ_V_4B] = {
+        /* TQ_V_4B is only used as a V cache type; flash attention's V
+         * loop calls tq_v_4b_vec_mad_f32 directly. vec_dot is never
+         * invoked for this type but we register from_float so ggml_set_rows
+         * can write into the cache during prompt processing. */
+        .from_float               = (ggml_from_float_t) quantize_row_tq_v_4b_ref,
+        .vec_dot                  = NULL,
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
     [GGML_TYPE_Q2_K] = {
         .from_float               = quantize_row_q2_K,
         .vec_dot                  = ggml_vec_dot_q2_K_q8_K,

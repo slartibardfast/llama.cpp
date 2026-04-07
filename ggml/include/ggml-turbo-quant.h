@@ -56,6 +56,38 @@ typedef struct {
 typedef char tq_check_block_size[(sizeof(block_tq_kv_1b) == 24) ? 1 : -1];
 
 /* ============================================================
+ * Block definition: TurboQuant V 4-bit (symmetric, 128 elements)
+ *
+ * 66 bytes per 128 elements = 4.125 bits per element (with metadata).
+ *
+ * Layout:
+ *   d       (2B) - per-block scale (FP16, negative, following q4_0 semantics)
+ *   qs     (64B) - 128 signed 4-bit values, packed as nibble pairs
+ *                   low nibble at qs[j] & 0x0F, high nibble at qs[j] >> 4
+ *
+ * Quantization:
+ *   d = -max(abs(x_min), abs(x_max)) / 8          (matches q4_0 sign convention)
+ *   q = clamp(round(x / d + 8), 0, 15)            (zero-point 8, unsigned storage)
+ *
+ * Dequantization:
+ *   x ≈ (q - 8) * d                               (symmetric, centered at zero)
+ *
+ * Layout matches ggml q4_0 semantics but with 128-element blocks (vs
+ * q4_0's 32-element) to amortise the scale over 4x more elements and
+ * match our K-side TQ_KV_1B block size for paired cache storage.
+ * ============================================================ */
+
+#define TQ_V_4B_BLOCK_SIZE 128
+
+typedef struct {
+    uint16_t d;                             /* per-block scale in FP16 */
+    uint8_t  qs[TQ_V_4B_BLOCK_SIZE / 2];    /* 128 nibbles = 64 bytes */
+} block_tq_v_4b;
+
+/* Compile-time size check: 2 + 64 = 66 bytes */
+typedef char tq_v_4b_check_block_size[(sizeof(block_tq_v_4b) == 66) ? 1 : -1];
+
+/* ============================================================
  * Public API (matches llama.cpp quantize/dequantize convention)
  *
  * k: number of elements (must be multiple of TQ_KV_1B_BLOCK_SIZE)
@@ -124,6 +156,41 @@ void tq_kv_1b_attention(const float * query, const block_tq_kv_1b * kv_cache,
 void tq_kv_1b_attention_multi(const float * query,
                                const block_tq_kv_1b * kv_cache,
                                float * scores, int valid_count, int head_dim);
+
+/* ============================================================
+ * TurboQuant V 4-bit API
+ * ============================================================ */
+
+/**
+ * Quantize a row of float V values into TQ_V_4B blocks.
+ * k must be a multiple of TQ_V_4B_BLOCK_SIZE (128).
+ *
+ * Symmetric q4_0-style scheme:
+ *   d = -max(abs(x)) / 8
+ *   q = clamp(round(x / d + 8), 0, 15)
+ */
+void quantize_row_tq_v_4b_ref(const float * x, block_tq_v_4b * y, int64_t k);
+
+/**
+ * Dequantize a row of TQ_V_4B blocks back to float. Used by ggml's
+ * type_traits to_float slot for generic code paths (our hot path
+ * bypasses this by calling the fused mad helper directly).
+ */
+void dequantize_row_tq_v_4b(const block_tq_v_4b * x, float * y, int64_t k);
+
+/**
+ * Fused V dequant + vector mad for the flash attention hot loop.
+ *
+ * Computes: VKQ32[0..dv-1] += dequant(v[0..dv/128 blocks]) * vs
+ *
+ * This avoids the dequant-then-mad round trip and the intermediate
+ * fp32 V buffer (per-thread scratch). The dequant result is kept
+ * in registers and directly fmadd'd into VKQ32. On Westmere this
+ * is a register-resident SSE4.1 loop.
+ *
+ * dv must be a multiple of TQ_V_4B_BLOCK_SIZE (128).
+ */
+void tq_v_4b_vec_mad_f32(int dv, float * vkq, const block_tq_v_4b * v, float vs);
 
 #ifdef __cplusplus
 }

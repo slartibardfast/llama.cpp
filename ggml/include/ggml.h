@@ -429,7 +429,8 @@ extern "C" {
         GGML_TYPE_MXFP4   = 39, // MXFP4 (1 block)
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_TQ_KV_1B = 41, // quant.cpp 1-bit KV (24 bytes per 128 elements)
-        GGML_TYPE_COUNT   = 42,
+        GGML_TYPE_TQ_V_4B  = 42, // TurboQuant V 4-bit (66 bytes per 128 elements)
+        GGML_TYPE_COUNT   = 43,
     };
 
     // precision

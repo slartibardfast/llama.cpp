@@ -422,3 +422,173 @@ void tq_kv_1b_attention_multi(const float * query,
         scores[s] = total;
     }
 }
+
+/* ============================================================
+ * TurboQuant V 4-bit quantization
+ *
+ * Symmetric q4_0-style scheme, 128-element blocks (vs q4_0's 32).
+ * Layout matches block_tq_v_4b in the header.
+ *
+ * The block size bump from 32 → 128 amortises the fp16 scale across
+ * 4× more elements (2 bytes per 128 vs 8 bytes per 128) and aligns
+ * with our K-side TQ_KV_1B blocks so paired cache storage (Step 4.75)
+ * can stride a single pair of blocks per K position.
+ * ============================================================ */
+
+void quantize_row_tq_v_4b_ref(const float * x, block_tq_v_4b * y, int64_t k) {
+    if (!x || !y || k <= 0) return;
+    const int qk = TQ_V_4B_BLOCK_SIZE;
+    const int nb = (int)(k / qk);
+
+    for (int i = 0; i < nb; i++) {
+        /* Per-block max magnitude, matching ggml q4_0's scale derivation. */
+        float amax = 0.0f;
+        float max  = 0.0f;
+        for (int j = 0; j < qk; j++) {
+            const float v = x[i*qk + j];
+            const float a = v < 0.0f ? -v : v;
+            if (a > amax) { amax = a; max = v; }
+        }
+        const float d  = max / -8.0f;        /* negative, q4_0 convention     */
+        const float id = (d != 0.0f) ? (1.0f / d) : 0.0f;
+
+        y[i].d = tq_fp32_to_fp16(d);
+
+        for (int j = 0; j < qk/2; j++) {
+            const float x0 = x[i*qk + 0        + j] * id;
+            const float x1 = x[i*qk + qk/2     + j] * id;
+
+            /* Round to nearest even, add zero-point 8, clamp to [0, 15]. */
+            int q0 = (int)(x0 + 8.5f);
+            int q1 = (int)(x1 + 8.5f);
+            if (q0 < 0)  q0 = 0;
+            if (q0 > 15) q0 = 15;
+            if (q1 < 0)  q1 = 0;
+            if (q1 > 15) q1 = 15;
+
+            y[i].qs[j] = (uint8_t)(q0 | (q1 << 4));
+        }
+    }
+}
+
+void dequantize_row_tq_v_4b(const block_tq_v_4b * x, float * y, int64_t k) {
+    const int qk = TQ_V_4B_BLOCK_SIZE;
+    const int nb = (int)(k / qk);
+
+    for (int i = 0; i < nb; i++) {
+        const float d = tq_fp16_to_fp32(x[i].d);
+        for (int j = 0; j < qk/2; j++) {
+            const int lo = (x[i].qs[j] & 0x0F) - 8;
+            const int hi = (x[i].qs[j] >>   4) - 8;
+            y[i*qk + 0        + j] = (float) lo * d;
+            y[i*qk + qk/2     + j] = (float) hi * d;
+        }
+    }
+}
+
+/* Fused V dequant + vec mad for the flash attention hot path.
+ *
+ * SSE4.1 register-resident body. Each block processes 128 elements
+ * in the same interleaved low-nibbles-then-high-nibbles layout that
+ * ggml_x86_q4_0_unpack_32 uses but with a 128-element rather than
+ * 32-element block. The scale `d` and softmax weight `vs` are folded
+ * into `scaled = d * vs` so the inner loop is one `_mm_mul_ps` plus
+ * one `_mm_add_ps` per 4-lane store of VKQ32.
+ *
+ * Because ggml-turbo-quant.c is compiled with per-source -march=native
+ * (see CMakeLists.txt set_source_files_properties), we can use SSE4.1
+ * intrinsics directly here. */
+#if defined(__SSE4_1__)
+
+void tq_v_4b_vec_mad_f32(int dv, float * vkq, const block_tq_v_4b * v, float vs) {
+    const int qk = TQ_V_4B_BLOCK_SIZE;
+    if ((dv % qk) != 0) return; /* caller bug */
+    const int nb = dv / qk;
+
+    const __m128i mask_0f = _mm_set1_epi8(0x0F);
+    const __m128i bias8   = _mm_set1_epi32(8);
+
+    for (int b = 0; b < nb; b++) {
+        const float scale = tq_fp16_to_fp32(v[b].d) * vs;
+        const __m128 vs_vec = _mm_set1_ps(scale);
+        const uint8_t * qs = v[b].qs;
+
+        float * out = vkq + b * qk;
+
+        /* Low nibbles: qs[0..63] & 0x0F → 64 values (half of the block). */
+        for (int j = 0; j < qk/2; j += 16) {
+            /* Load 16 bytes (16 nibble pairs / 16 low nibbles here). */
+            const __m128i packed = _mm_loadu_si128((const __m128i *)(qs + j));
+            const __m128i lo = _mm_and_si128(packed, mask_0f);
+
+            /* Expand 4 bytes at a time to int32x4, subtract zero-point 8,
+             * convert to float, multiply by scale, fmadd into VKQ. */
+            __m128i l0 = _mm_sub_epi32(_mm_cvtepu8_epi32(lo), bias8);
+            __m128i l1 = _mm_sub_epi32(_mm_cvtepu8_epi32(_mm_srli_si128(lo, 4)), bias8);
+            __m128i l2 = _mm_sub_epi32(_mm_cvtepu8_epi32(_mm_srli_si128(lo, 8)), bias8);
+            __m128i l3 = _mm_sub_epi32(_mm_cvtepu8_epi32(_mm_srli_si128(lo, 12)), bias8);
+
+            __m128 f0 = _mm_mul_ps(_mm_cvtepi32_ps(l0), vs_vec);
+            __m128 f1 = _mm_mul_ps(_mm_cvtepi32_ps(l1), vs_vec);
+            __m128 f2 = _mm_mul_ps(_mm_cvtepi32_ps(l2), vs_vec);
+            __m128 f3 = _mm_mul_ps(_mm_cvtepi32_ps(l3), vs_vec);
+
+            __m128 a0 = _mm_loadu_ps(out + 0  + j);
+            __m128 a1 = _mm_loadu_ps(out + 4  + j);
+            __m128 a2 = _mm_loadu_ps(out + 8  + j);
+            __m128 a3 = _mm_loadu_ps(out + 12 + j);
+
+            _mm_storeu_ps(out + 0  + j, _mm_add_ps(a0, f0));
+            _mm_storeu_ps(out + 4  + j, _mm_add_ps(a1, f1));
+            _mm_storeu_ps(out + 8  + j, _mm_add_ps(a2, f2));
+            _mm_storeu_ps(out + 12 + j, _mm_add_ps(a3, f3));
+        }
+
+        /* High nibbles: (qs[0..63] >> 4) & 0x0F → 64 values (second half). */
+        for (int j = 0; j < qk/2; j += 16) {
+            const __m128i packed = _mm_loadu_si128((const __m128i *)(qs + j));
+            const __m128i hi = _mm_and_si128(_mm_srli_epi16(packed, 4), mask_0f);
+
+            __m128i h0 = _mm_sub_epi32(_mm_cvtepu8_epi32(hi), bias8);
+            __m128i h1 = _mm_sub_epi32(_mm_cvtepu8_epi32(_mm_srli_si128(hi, 4)), bias8);
+            __m128i h2 = _mm_sub_epi32(_mm_cvtepu8_epi32(_mm_srli_si128(hi, 8)), bias8);
+            __m128i h3 = _mm_sub_epi32(_mm_cvtepu8_epi32(_mm_srli_si128(hi, 12)), bias8);
+
+            __m128 f0 = _mm_mul_ps(_mm_cvtepi32_ps(h0), vs_vec);
+            __m128 f1 = _mm_mul_ps(_mm_cvtepi32_ps(h1), vs_vec);
+            __m128 f2 = _mm_mul_ps(_mm_cvtepi32_ps(h2), vs_vec);
+            __m128 f3 = _mm_mul_ps(_mm_cvtepi32_ps(h3), vs_vec);
+
+            __m128 a0 = _mm_loadu_ps(out + qk/2 + 0  + j);
+            __m128 a1 = _mm_loadu_ps(out + qk/2 + 4  + j);
+            __m128 a2 = _mm_loadu_ps(out + qk/2 + 8  + j);
+            __m128 a3 = _mm_loadu_ps(out + qk/2 + 12 + j);
+
+            _mm_storeu_ps(out + qk/2 + 0  + j, _mm_add_ps(a0, f0));
+            _mm_storeu_ps(out + qk/2 + 4  + j, _mm_add_ps(a1, f1));
+            _mm_storeu_ps(out + qk/2 + 8  + j, _mm_add_ps(a2, f2));
+            _mm_storeu_ps(out + qk/2 + 12 + j, _mm_add_ps(a3, f3));
+        }
+    }
+}
+
+#else /* !__SSE4_1__ */
+
+void tq_v_4b_vec_mad_f32(int dv, float * vkq, const block_tq_v_4b * v, float vs) {
+    const int qk = TQ_V_4B_BLOCK_SIZE;
+    if ((dv % qk) != 0) return;
+    const int nb = dv / qk;
+    for (int b = 0; b < nb; b++) {
+        const float scale = tq_fp16_to_fp32(v[b].d) * vs;
+        const uint8_t * qs = v[b].qs;
+        float * out = vkq + b * qk;
+        for (int j = 0; j < qk/2; j++) {
+            const int lo = (qs[j] & 0x0F) - 8;
+            const int hi = (qs[j] >>   4) - 8;
+            out[j]        += (float) lo * scale;
+            out[qk/2 + j] += (float) hi * scale;
+        }
+    }
+}
+
+#endif /* __SSE4_1__ */
