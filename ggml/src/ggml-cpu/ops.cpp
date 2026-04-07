@@ -8850,37 +8850,30 @@ static void ggml_compute_forward_flash_attn_ext_f16(
     // When use_ref is set, force the vec-only reference implementation (no tiling, no KV-chunking)
     const bool use_ref = params->use_ref;
 
-    // Keep the original F32/F16 predicate available — the tiled flash
-    // attention path below still requires it (the tiled kernel has no
-    // TQ support).
+    // Split-KV path is gated on F32/F16 K + matching V type.
+    //
+    // TQ_KV_1B was briefly admitted (Step 5 attempt) and regressed the
+    // 8K-fill benchmark from 4.21 → 3.95 t/s. Root cause: at partial
+    // fill (e.g. 7835 valid keys in a 65536-slot cache), the split-KV
+    // chunking divides the ALLOCATED range across threads, not the
+    // valid range. With chunk_size = 10923 and only 7835 valid keys,
+    // thread 0 handles the entire valid range while threads 1..5 spin
+    // on fully-masked chunks. The non-split per-query-head parallelism
+    // (16 heads split across 6 threads) balances better for this
+    // shape. Sticking with the non-split path for TQ.
+    //
+    // Re-enabling this is a follow-up that requires valid-range-aware
+    // chunking (compute valid_end once, then divide [0, valid_end)
+    // across threads) — out of scope for this session.
     const bool kv_is_f32_or_f16 = (k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_F16);
-
-    // Split-KV path admits F32, F16, and TQ_KV_1B keys. For TQ_KV_1B we
-    // drop the k->type == v->type constraint because V is independently
-    // typed (q4_0 or TQ_V_4B). The _one_chunk function's TQ_KV_1B fast
-    // path already handles per-chunk ic_start..ic_end correctly.
-    const bool kv_is_supported_for_split =
-        kv_is_f32_or_f16 || (k->type == GGML_TYPE_TQ_KV_1B);
-    const bool split_kv_type_match =
-        (k->type == GGML_TYPE_TQ_KV_1B) ? true : (k->type == v->type);
-    const bool use_split_kv_path = !use_ref && (neq1 == 1 && neq3 == 1) &&
-        kv_is_supported_for_split && split_kv_type_match &&
-        q->type == GGML_TYPE_F32 && nek1 >= 512;
+    const bool use_split_kv_path = !use_ref && (neq1 == 1 && neq3 == 1) && kv_is_f32_or_f16 && (k->type == v->type) && q->type == GGML_TYPE_F32 && nek1 >= 512;
 
     if (use_split_kv_path) {
         const int64_t chunk_size = (nek1 + nth - 1) / nth;
 
         // Partials buffer layout: [q_head][kv_chunk][M, S, VKQ]
-        // TQ_KV_1B reserves per-thread scratch IMMEDIATELY after the per-
-        // thread scratch slab; partials must come after BOTH. See the
-        // work_size calc in ggml-cpu.c GGML_OP_FLASH_ATTN_EXT.
         const int64_t partial_size  = 2 + DV;
-        size_t partials_offset = (size_t) nth * (DK + 2*DV + CACHE_LINE_SIZE_F32);
-        if (k->type == GGML_TYPE_TQ_KV_1B) {
-            const size_t tq_stride = ((nek1 + CACHE_LINE_SIZE_F32 - 1) / CACHE_LINE_SIZE_F32) * CACHE_LINE_SIZE_F32;
-            partials_offset += (size_t) nth * tq_stride;
-        }
-        float * partials_base = (float *) params->wdata + partials_offset;
+        float *       partials_base = (float *) params->wdata + nth * (DK + 2*DV + CACHE_LINE_SIZE_F32);
 
         const int64_t ic_start = ith * chunk_size;
         const int64_t ic_end   = std::min(ic_start + chunk_size, nek1);
