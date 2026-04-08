@@ -4698,6 +4698,9 @@ static void ggml_compute_forward_get_rows_q(
     const int ir0 = dr*ith;
     const int ir1 = MIN(ir0 + dr, nr);
 
+    // NUMA mirror: read from the calling thread's local copy.
+    const char * src0_data_local = ggml_tensor_data_numa_local(src0);
+
     for (int64_t i = ir0; i < ir1; ++i) {
         const int64_t i12 = i/(ne11*ne10);
         const int64_t i11 = (i - i12*ne11*ne10)/ne10;
@@ -4707,7 +4710,7 @@ static void ggml_compute_forward_get_rows_q(
         GGML_ASSERT(i01 >= 0 && i01 < ne01);
 
         dequantize_row_q(
-                (const void *) ((char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03),
+                (const void *) (src0_data_local + i01*nb01 + i11*nb02 + i12*nb03),
                      (float *) ((char *)  dst->data + i10*nb1  + i11*nb2  + i12*nb3), nc);
     }
 }
@@ -4739,6 +4742,9 @@ static void ggml_compute_forward_get_rows_f16(
     const int ir0 = dr*ith;
     const int ir1 = MIN(ir0 + dr, nr);
 
+    // NUMA mirror: read from the calling thread's local copy.
+    const char * src0_data_local = ggml_tensor_data_numa_local(src0);
+
     for (int64_t i = ir0; i < ir1; ++i) {
         const int64_t i12 = i/(ne11*ne10);
         const int64_t i11 = (i - i12*ne11*ne10)/ne10;
@@ -4748,7 +4754,7 @@ static void ggml_compute_forward_get_rows_f16(
         GGML_ASSERT(i01 >= 0 && i01 < ne01);
 
         ggml_cpu_fp16_to_fp32(
-            (const ggml_fp16_t*) ((char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03),
+            (const ggml_fp16_t*) (src0_data_local + i01*nb01 + i11*nb02 + i12*nb03),
                        (float *) ((char *)  dst->data + i10*nb1  + i11*nb2  + i12*nb3), nc);
     }
 }
@@ -4780,6 +4786,9 @@ static void ggml_compute_forward_get_rows_bf16(
     const int ir0 = dr*ith;
     const int ir1 = MIN(ir0 + dr, nr);
 
+    // NUMA mirror: read from the calling thread's local copy.
+    const char * src0_data_local = ggml_tensor_data_numa_local(src0);
+
     for (int64_t i = ir0; i < ir1; ++i) {
         const int64_t i12 = i/(ne11*ne10);
         const int64_t i11 = (i - i12*ne11*ne10)/ne10;
@@ -4789,7 +4798,7 @@ static void ggml_compute_forward_get_rows_bf16(
         GGML_ASSERT(i01 >= 0 && i01 < ne01);
 
         ggml_cpu_bf16_to_fp32(
-            (const ggml_bf16_t *) ((char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03),
+            (const ggml_bf16_t *) (src0_data_local + i01*nb01 + i11*nb02 + i12*nb03),
                         (float *) ((char *)  dst->data + i10*nb1  + i11*nb2  + i12*nb3), nc);
     }
 }
@@ -4821,6 +4830,9 @@ static void ggml_compute_forward_get_rows_f32(
     const int ir0 = dr*ith;
     const int ir1 = MIN(ir0 + dr, nr);
 
+    // NUMA mirror: read from the calling thread's local copy.
+    const char * src0_data_local = ggml_tensor_data_numa_local(src0);
+
     for (int64_t i = ir0; i < ir1; ++i) {
         const int64_t i12 = i/(ne11*ne10);
         const int64_t i11 = (i - i12*ne11*ne10)/ne10;
@@ -4830,8 +4842,8 @@ static void ggml_compute_forward_get_rows_f32(
         GGML_ASSERT(i01 >= 0 && i01 < ne01);
 
         ggml_vec_cpy_f32(nc,
-                (float *) ((char *)  dst->data + i10*nb1  + i11*nb2  + i12*nb3),
-                (float *) ((char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03));
+                      (float *) ((char *)  dst->data + i10*nb1  + i11*nb2  + i12*nb3),
+                (const float *) (src0_data_local + i01*nb01 + i11*nb02 + i12*nb03));
     }
 }
 
@@ -8235,6 +8247,15 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
 
     int ith = params->ith;
 
+    // NUMA mirror: read K and V from the calling thread's local copy.
+    // For non-mirrored tensors these are identical to k->data / v->data.
+    // The KV cache lives on the mirror buft when --numa mirror is active,
+    // and each socket reads its own physical copy. The Q tensor is not
+    // mirrored (it's a per-token activation produced by the projection
+    // layer), so the read site for Q is unchanged.
+    const char * const k_data_local = ggml_tensor_data_numa_local(k);
+    const char * const v_data_local = ggml_tensor_data_numa_local(v);
+
     // ----- TQ_KV_1B Hamming-attention fast path setup (loop invariants) -----
     // For the TQ_KV_1B key cache type we replace the per-K vec_dot inside the
     // inner loop with a single batched call to tq_kv_1b_attention_multi that
@@ -8317,8 +8338,8 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
                 // Single-pass K Hamming + online softmax + V mad.
                 // Skips the score scratch and the per-position loop below.
                 if (valid_run > 0) {
-                    const char * k_base = (const char *) k->data + ic_start*nbk1 + ik2*nbk2 + ik3*nbk3;
-                    const char * v_base = (const char *) v->data + ic_start*nbv1 + iv2*nbv2 + iv3*nbv3;
+                    const char * k_base = k_data_local + ic_start*nbk1 + ik2*nbk2 + ik3*nbk3;
+                    const char * v_base = v_data_local + ic_start*nbv1 + iv2*nbv2 + iv3*nbv3;
                     tq_kv_fused_attention(pq, k_base, v_base,
                         (size_t) nbv1,
                         mp ? (const uint16_t *) (mp + ic_start) : NULL,
@@ -8328,7 +8349,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
                 }
             } else if (valid_run > 0) {
                 const block_tq_kv_1b * k_blocks = (const block_tq_kv_1b *)
-                    ((const char *) k->data + ic_start*nbk1 + ik2*nbk2 + ik3*nbk3);
+                    (k_data_local + ic_start*nbk1 + ik2*nbk2 + ik3*nbk3);
                 tq_kv_1b_attention_multi(pq, k_blocks, tq_thread_buf, (int) valid_run, (int) DK);
             }
         }
@@ -8349,7 +8370,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
             if (use_tq_kv_1b) {
                 s = tq_thread_buf[ic - ic_start];
             } else {
-                const char * k_data = (const char *) k->data + ( ic*nbk1 + ik2*nbk2 + ik3*nbk3);
+                const char * k_data = k_data_local + ( ic*nbk1 + ik2*nbk2 + ik3*nbk3);
                 kq_vec_dot(DK, &s, 0, k_data, 0, Q_q, 0, 1);
             }
 
@@ -8366,7 +8387,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
             float ms = 1.0f; // upon new higher max val, scale VKQ and KQ sum with this value
             float vs = 1.0f; // post-softmax KQ value, expf(s - M)
 
-            const char * v_data = ((const char *) v->data + (ic*nbv1 + iv2*nbv2 + iv3*nbv3));
+            const char * v_data = (v_data_local + (ic*nbv1 + iv2*nbv2 + iv3*nbv3));
 
             if (v->type == GGML_TYPE_F16) {
                 if (s > M) {
