@@ -23,21 +23,82 @@
 #include <cstring>
 #include <new>
 
+#if defined(__gnu_linux__)
+#  include <sys/mman.h>
+#  include <numaif.h>
+#  include <unistd.h>
+#  define GGML_NUMA_MIRROR_HAVE_MBIND 1
+#else
+#  define GGML_NUMA_MIRROR_HAVE_MBIND 0
+#endif
+
 namespace {
 
 // Per-buffer context. Holds both physical bases and the precomputed
-// alt offset (= base[1] - base[0]). For the v1 single-copy fallback,
+// alt offset (= base[1] - base[0]). For the single-copy fallback,
 // base[1] is NULL and alt_off is 0; the buffer behaves as a regular
 // CPU buffer.
+//
+// `mbind_path` records whether the bases came from mbind_alloc_on_node
+// (true) or posix_memalign (false), so the free path knows which
+// deallocator to use.
 struct mirror_ctx {
     void *    base[2];   // base[0] is the primary copy, base[1] the alt
     size_t    size;
     ptrdiff_t alt_off;   // 0 when single-copy
+    bool      mbind_path;
 };
 
 // Buffer alignment matches the default CPU buffer type so set_tensor /
 // get_tensor can use plain memcpy without alignment fixups. Reuses the
 // global TENSOR_ALIGNMENT macro from ggml-impl.h.
+
+#if GGML_NUMA_MIRROR_HAVE_MBIND
+
+// Round size up to the page boundary so mbind operates on whole pages.
+size_t round_up_to_page(size_t size) {
+    static const size_t pg = (size_t) sysconf(_SC_PAGESIZE);
+    return (size + pg - 1) & ~(pg - 1);
+}
+
+// Allocate `size` bytes via mmap and bind the resulting pages to a
+// specific NUMA node. Returns the base pointer (page-aligned), or
+// MAP_FAILED on error. The mapping is private + anonymous so it costs
+// no swap and is freed via munmap.
+//
+// We use MPOL_BIND so the kernel will fail (rather than fall back to
+// other nodes) if `node` runs out of memory. Combined with our 188 GiB
+// budget and 96 GiB per node, this is a hard guarantee that the
+// allocation lives where we asked for it.
+void * mbind_alloc_on_node(size_t size, int node) {
+    const size_t aligned_size = round_up_to_page(size);
+    void * p = mmap(nullptr, aligned_size,
+                    PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANONYMOUS,
+                    -1, 0);
+    if (p == MAP_FAILED) {
+        return MAP_FAILED;
+    }
+
+    // Build a node mask with just `node` set.
+    unsigned long node_mask = 1UL << node;
+    const unsigned long max_node = sizeof(node_mask) * 8;
+
+    if (mbind(p, aligned_size, MPOL_BIND, &node_mask, max_node, MPOL_MF_STRICT) != 0) {
+        munmap(p, aligned_size);
+        return MAP_FAILED;
+    }
+
+    return p;
+}
+
+void mbind_free(void * p, size_t size) {
+    if (p != nullptr && p != MAP_FAILED) {
+        munmap(p, round_up_to_page(size));
+    }
+}
+
+#endif  // GGML_NUMA_MIRROR_HAVE_MBIND
 
 void * aligned_alloc_local(size_t size) {
     void * p = nullptr;
@@ -62,10 +123,15 @@ void * mirror_buffer_get_base(ggml_backend_buffer_t buffer) {
 
 void mirror_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     auto * ctx = static_cast<mirror_ctx *>(buffer->context);
-    if (ctx->base[1] != nullptr) {
-        aligned_free_local(ctx->base[1]);
+#if GGML_NUMA_MIRROR_HAVE_MBIND
+    if (ctx->mbind_path) {
+        mbind_free(ctx->base[0], ctx->size);
+        mbind_free(ctx->base[1], ctx->size);
+    } else
+#endif
+    {
+        aligned_free_local(ctx->base[0]);
     }
-    aligned_free_local(ctx->base[0]);
     delete ctx;
 }
 
@@ -142,13 +208,38 @@ ggml_backend_buffer_t mirror_buft_alloc_buffer(ggml_backend_buffer_type_t buft, 
 
     ctx->size = size;
 
-    // v1: single-copy fallback. The dual-mbind allocator lands in step 3
-    // of the Phase 26 #1 implementation. For now, allocate one copy and
-    // leave alt_off at 0; the buffer behaves identically to the default
-    // CPU buffer type.
+#if GGML_NUMA_MIRROR_HAVE_MBIND
+    // Dual-mbind allocator path: bind copy 0 to NUMA node 0 and copy 1
+    // to NUMA node 1. The two copies are page-aligned by mmap and the
+    // alt offset is the byte distance between them. After load, both
+    // copies are populated identically by the buffer's set_tensor /
+    // memset_tensor callbacks (which write through to both copies),
+    // and the after-op sync hook keeps them in lockstep for any
+    // subsequent compute writes.
+    void * p0 = mbind_alloc_on_node(size, 0);
+    void * p1 = mbind_alloc_on_node(size, 1);
+    if (p0 != MAP_FAILED && p1 != MAP_FAILED) {
+        ctx->base[0] = p0;
+        ctx->base[1] = p1;
+        ctx->alt_off = (char *) p1 - (char *) p0;
+        ctx->mbind_path = true;
+        return ggml_backend_buffer_init(buft, mirror_buffer_iface, ctx, size);
+    }
+    // mbind failed (probably out of memory on one node, or running on
+    // a kernel without NUMA support). Free whatever we got and fall
+    // through to the single-copy path so the model still loads, just
+    // without replication.
+    mbind_free(p0, size);
+    mbind_free(p1, size);
+#endif
+
+    // Single-copy fallback. Behaves identically to the default CPU buffer
+    // type. Used when mbind isn't available or when both nodes can't
+    // satisfy the allocation.
     ctx->base[0] = aligned_alloc_local(size);
     ctx->base[1] = nullptr;
     ctx->alt_off = 0;
+    ctx->mbind_path = false;
 
     if (ctx->base[0] == nullptr) {
         delete ctx;
