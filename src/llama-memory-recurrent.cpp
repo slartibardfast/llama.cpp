@@ -564,10 +564,6 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
     const uint32_t n_seq_tokens = ubatch.n_seq_tokens;
     const uint32_t n_seqs       = ubatch.n_seqs;
 
-    fprintf(stderr, "[MTP-FINDSLOT] find_slot: n_seq_tokens=%d, n_seqs=%d, size=%d, used=%d, head=%d\n",
-            (int)n_seq_tokens, (int)n_seqs, (int)size, (int)used, (int)head);
-    fflush(stderr);
-
     // if we have enough unused cells before the current head ->
     //   better to start searching from the beginning of the cache, hoping to fill it
     if (head > used + 2*n_seqs) {
