@@ -5,6 +5,8 @@
 #include "llama-model.h"
 #include "llama-context.h"
 
+#include "ggml-cpu.h"
+
 #include <algorithm>
 #include <cassert>
 #include <cmath>
@@ -116,7 +118,10 @@ llama_kv_cache::llama_kv_cache(
 
         const char * dev_name = "CPU";
 
-        ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
+        // Routes through the NUMA mirror buft when --numa mirror is
+        // active so KV writes are replicated across both nodes; falls
+        // through to the regular CPU buft otherwise.
+        ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type_for_runtime();
 
         if (offload) {
             auto * dev = model.dev_layer(il);

@@ -8,6 +8,7 @@
 #include "ggml-impl.h"
 #include "quants.h"
 #include "ggml-threading.h"
+#include "numa-mirror.h"
 #include "unary-ops.h"
 #include "binary-ops.h"
 #include "vec.h"
@@ -2174,6 +2175,16 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 GGML_ABORT("fatal error");
             }
     }
+
+    // NUMA mirror: replicate per-op writes from the primary copy of the
+    // dst tensor to the secondary. The helper checks `tensor->buffer`'s
+    // alt offset and returns immediately for non-mirror buffers (the
+    // common case — compute scratch lives in the regular CPU buft), so
+    // this is a near-zero-cost no-op on non-MIRROR runs. For mirror
+    // buffers it barriers to ensure all worker threads have committed
+    // their slice of the op work, then the master thread copies the
+    // dirty region to the alt.
+    ggml_backend_cpu_numa_mirror_after_op_sync(params, tensor);
 }
 
 // Android's libc implementation "bionic" does not support setting affinity

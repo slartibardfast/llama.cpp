@@ -5,6 +5,8 @@
 #include "llama-batch.h"
 #include "llama-model.h"
 
+#include "ggml-cpu.h"
+
 #include <algorithm>
 #include <cassert>
 #include <cstring>
@@ -76,7 +78,10 @@ llama_memory_recurrent::llama_memory_recurrent(
 
         const char * dev_name = "CPU";
 
-        ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
+        // Routes through the NUMA mirror buft when --numa mirror is
+        // active so SSM/recurrent state writes are replicated across
+        // both nodes; falls through to the regular CPU buft otherwise.
+        ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type_for_runtime();
 
         if (offload) {
             auto * dev = model.dev_layer(i);

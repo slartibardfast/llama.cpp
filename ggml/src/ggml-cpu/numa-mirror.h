@@ -7,6 +7,8 @@
 extern "C" {
 #endif
 
+struct ggml_compute_params;
+
 // NUMA-mirror CPU buffer type. Allocates two physical copies of every
 // buffer it owns, one bound to each NUMA node, and exposes a per-buffer
 // alt offset so the CPU compute kernels can read from the local copy
@@ -34,13 +36,25 @@ bool ggml_backend_cpu_numa_mirror_is_mirror(ggml_backend_buffer_t buffer);
 //   const char * data_local = (const char *) t->data + alt * ggml_cpu_get_numa_node();
 ptrdiff_t ggml_backend_cpu_numa_mirror_alt_offset(ggml_backend_buffer_t buffer);
 
-// After-op replication hook. Called once from ggml_compute_forward
-// after a write op completes, by the master thread (ith == 0). Walks
-// the op's destination tensor and replicates the dirty region from
-// copy 0 to copy 1. The set of supported write ops is enumerated in
-// the helper's switch; unknown ops fall through to a safe full-tensor
-// memcpy. No-op when the buffer isn't mirrored.
-void ggml_backend_cpu_numa_mirror_after_op_sync(struct ggml_tensor * tensor);
+// After-op replication hook. Called from ggml_compute_forward by every
+// thread after a write op completes. The helper:
+//   1. Returns immediately for non-mirror destination buffers (cheap
+//      check on the buft alt offset).
+//   2. Calls ggml_barrier() to ensure all threads have committed their
+//      slice of the op work — most ops slice work by row across threads
+//      and do not have an internal barrier, so the calling thread cannot
+//      assume the dst tensor is fully written when it returns from the
+//      op dispatch.
+//   3. The master thread (ith == 0) replicates the dirty region from
+//      copy 0 to copy 1; other threads return.
+//   4. The threadpool barrier between graph nodes serializes the master
+//      sync against the next op, so no extra barrier is needed at the
+//      hook exit.
+// The set of supported write ops is enumerated in the helper's switch;
+// unknown ops fall through to a safe full-tensor memcpy.
+void ggml_backend_cpu_numa_mirror_after_op_sync(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * tensor);
 
 #ifdef __cplusplus
 }

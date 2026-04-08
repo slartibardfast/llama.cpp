@@ -275,6 +275,26 @@ ggml_backend_buffer_type_t ggml_backend_cpu_numa_mirror_buffer_type(void) {
     return &t;
 }
 
+ggml_backend_buffer_type_t ggml_backend_cpu_buffer_type_for_runtime(void) {
+    // Default callsites (KV cache, recurrent state) ask for the regular
+    // CPU buft directly. On a MIRROR run we want them to land on the
+    // mirror buft so per-thread reads stay NUMA-local. This helper does
+    // the redirect without making the callsites aware of the mirror.
+    if (ggml_cpu_get_numa_strategy() != GGML_NUMA_STRATEGY_MIRROR) {
+        return ggml_backend_cpu_buffer_type();
+    }
+    // Kill switch for A/B equivalence testing of KV mirroring without
+    // a rebuild. When set (any value), the mirror is bypassed and the
+    // KV cache lands on the regular CPU buft just like a non-MIRROR
+    // run. The weights mirror still works (it goes through the extra
+    // buft list, not this helper). Removed in commit 3 once equivalence
+    // is verified.
+    if (getenv("LLAMA_NUMA_MIRROR_KV_DISABLE") != nullptr) {
+        return ggml_backend_cpu_buffer_type();
+    }
+    return ggml_backend_cpu_numa_mirror_buffer_type();
+}
+
 bool ggml_backend_cpu_numa_mirror_is_mirror(ggml_backend_buffer_t buffer) {
     if (buffer == nullptr) {
         return false;
@@ -314,20 +334,41 @@ void ggml_backend_cpu_buffer_finalize_load(ggml_backend_buffer_t buffer) {
     memcpy(ctx->base[1], ctx->base[0], ctx->size);
 }
 
-void ggml_backend_cpu_numa_mirror_after_op_sync(struct ggml_tensor * tensor) {
+void ggml_backend_cpu_numa_mirror_after_op_sync(
+        const struct ggml_compute_params * params,
+        struct ggml_tensor * tensor) {
     if (tensor == nullptr || tensor->buffer == nullptr) {
         return;
     }
     const ptrdiff_t alt_off = ggml_backend_cpu_numa_mirror_alt_offset(tensor->buffer);
     if (alt_off == 0) {
         // Single-copy fallback or non-mirror buffer; nothing to sync.
+        // Cheap early return — most tensors in a graph live in compute
+        // scratch (regular CPU buft, alt_off == 0) so this is the
+        // common case and runs on every thread without a barrier cost.
         return;
     }
 
-    // The dispatch on tensor->op decides what region to sync. v1 lands
-    // the framework with a safe full-tensor fallback; the per-op narrow
-    // dirty regions (e.g. set_rows reading the index tensor) are added
-    // alongside the dual-mbind allocator in step 4.
+    // From here we know the dst tensor is on a mirror buffer with two
+    // physical copies. Most CPU ops slice work across threads by row
+    // and do not have an internal barrier; the calling thread may
+    // therefore have finished its slice before other threads have
+    // finished theirs. We need a barrier so the master thread reads
+    // a fully-written dst before copying it to the alt.
+    ggml_barrier(params->threadpool);
+
+    if (params->ith != 0) {
+        // Worker threads have nothing to do; the next op's barrier
+        // (in ggml_graph_compute_thread, between nodes) will hold them
+        // until the master thread finishes the sync below.
+        return;
+    }
+
+    // Stub: full-tensor sync. Correct for any write op (the entire dst
+    // is byte-identical between the two copies after this) but pays
+    // catastrophic cross-socket bandwidth for ops that only touch a
+    // small slice of dst (e.g. SET_ROWS into a 60 MB KV cache row).
+    // Commit 2 replaces this with per-op narrow dirty-region dispatch.
     const size_t nbytes = ggml_nbytes(tensor);
     memcpy((char *) tensor->data + alt_off, tensor->data, nbytes);
 }

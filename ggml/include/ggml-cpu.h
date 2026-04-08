@@ -46,6 +46,14 @@ extern "C" {
     // other buffer type.
     GGML_BACKEND_API void    ggml_backend_cpu_buffer_finalize_load(ggml_backend_buffer_t buffer);
 
+    // Returns the NUMA-mirror CPU buffer type when GGML_NUMA_STRATEGY_MIRROR
+    // is active, otherwise returns the regular CPU buffer type. Callers
+    // (e.g. KV cache and recurrent state allocation) use this so the same
+    // call site routes to the mirror buft on dual-socket runs without
+    // hard-wiring the mirror dependency. Equivalent to ggml_backend_cpu_buffer_type()
+    // when --numa mirror is not in effect.
+    GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cpu_buffer_type_for_runtime(void);
+
     GGML_BACKEND_API struct ggml_tensor * ggml_new_i32(struct ggml_context * ctx, int32_t value);
     GGML_BACKEND_API struct ggml_tensor * ggml_new_f32(struct ggml_context * ctx, float value);
 
