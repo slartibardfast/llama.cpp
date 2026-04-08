@@ -4,6 +4,7 @@
 
 #include "ggml.h"
 #include "ggml-impl.h"
+#include "ggml-cpu.h"
 
 #include <stdlib.h> // load `stdlib.h` before other headers to work around MinGW bug: https://sourceforge.net/p/mingw-w64/bugs/192/
 //#include <stddef.h>
@@ -28,6 +29,13 @@ struct ggml_compute_params {
     // use reference implementation
     bool use_ref;
 };
+
+// NUMA-mirror plumbing. ggml_tls_numa_node is set per worker thread by
+// set_numa_thread_affinity when GGML_NUMA_STRATEGY_MIRROR is active. The
+// helpers are read by the CPU compute kernels (ops.cpp) and the mirror
+// buffer abstraction to pick the local copy of replicated buffers.
+int ggml_cpu_get_numa_node(void);
+enum ggml_numa_strategy ggml_cpu_get_numa_strategy(void);
 
 
 #if defined(_MSC_VER)

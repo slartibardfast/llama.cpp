@@ -603,6 +603,21 @@ struct ggml_state {
 
 static struct ggml_state g_state = {0};
 
+// Thread-local NUMA node id, set by set_numa_thread_affinity for the
+// MIRROR strategy and read by the CPU compute kernels and the buffer
+// abstraction to pick the local copy of replicated buffers. Defaults to
+// 0 so non-MIRROR runs naturally select the primary copy. Exposed to
+// other ggml-cpu translation units via ggml_cpu_get_numa_node().
+__thread int ggml_tls_numa_node = 0;
+
+int ggml_cpu_get_numa_node(void) {
+    return ggml_tls_numa_node;
+}
+
+enum ggml_numa_strategy ggml_cpu_get_numa_strategy(void) {
+    return g_state.numa.numa_strategy;
+}
+
 void ggml_barrier(struct ggml_threadpool * tp) {
     int n_threads = atomic_load_explicit(&tp->n_graph, memory_order_relaxed) & GGML_THREADPOOL_N_THREADS_MASK;
     if (n_threads == 1) {
@@ -2175,6 +2190,14 @@ static void set_numa_thread_affinity(int thread_n) {
                 fprintf(stderr, "warning: pthread_setaffinity_np() failed: %s\n",strerror(rv));
             }
             return;
+        case GGML_NUMA_STRATEGY_MIRROR:
+            // Each thread is assigned to one NUMA node (round-robin), and the
+            // model weights / KV cache buffers are replicated per node so each
+            // thread reads its local copy. The thread-local node id is read by
+            // the buffer abstraction at access time to pick the right copy.
+            node_num = thread_n % g_state.numa.n_nodes;
+            ggml_tls_numa_node = node_num;
+            break;
         default:
             return;
     }

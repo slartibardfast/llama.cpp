@@ -1,6 +1,8 @@
 #include "ggml-backend.h"
 #include "ggml-backend-impl.h"
 #include "ggml-cpu.h"
+#include "ggml-cpu-impl.h"
+#include "numa-mirror.h"
 #include "repack.h"
 #include "traits.h"
 #include "ggml-impl.h"
@@ -42,6 +44,15 @@
 std::vector<ggml_backend_buffer_type_t> & ggml_backend_cpu_get_extra_buffer_types() {
     static std::vector<ggml_backend_buffer_type_t> bufts = []() {
         std::vector<ggml_backend_buffer_type_t> bufts;
+
+        // NUMA mirror buffer type — registered first when MIRROR strategy
+        // is active so model weight tensors land on it. The lazy static
+        // initializer runs on the first call to this function, which is
+        // during model load (after llama_backend_init has called
+        // ggml_numa_init), so the strategy is known by the time we read it.
+        if (ggml_cpu_get_numa_strategy() == GGML_NUMA_STRATEGY_MIRROR) {
+            bufts.push_back(ggml_backend_cpu_numa_mirror_buffer_type());
+        }
 
 #if defined(__AMX_INT8__) && defined(__AVX512VNNI__)
         if (ggml_backend_amx_buffer_type()) {
