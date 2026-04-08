@@ -192,6 +192,48 @@ void dequantize_row_tq_v_4b(const block_tq_v_4b * x, float * y, int64_t k);
  */
 void tq_v_4b_vec_mad_f32(int dv, float * vkq, const block_tq_v_4b * v, float vs);
 
+/* ============================================================
+ * Fused K Hamming + online softmax + V dequant-mad for one FA row.
+ *
+ * Bundles the work that was previously split between
+ * tq_kv_1b_attention_multi (K Hamming, batched into a thread-local
+ * score scratch) and the per-position softmax+V loop in
+ * ggml_compute_forward_flash_attn_ext_f16. Eliminates the score
+ * scratch entirely and walks the valid K range in a single pass,
+ * reading K[s] and V[s] back to back per position.
+ *
+ * `k_base` and `v_base` are byte-pointers into the K and V cache
+ * tensors, already offset by ic_start and the head/batch indices.
+ * `v_row_stride` is the per-K-position byte stride within a single
+ * head (== ggml row stride nb[1]). The K side uses the legacy
+ * dense-block stride for byte-equivalence with tq_kv_1b_attention_multi.
+ *
+ * Caller initializes VKQ32[0..DV-1] = 0, *M_inout = -INFINITY,
+ * *S_inout = 0 before the call (matching the existing FA loop).
+ *
+ * Mask: per-position fp16 mask from the FA op, applied as
+ *   score += slope * fp16_to_fp32(mp[s])
+ * Positions where the masked score is -INFINITY are skipped at
+ * zero cost. Pass mp = NULL for no mask.
+ *
+ * DK and DV must both be multiples of 128.
+ * ============================================================ */
+void tq_kv_fused_attention(
+    const float          * query,
+    const char           * k_base,        /* K cache base, already offset      */
+    const char           * v_base,        /* V cache base, already offset      */
+    size_t                 v_row_stride,  /* bytes per K position in V cache   */
+    const uint16_t       * mp,            /* fp16 mask, NULL for no mask       */
+    int                    valid_run,
+    int                    DK,
+    int                    DV,
+    float                  scale,
+    float                  slope,
+    float                  logit_softcap, /* 0.0f for no softcap               */
+    float                * VKQ32,
+    float                * M_inout,
+    float                * S_inout);
+
 #ifdef __cplusplus
 }
 #endif
