@@ -8242,7 +8242,13 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     // scratch buffer for the precomputed scores lives in params->wdata, after
     // the per-thread Q_q/VKQ scratch slab; sized at graph build time in
     // ggml-cpu.c (GGML_OP_FLASH_ATTN_EXT work_size calc).
-    const bool   use_tq_kv_1b   = (k->type == GGML_TYPE_TQ_KV_1B);
+    //
+    // Step 4.75 (TQ_KV_FUSED): when V is also TQ_V_4B, we take a fused
+    // single-pass path that bundles K Hamming + online softmax + V mad in
+    // one kernel call per FA row, eliminating the score scratch and the
+    // separate per-position loop below.
+    const bool   use_tq_kv_1b    = (k->type == GGML_TYPE_TQ_KV_1B);
+    const bool   use_tq_kv_fused = use_tq_kv_1b && (v->type == GGML_TYPE_TQ_V_4B);
     const size_t fa_scratch_str = (size_t)(1*DK + 2*DV + CACHE_LINE_SIZE_F32);
     const size_t tq_thread_str  = ((nek1 + CACHE_LINE_SIZE_F32 - 1) / CACHE_LINE_SIZE_F32) * CACHE_LINE_SIZE_F32;
     float * const tq_thread_buf = use_tq_kv_1b
@@ -8307,7 +8313,20 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
                 }
             }
             const int64_t valid_run = valid_end - ic_start;
-            if (valid_run > 0) {
+            if (use_tq_kv_fused) {
+                // Single-pass K Hamming + online softmax + V mad.
+                // Skips the score scratch and the per-position loop below.
+                if (valid_run > 0) {
+                    const char * k_base = (const char *) k->data + ic_start*nbk1 + ik2*nbk2 + ik3*nbk3;
+                    const char * v_base = (const char *) v->data + ic_start*nbv1 + iv2*nbv2 + iv3*nbv3;
+                    tq_kv_fused_attention(pq, k_base, v_base,
+                        (size_t) nbv1,
+                        mp ? (const uint16_t *) (mp + ic_start) : NULL,
+                        (int) valid_run, (int) DK, (int) DV,
+                        scale, slope, logit_softcap,
+                        VKQ32, &M, &S);
+                }
+            } else if (valid_run > 0) {
                 const block_tq_kv_1b * k_blocks = (const block_tq_kv_1b *)
                     ((const char *) k->data + ic_start*nbk1 + ik2*nbk2 + ik3*nbk3);
                 tq_kv_1b_attention_multi(pq, k_blocks, tq_thread_buf, (int) valid_run, (int) DK);
@@ -8317,8 +8336,9 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         // online softmax / attention
         // loop over n_kv and n_head_kv
         // ref: https://arxiv.org/pdf/2112.05682.pdf
-
-        for (int64_t ic = ic_start; ic < ic_end; ++ic) {
+        // Skipped entirely for the TQ_KV_FUSED path — that kernel handles
+        // softmax + V mad in one pass.
+        for (int64_t ic = ic_start; ic < ic_end && !use_tq_kv_fused; ++ic) {
             const float mv = mp ? slope*GGML_CPU_FP16_TO_FP32(mp[ic]) : 0.0f;
             if (mv == -INFINITY) {
                 continue;

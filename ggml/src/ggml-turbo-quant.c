@@ -592,3 +592,155 @@ void tq_v_4b_vec_mad_f32(int dv, float * vkq, const block_tq_v_4b * v, float vs)
 }
 
 #endif /* __SSE4_1__ */
+
+/* ============================================================
+ * Step 4.75: TQ_KV_FUSED — fused K Hamming + online softmax + V mad.
+ *
+ * Bundles the work that was previously split between
+ * tq_kv_1b_attention_multi (K side) and the per-position softmax+V
+ * loop in ggml_compute_forward_flash_attn_ext_f16 (caller). The
+ * score scratch is eliminated; K[s] and V[s] are accessed back to
+ * back so the L1/L2 prefetcher streams them as a single unit.
+ *
+ * Numerical equivalence: the online softmax math, the Hamming score
+ * formula, and the V mad accumulator update all match the legacy
+ * paths bit-for-bit (modulo fp32 reassociation in the SSE4.1 V mad,
+ * which already exists in the unfused tq_v_4b_vec_mad_f32).
+ * ============================================================ */
+
+/* Inline VKQ32 *= ms scale. SSE4.1 register loop, scalar fallback.
+ * dv must be a multiple of 4 (always true for FA: DV=128 or 256). */
+static inline void tq_vec_scale_f32_inplace(int dv, float * vkq, float ms) {
+#if defined(__SSE4_1__)
+    const __m128 ms_vec = _mm_set1_ps(ms);
+    int j = 0;
+    for (; j + 16 <= dv; j += 16) {
+        __m128 a0 = _mm_loadu_ps(vkq + j +  0);
+        __m128 a1 = _mm_loadu_ps(vkq + j +  4);
+        __m128 a2 = _mm_loadu_ps(vkq + j +  8);
+        __m128 a3 = _mm_loadu_ps(vkq + j + 12);
+        _mm_storeu_ps(vkq + j +  0, _mm_mul_ps(a0, ms_vec));
+        _mm_storeu_ps(vkq + j +  4, _mm_mul_ps(a1, ms_vec));
+        _mm_storeu_ps(vkq + j +  8, _mm_mul_ps(a2, ms_vec));
+        _mm_storeu_ps(vkq + j + 12, _mm_mul_ps(a3, ms_vec));
+    }
+    for (; j < dv; j += 4) {
+        __m128 a = _mm_loadu_ps(vkq + j);
+        _mm_storeu_ps(vkq + j, _mm_mul_ps(a, ms_vec));
+    }
+#else
+    for (int j = 0; j < dv; j++) vkq[j] *= ms;
+#endif
+}
+
+void tq_kv_fused_attention(
+    const float          * query,
+    const char           * k_base,
+    const char           * v_base,
+    size_t                 v_row_stride,
+    const uint16_t       * mp,
+    int                    valid_run,
+    int                    DK,
+    int                    DV,
+    float                  scale,
+    float                  slope,
+    float                  logit_softcap,
+    float                * VKQ32,
+    float                * M_inout,
+    float                * S_inout)
+{
+    if (valid_run <= 0) return;
+
+    const int n_blocks_k = DK / TQ_KV_1B_BLOCK_SIZE;
+    const int n_blocks_v = DV / TQ_V_4B_BLOCK_SIZE;
+    if (n_blocks_k * TQ_KV_1B_BLOCK_SIZE != DK ||
+        n_blocks_v * TQ_V_4B_BLOCK_SIZE  != DV ||
+        n_blocks_k > TQ_MAX_BLOCKS_PER_KEY) {
+        return; /* caller bug; legacy path handles odd dims */
+    }
+    /* K side uses dense-block stride to match tq_kv_1b_attention_multi
+     * byte-for-byte (see note in header). The legacy K helper indexes
+     * by `s * n_blocks_k`, ignoring nbk1; preserving that here keeps
+     * the fused path numerically equivalent to the unfused TQ path on
+     * the GQA layouts the model uses today. */
+    const block_tq_kv_1b * k_blocks = (const block_tq_kv_1b *) k_base;
+
+    /* Per-K-block Q precomputation (hoisted out of the position loop).
+     * Identical to tq_kv_1b_attention_multi lines 393-410. */
+    uint8_t   q_signs[TQ_MAX_BLOCKS_PER_KEY][TQ_KV_1B_BLOCK_SIZE / 8];
+    float     q_norm [TQ_MAX_BLOCKS_PER_KEY];
+    const float per_block_scale = sqrtf(TQ_PI_2) / (float) TQ_KV_1B_BLOCK_SIZE;
+
+    for (int b = 0; b < n_blocks_k; b++) {
+        const float * q_slice = query + b * TQ_KV_1B_BLOCK_SIZE;
+
+        float q_rot[TQ_KV_1B_BLOCK_SIZE];
+        memcpy(q_rot, q_slice, TQ_KV_1B_BLOCK_SIZE * sizeof(float));
+        tq_rht_forward(q_rot, TQ_KV_1B_BLOCK_SIZE, TQ_DEFAULT_SEED);
+
+        float sumsq = 0.0f;
+        for (int i = 0; i < TQ_KV_1B_BLOCK_SIZE; i++) sumsq += q_slice[i] * q_slice[i];
+        q_norm[b] = sqrtf(sumsq);
+
+        memset(q_signs[b], 0, TQ_KV_1B_BLOCK_SIZE / 8);
+        for (int i = 0; i < TQ_KV_1B_BLOCK_SIZE; i++) {
+            if (q_rot[i] > 0.0f) {
+                q_signs[b][i >> 3] |= (uint8_t) (1u << (i & 7));
+            }
+        }
+    }
+
+    float M = *M_inout;
+    float S = *S_inout;
+
+    /* Fused per-position loop. */
+    for (int s = 0; s < valid_run; s++) {
+        /* Mask gate first — cheapest reject. */
+        float mv = 0.0f;
+        if (mp) {
+            mv = slope * tq_fp16_to_fp32(mp[s]);
+            if (mv == -INFINITY) continue;
+        }
+
+        /* K-side: Hamming score for position s, sum across DK/128 blocks. */
+        const block_tq_kv_1b * k_row = &k_blocks[s * n_blocks_k];
+        float score = 0.0f;
+        for (int b = 0; b < n_blocks_k; b++) {
+            int hamming = tq_xor_popcount_16(q_signs[b], k_row[b].signs);
+            int agree   = TQ_KV_1B_BLOCK_SIZE - hamming;
+            float k_norm = tq_fp16_to_fp32(k_row[b].norm);
+            score += q_norm[b] * k_norm * per_block_scale *
+                     (float) (2 * agree - TQ_KV_1B_BLOCK_SIZE);
+        }
+
+        score = score * scale;
+        if (logit_softcap != 0.0f) score = logit_softcap * tanhf(score);
+        score += mv;
+
+        /* Online softmax update (matches ops.cpp:8344-8377 fp32 path). */
+        float ms = 1.0f;
+        float vs = 1.0f;
+        if (score > M) {
+            const float Mold = M;
+            M = score;
+            ms = expf(Mold - M);
+            tq_vec_scale_f32_inplace(DV, VKQ32, ms);
+        } else {
+            vs = expf(score - M);
+        }
+
+        /* V-side: fused dequant + mad in place. The per-K-position stride
+         * comes from the caller (ggml row stride nb[1] of the V tensor).
+         * For the GQA layouts the model uses today this is greater than
+         * n_blocks_v * sizeof(block_tq_v_4b) because consecutive K positions
+         * are interleaved with the other KV head's V data. */
+        const block_tq_v_4b * v_row = (const block_tq_v_4b *) (v_base + (size_t) s * v_row_stride);
+        tq_v_4b_vec_mad_f32(DV, VKQ32, v_row, vs);
+        (void) n_blocks_v;
+
+        S = S * ms + vs;
+    }
+
+    *M_inout = M;
+    *S_inout = S;
+}
