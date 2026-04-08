@@ -443,7 +443,14 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
         if (op->src[i] && op->src[i]->buffer &&
             ggml_backend_cpu_is_extra_buffer_type(op->src[i]->buffer->buft)) {
             auto * buf_extra = (ggml::cpu::extra_buffer_type *) op->src[i]->buffer->buft->context;
-            return buf_extra->supports_op(dev, op);
+            // A null context means the extra buft has no op-level constraints
+            // (e.g. NUMA mirror buft holds plain CPU bytes in two physical
+            // copies; it doesn't change which ops are supported). Fall through
+            // to the generic CPU op check below. This matches the guard
+            // pattern in traits.cpp ggml_cpu_extra_compute_forward.
+            if (buf_extra) {
+                return buf_extra->supports_op(dev, op);
+            }
         }
     }
 
