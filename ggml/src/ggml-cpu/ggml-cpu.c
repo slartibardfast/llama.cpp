@@ -1244,6 +1244,10 @@ static void ggml_compute_forward_mul_mat_one_chunk(
     assert(ne12 % ne02 == 0);
     assert(ne13 % ne03 == 0);
 
+    // NUMA mirror: read src0 weights from the calling thread's local copy.
+    // For non-mirrored tensors this is identical to src0->data.
+    const char * src0_data_local = ggml_tensor_data_numa_local(src0);
+
     // block-tiling attempt
     const int64_t blck_0 = 16;
     const int64_t blck_1 = 16;
@@ -1269,7 +1273,7 @@ static void ggml_compute_forward_mul_mat_one_chunk(
                 const int64_t i2 = i12;
                 const int64_t i3 = i13;
 
-                const char * src0_row = (const char*)src0->data + (0 + i02 * nb02 + i03 * nb03);
+                const char * src0_row = src0_data_local + (0 + i02 * nb02 + i03 * nb03);
 
                 // desc: when src1 is not a contiguous memory block we have to calculate the offset using the strides
                 //       if it is, then we have either copied the data to params->wdata and made it contiguous or we are using
@@ -1333,6 +1337,11 @@ void ggml_compute_forward_mul_mat(
 
     // TODO: extract to "extra_op"
 #if GGML_USE_LLAMAFILE
+    // NUMA mirror: read src0 weights from the calling thread's local copy.
+    // Hoisted here for both LLAMAFILE early-outs. The main compute path
+    // hoists its own copy inside ggml_compute_forward_mul_mat_one_chunk.
+    const char * const src0_data_local = ggml_tensor_data_numa_local(src0);
+
     // broadcast factors
     const int64_t r2 = ne12 / ne02;
     const int64_t r3 = ne13 / ne03;
@@ -1344,7 +1353,7 @@ void ggml_compute_forward_mul_mat(
             for (int64_t i12 = 0; i12 < ne12; i12++)
                 if (!llamafile_sgemm(params,
                                      ne01, ne11, ne00/ggml_blck_size(src0->type),
-                                     (const char *)src0->data + i12/r2*nb02 + i13/r3*nb03,
+                                     src0_data_local + i12/r2*nb02 + i13/r3*nb03,
                                      nb01/ggml_type_size(src0->type),
                                      (const char *)src1->data + i12*nb12 + i13*nb13,
                                      nb11/ggml_type_size(src1->type),
@@ -1412,7 +1421,7 @@ UseGgmlGemm1:;
             for (int64_t i12 = 0; i12 < ne12; i12++)
                 if (!llamafile_sgemm(params,
                                      ne01, ne11, ne00/ggml_blck_size(src0->type),
-                                     (const char *)src0->data + i12/r2*nb02 + i13/r3*nb03,
+                                     src0_data_local + i12/r2*nb02 + i13/r3*nb03,
                                      nb01/ggml_type_size(src0->type),
                                      (const char *)wdata + (i12*ne11 + i13*ne12*ne11)*row_size,
                                      row_size/ggml_type_size(vec_dot_type),
@@ -1691,7 +1700,11 @@ static void ggml_compute_forward_mul_mat_id(
             continue;
         }
 
-        const char * src0_cur = (const char *) src0->data + cur_a * nb02;
+        // NUMA mirror: read the per-expert weight tile from the calling
+        // thread's local copy. For non-mirrored tensors this is identical
+        // to src0->data; for the MIRROR strategy each socket reads its
+        // own physical copy of the expert weights.
+        const char * src0_cur = ggml_tensor_data_numa_local(src0) + cur_a * nb02;
         const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
         const size_t row_size = ggml_row_size(vec_dot_type, ne10);
 

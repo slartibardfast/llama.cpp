@@ -297,6 +297,23 @@ ptrdiff_t ggml_backend_cpu_numa_mirror_alt_offset(ggml_backend_buffer_t buffer) 
     return ctx->alt_off;
 }
 
+void ggml_backend_cpu_buffer_finalize_load(ggml_backend_buffer_t buffer) {
+    if (buffer == nullptr) {
+        return;
+    }
+    if (buffer->buft != ggml_backend_cpu_numa_mirror_buffer_type()) {
+        return;
+    }
+    auto * ctx = static_cast<mirror_ctx *>(buffer->context);
+    if (ctx->base[1] == nullptr || ctx->alt_off == 0) {
+        return;
+    }
+    // Bulk replicate the primary copy into the secondary. The model loader
+    // calls this once per buffer after all tensors have been loaded via
+    // direct cur->data writes (which bypass the buffer set_tensor hook).
+    memcpy(ctx->base[1], ctx->base[0], ctx->size);
+}
+
 void ggml_backend_cpu_numa_mirror_after_op_sync(struct ggml_tensor * tensor) {
     if (tensor == nullptr || tensor->buffer == nullptr) {
         return;

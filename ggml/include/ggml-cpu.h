@@ -37,6 +37,15 @@ extern "C" {
     GGML_BACKEND_API void    ggml_numa_init(enum ggml_numa_strategy numa); // call once for better performance on NUMA systems
     GGML_BACKEND_API bool    ggml_is_numa(void); // true if init detected that system has >1 NUMA node
 
+    // For the NUMA mirror buffer type only: replicate the primary copy
+    // (whatever was written into the buffer via direct ptr access bypassing
+    // set_tensor) into the secondary copy. Called by the model loader after
+    // file->read_raw populates the weight tensors via direct cur->data
+    // writes — those direct writes don't go through the buffer's set_tensor
+    // hook so the alt copy stays empty without this call. No-op for any
+    // other buffer type.
+    GGML_BACKEND_API void    ggml_backend_cpu_buffer_finalize_load(ggml_backend_buffer_t buffer);
+
     GGML_BACKEND_API struct ggml_tensor * ggml_new_i32(struct ggml_context * ctx, int32_t value);
     GGML_BACKEND_API struct ggml_tensor * ggml_new_f32(struct ggml_context * ctx, float value);
 
