@@ -420,13 +420,24 @@ static void mirror_sync_set_rows_slice(struct ggml_tensor * tensor, ptrdiff_t al
 // and for ops that write the full dst extent. Each thread copies its
 // slice of dst rows to the alt copy. No barrier needed because each
 // thread reads only the rows it wrote.
+//
+// Slicing matches ggml_compute_forward_dup_bytes: nr = ne[1] (rows in
+// dim 1 only), each thread takes ir0..ir1, and the inner loop iterates
+// dims 2 and 3 in full. This handles 1D/2D tensors trivially (the inner
+// loops collapse to a single iteration when ne02 == ne03 == 1) and 3D/4D
+// tensors correctly (each thread visits all (i02, i03) for its (i01)
+// slice).
 static void mirror_sync_rows_slice(struct ggml_tensor * tensor, ptrdiff_t alt_off,
                                     int ith, int nth) {
-    const int64_t nr = ggml_nrows(tensor);
+    const int64_t ne01 = tensor->ne[1];
+    const int64_t ne02 = tensor->ne[2];
+    const int64_t ne03 = tensor->ne[3];
+    const int64_t nr   = ne01;
 
     if (nr <= 1) {
-        // Single-row or zero-row dst: master thread does the whole copy.
-        // The op kernel similarly funnels into a single thread for nr<=1.
+        // Single dim-1 row (typical for CPY of 1D views into recurrent
+        // state): master thread does the whole copy. The op kernel
+        // similarly funnels into a single thread for nr<=1.
         if (ith == 0) {
             const size_t nbytes = ggml_nbytes(tensor);
             memcpy((char *) tensor->data + alt_off, tensor->data, nbytes);
@@ -442,13 +453,22 @@ static void mirror_sync_rows_slice(struct ggml_tensor * tensor, ptrdiff_t alt_of
         return;  // empty slice for this thread
     }
 
-    // Treat dst as a flat row-major buffer with row stride nb[1] (which
-    // is the byte stride to advance one row in dim 1). This matches what
-    // ggml_nrows iterates over and what the CPY/DUP kernels write.
-    const size_t row_bytes = tensor->nb[1];
-    char * dst_base = (char *) tensor->data + ir0 * row_bytes;
-    const size_t span = (size_t)(ir1 - ir0) * row_bytes;
-    memcpy(dst_base + alt_off, dst_base, span);
+    const size_t nb1 = tensor->nb[1];
+    const size_t nb2 = tensor->nb[2];
+    const size_t nb3 = tensor->nb[3];
+
+    // Row size in bytes — derived from nb1 directly to handle padded
+    // and strided layouts. For a row-contiguous tensor this equals
+    // ne[0] * type_size / blck_size.
+    const size_t row_bytes = nb1;
+
+    for (int64_t i03 = 0; i03 < ne03; ++i03) {
+        for (int64_t i02 = 0; i02 < ne02; ++i02) {
+            char * dst_row = (char *) tensor->data + ir0*nb1 + i02*nb2 + i03*nb3;
+            const size_t span = (size_t)(ir1 - ir0) * row_bytes;
+            memcpy(dst_row + alt_off, dst_row, span);
+        }
+    }
 }
 
 void ggml_backend_cpu_numa_mirror_after_op_sync(
