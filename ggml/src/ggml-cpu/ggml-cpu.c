@@ -3097,8 +3097,9 @@ struct ggml_cplan ggml_graph_plan(
                         // TQ_KV_1B Hamming attention. Lives at offset
                         //   nth * (DK + 2*DV + CACHE_LINE_SIZE_F32) floats
                         // from the start of wdata, after the per-thread scratch.
-                        // TQ_KV_1B is NOT enabled for split-KV, so this scratch
-                        // doesn't need to coexist with the split-KV partials.
+                        // When split-KV is active (which now admits TQ_KV_1B),
+                        // the partials buffer follows AFTER this TQ scratch —
+                        // see partials_offset in the split-KV path of ops.cpp.
                         if (node->src[1]->type == GGML_TYPE_TQ_KV_1B) {
                             const size_t cache_line_f32 = CACHE_LINE_SIZE/sizeof(float);
                             const size_t tq_stride = ((nek1 + cache_line_f32 - 1) / cache_line_f32) * cache_line_f32;
