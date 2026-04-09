@@ -1,5 +1,6 @@
 #include "models.h"
 
+#include "ggml-fusion.h"
 #include "llama-memory-recurrent.h"
 
 llm_build_qwen35::llm_build_qwen35(const llama_model & model, const llm_graph_params & params) :
@@ -246,11 +247,7 @@ ggml_tensor * llm_build_qwen35::build_layer_attn_linear(
     alpha = ggml_reshape_3d(ctx0, alpha, num_v_heads, n_seq_tokens, n_seqs);
     cb(alpha, "alpha", il);
 
-    ggml_tensor * alpha_biased   = ggml_add(ctx0, alpha, model.layers[il].ssm_dt);
-    ggml_tensor * alpha_softplus = ggml_softplus(ctx0, alpha_biased);
-    cb(alpha_softplus, "a_softplus", il);
-
-    ggml_tensor * gate = ggml_mul(ctx0, alpha_softplus, model.layers[il].ssm_a);  // -A_log.exp() * softplus
+    ggml_tensor * gate = ggml_fused_gate_prep(ctx0, alpha, model.layers[il].ssm_dt, model.layers[il].ssm_a);
     cb(gate, "gate", il);
 
     gate = ggml_reshape_4d(ctx0, gate, 1, num_v_heads, n_seq_tokens, n_seqs);

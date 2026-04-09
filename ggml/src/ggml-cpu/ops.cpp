@@ -1,6 +1,7 @@
 #include "ops.h"
 
 #include "ggml-cpu.h"
+#include "ggml-fusion.h"
 #include "ggml-impl.h"
 #include "binary-ops.h"
 #include "simd-gemm.h"
@@ -11319,5 +11320,61 @@ void ggml_compute_forward_opt_step_sgd(const ggml_compute_params * params, ggml_
             {
                 GGML_ABORT("fatal error - sgd is F32 only");
             }
+    }
+}
+
+// ggml_compute_forward_fused_gate_prep
+//
+// Fuses: add(alpha, dt_bias) + softplus + mul(ssm_a)
+// dst[i] = softplus(alpha[i] + dt_bias[i % num_v_heads]) * ssm_a[i % num_v_heads]
+
+static void ggml_compute_forward_fused_gate_prep(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * alpha  = dst->src[0];
+    const ggml_tensor * dt_bias = dst->src[1];
+    const ggml_tensor * ssm_a   = dst->src[2];
+
+    GGML_ASSERT(alpha->type  == GGML_TYPE_F32);
+    GGML_ASSERT(dt_bias->type == GGML_TYPE_F32);
+    GGML_ASSERT(ssm_a->type  == GGML_TYPE_F32);
+
+    const int64_t ne = ggml_nelements(alpha);
+    const int32_t num_v_heads = ggml_get_op_params_i32(dst, 1);
+    GGML_ASSERT(num_v_heads > 0);
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t dr = (ne + nth - 1) / nth;
+    const int64_t ir0 = dr * ith;
+    const int64_t ir1 = std::min(ir0 + dr, ne);
+
+    const float * src_alpha = (const float *) alpha->data;
+    const float * src_bias  = (const float *) dt_bias->data;
+    const float * src_a     = (const float *) ssm_a->data;
+    float       * dst_data  = (float *) dst->data;
+
+    for (int64_t i = ir0; i < ir1; i++) {
+        const int h = (int)(i % num_v_heads);
+        const float x = src_alpha[i] + src_bias[h];
+        const float sp = (x > 20.0f) ? x : logf(1.0f + expf(x));
+        dst_data[i] = sp * src_a[h];
+    }
+}
+
+// ggml_compute_forward_fused — dispatch by fusion_id
+
+void ggml_compute_forward_fused(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const int32_t fusion_id = ggml_get_op_params_i32(dst, 0);
+
+    switch (fusion_id) {
+        case GGML_FUSION_GATE_PREP:
+            ggml_compute_forward_fused_gate_prep(params, dst);
+            break;
+        default:
+            GGML_ABORT("unsupported fusion_id %d", fusion_id);
     }
 }

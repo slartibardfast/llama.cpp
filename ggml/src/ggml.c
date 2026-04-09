@@ -2,6 +2,7 @@
 #define _USE_MATH_DEFINES // For M_PI on MSVC
 
 #include "ggml-backend.h"
+#include "ggml-fusion.h"
 #include "ggml-impl.h"
 #include "ggml-threading.h"
 #include "ggml-cpu.h"
@@ -1072,9 +1073,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+
+    "FUSED",
 };
 
-static_assert(GGML_OP_COUNT == 96, "GGML_OP_COUNT != 96");
+static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 97");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1182,9 +1185,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+
+    "fused(x)",
 };
 
-static_assert(GGML_OP_COUNT == 96, "GGML_OP_COUNT != 96");
+static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 97");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6036,6 +6041,29 @@ struct ggml_tensor * ggml_custom_inplace(
 
     return result;
 }
+// ggml_fused_gate_prep
+
+struct ggml_tensor * ggml_fused_gate_prep(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * alpha,
+        struct ggml_tensor  * dt_bias,
+        struct ggml_tensor  * ssm_a) {
+    // Output shape matches alpha: [num_v_heads, n_seq_tokens, n_seqs]
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, alpha->ne);
+
+    int32_t fusion_params[2];
+    fusion_params[0] = GGML_FUSION_GATE_PREP;
+    fusion_params[1] = (int32_t) dt_bias->ne[0];  // num_v_heads for modular indexing
+    ggml_set_op_params(result, fusion_params, sizeof(fusion_params));
+
+    result->op     = GGML_OP_FUSED;
+    result->src[0] = alpha;
+    result->src[1] = dt_bias;
+    result->src[2] = ssm_a;
+
+    return result;
+}
+
 // ggml_cross_entropy_loss
 
 struct ggml_tensor * ggml_cross_entropy_loss(
