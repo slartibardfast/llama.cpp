@@ -8894,33 +8894,52 @@ static void ggml_compute_forward_flash_attn_ext_f16(
     // When use_ref is set, force the vec-only reference implementation (no tiling, no KV-chunking)
     const bool use_ref = params->use_ref;
 
-    // Split-KV path is gated on F32/F16 K + matching V type.
+    // Split-KV path: parallelise K scan across all nth threads at decode.
+    // Admits any K type with a vec_dot (F32, F16, Q4_0, Q8_0, TQ_KV_1B,
+    // etc.) and any V type. K and V types need not match — the K side
+    // uses its vec_dot, the V side uses v_to_float or the TQ_V_4B fused
+    // mad, and both produce fp32 partials for the reduce step.
     //
-    // TQ_KV_1B was briefly admitted (Step 5 attempt) and regressed the
-    // 8K-fill benchmark from 4.21 → 3.95 t/s. Root cause: at partial
-    // fill (e.g. 7835 valid keys in a 65536-slot cache), the split-KV
-    // chunking divides the ALLOCATED range across threads, not the
-    // valid range. With chunk_size = 10923 and only 7835 valid keys,
-    // thread 0 handles the entire valid range while threads 1..5 spin
-    // on fully-masked chunks. The non-split per-query-head parallelism
-    // (16 heads split across 6 threads) balances better for this
-    // shape. Sticking with the non-split path for TQ.
-    //
-    // Re-enabling this is a follow-up that requires valid-range-aware
-    // chunking (compute valid_end once, then divide [0, valid_end)
-    // across threads) — out of scope for this session.
+    // The tiled PP path (large batch) still requires F32/F16 K because
+    // the tiled kernel has no quantized-K support.
     const bool kv_is_f32_or_f16 = (k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_F16);
-    const bool use_split_kv_path = !use_ref && (neq1 == 1 && neq3 == 1) && kv_is_f32_or_f16 && (k->type == v->type) && q->type == GGML_TYPE_F32 && nek1 >= 512;
+    const bool kv_has_vec_dot   = (ggml_get_type_traits_cpu(k->type)->vec_dot != NULL);
+    const bool use_split_kv_path = !use_ref && (neq1 == 1 && neq3 == 1) && kv_has_vec_dot && q->type == GGML_TYPE_F32 && nek1 >= 512;
 
     if (use_split_kv_path) {
-        const int64_t chunk_size = (nek1 + nth - 1) / nth;
+        // Valid-range-aware chunking: scan the mask once to find the end
+        // of the valid (unmasked) range. For causal decode, valid positions
+        // are contiguous from 0. Chunking over [0, valid_end) instead of
+        // [0, nek1) avoids assigning threads to fully-masked chunks — the
+        // root cause of the original Step 5 regression (-6% at 8K fill).
+        int64_t valid_end = nek1;
+        const ggml_tensor * mask_t = dst->src[3];
+        if (mask_t) {
+            const ggml_fp16_t * mp0 = (const ggml_fp16_t *) mask_t->data;
+            for (int64_t ic = 0; ic < nek1; ic++) {
+                if (GGML_CPU_FP16_TO_FP32(mp0[ic]) == -INFINITY) {
+                    valid_end = ic;
+                    break;
+                }
+            }
+        }
+
+        const int64_t chunk_size = (valid_end + nth - 1) / nth;
 
         // Partials buffer layout: [q_head][kv_chunk][M, S, VKQ]
         const int64_t partial_size  = 2 + DV;
-        float *       partials_base = (float *) params->wdata + nth * (DK + 2*DV + CACHE_LINE_SIZE_F32);
+        size_t partials_offset = (size_t) nth * (DK + 2*DV + CACHE_LINE_SIZE_F32);
+        // When TQ_KV_1B K is active, the per-thread score scratch lives
+        // right after the per-thread Q/VKQ scratch. Partials must follow
+        // BOTH to avoid collision.
+        if (k->type == GGML_TYPE_TQ_KV_1B) {
+            const size_t tq_stride = ((nek1 + CACHE_LINE_SIZE_F32 - 1) / CACHE_LINE_SIZE_F32) * CACHE_LINE_SIZE_F32;
+            partials_offset += (size_t) nth * tq_stride;
+        }
+        float * partials_base = (float *) params->wdata + partials_offset;
 
         const int64_t ic_start = ith * chunk_size;
-        const int64_t ic_end   = std::min(ic_start + chunk_size, nek1);
+        const int64_t ic_end   = std::min(ic_start + chunk_size, valid_end);
 
         const int64_t partial_stride = nth * partial_size;
         float *       chunk_partials = partials_base + ith * partial_size;
