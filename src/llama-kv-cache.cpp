@@ -5,8 +5,6 @@
 #include "llama-model.h"
 #include "llama-context.h"
 
-#include "ggml-cpu.h"
-
 #include <algorithm>
 #include <cassert>
 #include <cmath>
@@ -118,16 +116,24 @@ llama_kv_cache::llama_kv_cache(
 
         const char * dev_name = "CPU";
 
-        // Routes through the NUMA mirror buft when --numa mirror is
-        // active so KV writes are replicated across both nodes; falls
-        // through to the regular CPU buft otherwise.
-        ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type_for_runtime();
+        ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
 
         if (offload) {
             auto * dev = model.dev_layer(il);
             buft = ggml_backend_dev_buffer_type(dev);
 
             dev_name = ggml_backend_dev_name(dev);
+        }
+
+        // If the layer landed on the regular CPU buft (either because
+        // offload is false, or because the dev is the CPU device), and
+        // --numa mirror is active, redirect to the mirror buft so KV
+        // writes get replicated across both NUMA nodes. The helper is a
+        // no-op on non-mirror runs and on non-CPU bufts; the equality
+        // check against the regular CPU buft is what scopes the redirect
+        // to layers that would otherwise live on a single CPU node.
+        if (buft == ggml_backend_cpu_buffer_type()) {
+            buft = ggml_backend_cpu_buffer_type_for_runtime();
         }
 
         LLAMA_LOG_DEBUG("%s: layer %3d: dev = %s\n", __func__, il, dev_name);
