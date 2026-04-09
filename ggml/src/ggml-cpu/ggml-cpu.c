@@ -2177,14 +2177,29 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
     }
 
     // NUMA mirror: replicate per-op writes from the primary copy of the
-    // dst tensor to the secondary. The helper checks `tensor->buffer`'s
-    // alt offset and returns immediately for non-mirror buffers (the
-    // common case — compute scratch lives in the regular CPU buft), so
-    // this is a near-zero-cost no-op on non-MIRROR runs. For mirror
-    // buffers it barriers to ensure all worker threads have committed
-    // their slice of the op work, then the master thread copies the
-    // dirty region to the alt.
-    ggml_backend_cpu_numa_mirror_after_op_sync(params, tensor);
+    // dst tensor to the secondary. Most ops in a graph (matmul, softmax,
+    // norms, activations, attention) write to compute scratch (regular
+    // CPU buft) and don't need the hook — gating on tensor->op here
+    // skips the function call entirely for those, which matters because
+    // ggml_compute_forward is on the per-op-per-thread hot path. Only
+    // ops whose dst can land on a mirror buffer (KV cache writes,
+    // recurrent state writes, in-place SCALE on a mirrored tensor) reach
+    // the helper, where it does the buft check and decides whether to
+    // sync. The set here MUST stay in sync with the dispatch switch in
+    // ggml_backend_cpu_numa_mirror_after_op_sync.
+    switch (tensor->op) {
+        case GGML_OP_SET_ROWS:
+        case GGML_OP_CPY:
+        case GGML_OP_DUP:
+        case GGML_OP_SCALE:
+        case GGML_OP_SSM_CONV:
+        case GGML_OP_SSM_SCAN:
+        case GGML_OP_GATED_DELTA_NET:
+            ggml_backend_cpu_numa_mirror_after_op_sync(params, tensor);
+            break;
+        default:
+            break;
+    }
 }
 
 // Android's libc implementation "bionic" does not support setting affinity

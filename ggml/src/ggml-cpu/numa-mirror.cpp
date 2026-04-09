@@ -277,19 +277,26 @@ ggml_backend_buffer_type_t ggml_backend_cpu_numa_mirror_buffer_type(void) {
 
 ggml_backend_buffer_type_t ggml_backend_cpu_buffer_type_for_runtime(void) {
     // Default callsites (KV cache, recurrent state) ask for the regular
-    // CPU buft directly. On a MIRROR run we want them to land on the
-    // mirror buft so per-thread reads stay NUMA-local. This helper does
-    // the redirect without making the callsites aware of the mirror.
+    // CPU buft directly. The helper exists so a future caller can opt
+    // into NUMA mirror placement of any buffer that would otherwise go
+    // to the regular CPU buft, without making the callsite aware of
+    // mirror semantics.
+    //
+    // For KV/recurrent state, mirroring is OPT-IN via the
+    // LLAMA_NUMA_MIRROR_KV env var. Default is OFF because measurement
+    // on dual Westmere with Qwen3.5-A3B Q4_K_M showed a ~14% decode
+    // regression when KV is on the mirror buffer (hot bench fixture:
+    // 8K openclaw fill, --numa mirror -t 12). The cause is per-op sync
+    // overhead amortised over many small SET_ROWS writes outweighing
+    // the cross-socket savings on KV reads, which are L3-friendly at
+    // moderate fill. The code path is kept available because (a) it
+    // may pay off at much larger fills where KV scan dominates and
+    // (b) it gives us a tested mirror-write framework that any future
+    // mirrored buffer (e.g. activations) can re-use.
     if (ggml_cpu_get_numa_strategy() != GGML_NUMA_STRATEGY_MIRROR) {
         return ggml_backend_cpu_buffer_type();
     }
-    // Kill switch for A/B equivalence testing of KV mirroring without
-    // a rebuild. When set (any value), the mirror is bypassed and the
-    // KV cache lands on the regular CPU buft just like a non-MIRROR
-    // run. The weights mirror still works (it goes through the extra
-    // buft list, not this helper). Removed in commit 3 once equivalence
-    // is verified.
-    if (getenv("LLAMA_NUMA_MIRROR_KV_DISABLE") != nullptr) {
+    if (getenv("LLAMA_NUMA_MIRROR_KV") == nullptr) {
         return ggml_backend_cpu_buffer_type();
     }
     return ggml_backend_cpu_numa_mirror_buffer_type();
@@ -334,6 +341,116 @@ void ggml_backend_cpu_buffer_finalize_load(ggml_backend_buffer_t buffer) {
     memcpy(ctx->base[1], ctx->base[0], ctx->size);
 }
 
+// Per-thread parallel-slice sync. Each thread syncs the dst rows IT wrote
+// during the op, matching the per-row work slicing the op kernels use.
+// Because each thread reads only what it itself just wrote, no barrier is
+// needed: there is no race with other threads' writes.
+//
+// This avoids the cost of a master-thread serial sync + cross-socket
+// barrier on every mirror-write op, which on dual-socket Westmere costs
+// many microseconds per op and at ~120 mirror-write ops per token adds
+// up to a measurable decode regression.
+//
+// Slicing convention: rows-of-the-write-region split equally across
+// threads, exactly matching the (nr + nth - 1) / nth / ir0 / ir1 pattern
+// in compute_forward_set_rows_f32 and compute_forward_dup_bytes.
+
+// SET_ROWS slice sync. The op iterates rows 0..nr of src0; this thread
+// owns rows ir0..ir1 (matching the op kernel's slicing). For each owned
+// row, look up the destination row index in src1 and sync that dst row.
+//
+// For Qwen3.5-A3B at decode the typical SET_ROWS into the K cache writes
+// 1 row of ~24 bytes (TQ_KV_1B) per call; the V cache writes 1 row of
+// ~66 bytes (TQ_V_4B). With nr=1 only thread 0 owns work; the others
+// run with empty ir0..ir1 and exit immediately with no memcpy.
+static void mirror_sync_set_rows_slice(struct ggml_tensor * tensor, ptrdiff_t alt_off,
+                                        int ith, int nth) {
+    const ggml_tensor * src0 = tensor->src[0];
+    const ggml_tensor * src1 = tensor->src[1];
+    if (src0 == nullptr || src1 == nullptr) {
+        return;  // defensive
+    }
+
+    const int64_t nc   = src0->ne[0];
+    const int64_t nr   = src0->ne[1];
+    const int64_t ne02 = src0->ne[2];
+    const int64_t ne03 = src0->ne[3];
+    const int64_t ne11 = src1->ne[1];
+    const int64_t ne12 = src1->ne[2];
+    const size_t  nb10 = src1->nb[0];
+    const size_t  nb11 = src1->nb[1];
+    const size_t  nb12 = src1->nb[2];
+    const size_t  nb1  = tensor->nb[1];
+    const size_t  nb2  = tensor->nb[2];
+    const size_t  nb3  = tensor->nb[3];
+
+    const int64_t dr  = (nr + nth - 1) / nth;
+    const int64_t ir0 = dr * ith;
+    const int64_t ir1 = (ir0 + dr) < nr ? (ir0 + dr) : nr;
+
+    if (ir0 >= ir1) {
+        return;  // empty slice for this thread
+    }
+
+    const size_t row_size = ggml_row_size(tensor->type, nc);
+    const bool   idx_i64  = (src1->type == GGML_TYPE_I64);
+
+    for (int64_t i03 = 0; i03 < ne03; ++i03) {
+        for (int64_t i02 = 0; i02 < ne02; ++i02) {
+            for (int64_t i = ir0; i < ir1; ++i) {
+                const int64_t i12 = i03 % ne12;
+                const int64_t i11 = i02 % ne11;
+                const int64_t i10 = i;
+
+                const char * idx_ptr = (const char *) src1->data
+                                     + i10*nb10 + i11*nb11 + i12*nb12;
+                const int64_t i1 = idx_i64
+                                 ? *(const int64_t *) idx_ptr
+                                 : (int64_t) *(const int32_t *) idx_ptr;
+
+                char * dst_row = (char *) tensor->data
+                               + i1*nb1 + i02*nb2 + i03*nb3;
+                memcpy(dst_row + alt_off, dst_row, row_size);
+            }
+        }
+    }
+}
+
+// Per-thread row-slice sync of the entire dst tensor. Used for CPY/DUP
+// and for ops that write the full dst extent. Each thread copies its
+// slice of dst rows to the alt copy. No barrier needed because each
+// thread reads only the rows it wrote.
+static void mirror_sync_rows_slice(struct ggml_tensor * tensor, ptrdiff_t alt_off,
+                                    int ith, int nth) {
+    const int64_t nr = ggml_nrows(tensor);
+
+    if (nr <= 1) {
+        // Single-row or zero-row dst: master thread does the whole copy.
+        // The op kernel similarly funnels into a single thread for nr<=1.
+        if (ith == 0) {
+            const size_t nbytes = ggml_nbytes(tensor);
+            memcpy((char *) tensor->data + alt_off, tensor->data, nbytes);
+        }
+        return;
+    }
+
+    const int64_t dr  = (nr + nth - 1) / nth;
+    const int64_t ir0 = dr * ith;
+    const int64_t ir1 = (ir0 + dr) < nr ? (ir0 + dr) : nr;
+
+    if (ir0 >= ir1) {
+        return;  // empty slice for this thread
+    }
+
+    // Treat dst as a flat row-major buffer with row stride nb[1] (which
+    // is the byte stride to advance one row in dim 1). This matches what
+    // ggml_nrows iterates over and what the CPY/DUP kernels write.
+    const size_t row_bytes = tensor->nb[1];
+    char * dst_base = (char *) tensor->data + ir0 * row_bytes;
+    const size_t span = (size_t)(ir1 - ir0) * row_bytes;
+    memcpy(dst_base + alt_off, dst_base, span);
+}
+
 void ggml_backend_cpu_numa_mirror_after_op_sync(
         const struct ggml_compute_params * params,
         struct ggml_tensor * tensor) {
@@ -345,30 +462,60 @@ void ggml_backend_cpu_numa_mirror_after_op_sync(
         // Single-copy fallback or non-mirror buffer; nothing to sync.
         // Cheap early return — most tensors in a graph live in compute
         // scratch (regular CPU buft, alt_off == 0) so this is the
-        // common case and runs on every thread without a barrier cost.
+        // common case and runs on every thread.
         return;
     }
 
-    // From here we know the dst tensor is on a mirror buffer with two
-    // physical copies. Most CPU ops slice work across threads by row
-    // and do not have an internal barrier; the calling thread may
-    // therefore have finished its slice before other threads have
-    // finished theirs. We need a barrier so the master thread reads
-    // a fully-written dst before copying it to the alt.
-    ggml_barrier(params->threadpool);
+    const int ith = params->ith;
+    const int nth = params->nth;
 
-    if (params->ith != 0) {
-        // Worker threads have nothing to do; the next op's barrier
-        // (in ggml_graph_compute_thread, between nodes) will hold them
-        // until the master thread finishes the sync below.
-        return;
+    switch (tensor->op) {
+        case GGML_OP_SET_ROWS:
+            // Critical case: KV cache writes go through SET_ROWS. Each
+            // thread syncs the dst rows it wrote (looked up via src[1]).
+            mirror_sync_set_rows_slice(tensor, alt_off, ith, nth);
+            break;
+
+        case GGML_OP_CPY:
+        case GGML_OP_DUP:
+            // Recurrent state checkpointing and similar. The op slices
+            // dst by rows; sync the same row slice.
+            mirror_sync_rows_slice(tensor, alt_off, ith, nth);
+            break;
+
+        case GGML_OP_SCALE:
+            // In-place SCALE on a mirrored tensor. Same row slicing.
+            mirror_sync_rows_slice(tensor, alt_off, ith, nth);
+            break;
+
+        case GGML_OP_SSM_CONV:
+        case GGML_OP_SSM_SCAN:
+        case GGML_OP_GATED_DELTA_NET:
+            // SSM/GDN ops typically write to a fresh compute-scratch dst
+            // (alt_off == 0, early-exit above). This case only fires when
+            // the dst happens to be on a mirror buffer; row-slice sync.
+            mirror_sync_rows_slice(tensor, alt_off, ith, nth);
+            break;
+
+        default: {
+            // Safety net: an unhandled write op falls back to a master
+            // sync with explicit barrier. The barrier is needed because
+            // we don't know how this op sliced its work across threads.
+            // Log once so we know to add a narrow case if this fires.
+            static enum ggml_op s_warned_op = GGML_OP_NONE;
+            if (ith == 0 && s_warned_op != tensor->op) {
+                s_warned_op = tensor->op;
+                fprintf(stderr,
+                        "ggml-cpu numa mirror: unhandled write op %s (%s) "
+                        "on mirror buffer — falling back to full-tensor sync\n",
+                        ggml_op_name(tensor->op), tensor->name);
+            }
+            ggml_barrier(params->threadpool);
+            if (ith == 0) {
+                const size_t nbytes = ggml_nbytes(tensor);
+                memcpy((char *) tensor->data + alt_off, tensor->data, nbytes);
+            }
+            break;
+        }
     }
-
-    // Stub: full-tensor sync. Correct for any write op (the entire dst
-    // is byte-identical between the two copies after this) but pays
-    // catastrophic cross-socket bandwidth for ops that only touch a
-    // small slice of dst (e.g. SET_ROWS into a 60 MB KV cache row).
-    // Commit 2 replaces this with per-op narrow dirty-region dispatch.
-    const size_t nbytes = ggml_nbytes(tensor);
-    memcpy((char *) tensor->data + alt_off, tensor->data, nbytes);
 }
