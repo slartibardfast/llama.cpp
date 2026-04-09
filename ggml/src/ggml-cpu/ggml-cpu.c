@@ -1738,6 +1738,30 @@ static void ggml_compute_forward_mul_mat_id(
 
     ggml_barrier(params->threadpool);
 
+    // NUMA mirror: base pointer for the calling thread's local copy of
+    // the expert weight tensor. For non-mirrored tensors this is just
+    // src0->data; for the MIRROR strategy each socket reads its own
+    // physical copy.
+    const char * src0_base = ggml_tensor_data_numa_local(src0);
+
+    // Prefetch active expert weight tiles into L2 before the matmul loop.
+    // At this point the router decision is known (matrix_row_counts is
+    // populated) but the matmuls haven't started. Issuing prefetch hints
+    // here overlaps the DRAM-to-L2 fetch with the loop setup overhead.
+    // With ~80% expert reuse across tokens, most tiles are already in L3
+    // from the previous token — the prefetch pulls the ~20% cold tiles
+    // into L2 where the matmul will find them.
+#if defined(__SSE__) || defined(__x86_64__)
+    for (int a = 0; a < n_as; a++) {
+        if (matrix_row_counts[a] > 0) {
+            const char * tile = src0_base + a * nb02;
+            for (size_t off = 0; off < 512 && off < nb02; off += 64) {
+                _mm_prefetch(tile + off, _MM_HINT_T1);
+            }
+        }
+    }
+#endif
+
     for (int cur_a = 0; cur_a < n_as; ++cur_a) {
         const int64_t cne1 = matrix_row_counts[cur_a];
 
@@ -1745,13 +1769,24 @@ static void ggml_compute_forward_mul_mat_id(
             continue;
         }
 
-        // NUMA mirror: read the per-expert weight tile from the calling
-        // thread's local copy. For non-mirrored tensors this is identical
-        // to src0->data; for the MIRROR strategy each socket reads its
-        // own physical copy of the expert weights.
-        const char * src0_cur = ggml_tensor_data_numa_local(src0) + cur_a * nb02;
+        const char * src0_cur = src0_base + cur_a * nb02;
         const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
         const size_t row_size = ggml_row_size(vec_dot_type, ne10);
+
+        // Look-ahead: prefetch the NEXT active expert's tile into L1
+        // while this expert's matmul is running. Pipelines the DRAM
+        // fetch behind the current compute.
+#if defined(__SSE__) || defined(__x86_64__)
+        for (int next_a = cur_a + 1; next_a < n_as; next_a++) {
+            if (matrix_row_counts[next_a] > 0) {
+                const char * next_tile = src0_base + next_a * nb02;
+                for (size_t off = 0; off < 512 && off < nb02; off += 64) {
+                    _mm_prefetch(next_tile + off, _MM_HINT_T0);
+                }
+                break;
+            }
+        }
+#endif
 
         const int64_t nr0 = ne01;
         const int64_t nr1 = cne1;
