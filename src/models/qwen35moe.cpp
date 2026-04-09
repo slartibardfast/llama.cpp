@@ -183,10 +183,7 @@ ggml_tensor * llm_build_qwen35moe ::build_layer_attn(
                 Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
     cb(cur, "attn_pregate", il);
 
-    ggml_tensor * gate_sigmoid = ggml_sigmoid(ctx0, gate);
-    cb(gate_sigmoid, "gate_sigmoid", il);
-
-    cur = ggml_mul(ctx0, cur, gate_sigmoid);
+    cur = ggml_fused_sigmoid_mul(ctx0, gate, cur);
     cb(cur, "attn_gated", il);
 
     cur = build_lora_mm(model.layers[il].wo, cur, model.layers[il].wo_s);

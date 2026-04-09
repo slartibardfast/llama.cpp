@@ -21,6 +21,7 @@ enum ggml_fusion_id {
     GGML_FUSION_NONE = 0,
     GGML_FUSION_GATE_PREP,      /* softplus(alpha + dt_bias) * ssm_a           */
     GGML_FUSION_SILU_MUL,       /* silu(x) * y                                */
+    GGML_FUSION_SIGMOID_MUL,    /* sigmoid(x) * y                             */
     GGML_FUSION_COUNT,
 };
 
@@ -56,6 +57,17 @@ GGML_API struct ggml_tensor * ggml_fused_gate_prep(
  * @return     silu(x) * y (same shape as x and y)
  */
 GGML_API struct ggml_tensor * ggml_fused_silu_mul(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * y);
+
+/**
+ * Fused sigmoid-gated multiply.
+ *
+ * Combines: sigmoid(x) * y into one dispatch.
+ * sigmoid(x) = 1 / (1 + exp(-x))
+ */
+GGML_API struct ggml_tensor * ggml_fused_sigmoid_mul(
         struct ggml_context * ctx,
         struct ggml_tensor  * x,
         struct ggml_tensor  * y);
