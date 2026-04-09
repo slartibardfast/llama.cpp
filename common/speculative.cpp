@@ -888,17 +888,27 @@ bool common_speculative_is_compat(llama_context * ctx_tgt) {
     }
 
     bool res = true;
+    int ret = 0;
+    llama_token tok = 0;
 
     llama_memory_clear(mem, true);
 
-    // eval 2 tokens to check if the context is compatible
-    std::vector<llama_token> tmp;
-    tmp.push_back(0);
-    tmp.push_back(0);
-
-    int ret = llama_decode(ctx_tgt, llama_batch_get_one(tmp.data(), tmp.size()));
+    // Eval 2 tokens to check if the context is compatible. We use TWO
+    // separate llama_decode() calls (one token each) instead of a single
+    // 2-token batch so that PR #20075's checkpoint/restore path for
+    // hybrid SSM models (e.g. Qwen3.5-A3B with DeltaNet) fires at the
+    // batch boundary between them — that's exactly what real speculative
+    // decode does at runtime, and a single-batch test bypasses the
+    // checkpoint creation.
+    ret = llama_decode(ctx_tgt, llama_batch_get_one(&tok, 1));
     if (ret != 0) {
-        LOG_ERR("%s: llama_decode() failed: %d\n", __func__, ret);
+        LOG_ERR("%s: llama_decode() (1) failed: %d\n", __func__, ret);
+        res = false;
+        goto done;
+    }
+    ret = llama_decode(ctx_tgt, llama_batch_get_one(&tok, 1));
+    if (ret != 0) {
+        LOG_ERR("%s: llama_decode() (2) failed: %d\n", __func__, ret);
         res = false;
         goto done;
     }
