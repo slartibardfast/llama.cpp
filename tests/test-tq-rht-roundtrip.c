@@ -41,13 +41,33 @@ int main(void) {
     float query[HEAD_DIM];
     block_tq_kv_1b blocks[N_KEYS];
 
-    /* Generate deterministic keys and query. */
-    for (int k = 0; k < N_KEYS; k++) {
-        xor_state = 1000 + k * 7;
-        for (int i = 0; i < HEAD_DIM; i++) keys[k][i] = xrand();
+    /* Generate keys with clearly distinguishable dot products.
+     * Key 0: strongly aligned with query (large positive dot)
+     * Key 1: anti-aligned (large negative dot)
+     * Key 2: orthogonal-ish (small dot)
+     * Key 3: moderately aligned (medium positive dot)
+     * This makes the ranking test meaningful for 1-bit quantization. */
+    xor_state = 42;
+    for (int i = 0; i < HEAD_DIM; i++) query[i] = xrand() * 2.0f;
+
+    /* Key 0: query + small noise → large positive dot */
+    for (int i = 0; i < HEAD_DIM; i++) {
+        xor_state = 100 + (uint32_t)i;
+        keys[0][i] = query[i] + xrand() * 0.1f;
     }
-    xor_state = 9999;
-    for (int i = 0; i < HEAD_DIM; i++) query[i] = xrand();
+    /* Key 1: -query + small noise → large negative dot */
+    for (int i = 0; i < HEAD_DIM; i++) {
+        xor_state = 200 + (uint32_t)i;
+        keys[1][i] = -query[i] + xrand() * 0.1f;
+    }
+    /* Key 2: random, uncorrelated with query → small dot */
+    xor_state = 300;
+    for (int i = 0; i < HEAD_DIM; i++) keys[2][i] = xrand() * 2.0f;
+    /* Key 3: 0.5*query + noise → medium positive dot */
+    for (int i = 0; i < HEAD_DIM; i++) {
+        xor_state = 400 + (uint32_t)i;
+        keys[3][i] = query[i] * 0.5f + xrand() * 0.5f;
+    }
 
     /* Quantize keys. */
     for (int k = 0; k < N_KEYS; k++) {

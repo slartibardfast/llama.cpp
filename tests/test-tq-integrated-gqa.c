@@ -23,17 +23,31 @@
 #define BLOCKS_PER_HEAD (HEAD_DIM / TQ_KV_1B_BLOCK_SIZE)  /* 2 */
 #define BLOCKS_PER_ROW  (N_KV_HEADS * BLOCKS_PER_HEAD)    /* 4 */
 
+/* Deterministic PRNG producing well-distributed values in [-1, 1]. */
+static uint32_t xor_state;
+static float xrand(void) {
+    xor_state ^= xor_state << 13;
+    xor_state ^= xor_state >> 17;
+    xor_state ^= xor_state << 5;
+    return (float)(xor_state & 0xFFFF) / 32768.0f - 1.0f;
+}
+
 int main(void) {
-    /* --- Generate raw key data (float, full n_embd_k_gqa per position) --- */
+    /* --- Generate raw key data with distinct per-position random seeds ---
+     * Each position × head gets its own seed so the data is uncorrelated.
+     * This avoids the degenerate sin/cos patterns that produce all-zero
+     * TQ scores due to identical sign-hash collisions. */
     float raw_keys[N_POS][N_EMBD_K_GQA];
     for (int pos = 0; pos < N_POS; pos++) {
+        /* Head 0: random, norm ~sqrt(256) ≈ 16 */
+        xor_state = 0xA0000000u + (uint32_t)pos * 1337;
         for (int i = 0; i < HEAD_DIM; i++) {
-            /* Head 0: sin-based, norm ~1 */
-            raw_keys[pos][i] = sinf((float)i * 0.1f + (float)pos * 0.7f);
+            raw_keys[pos][i] = xrand();
         }
+        /* Head 1: different seed, scaled ×3 so head leakage is detectable */
+        xor_state = 0xB0000000u + (uint32_t)pos * 7919;
         for (int i = 0; i < HEAD_DIM; i++) {
-            /* Head 1: cos-based, shifted, norm ~1 but uncorrelated with head 0 */
-            raw_keys[pos][HEAD_DIM + i] = cosf((float)i * 0.3f + (float)pos * 1.3f) * 3.0f;
+            raw_keys[pos][HEAD_DIM + i] = xrand() * 3.0f;
         }
     }
 
@@ -48,8 +62,9 @@ int main(void) {
 
     /* --- Generate query for head 0 --- */
     float query[HEAD_DIM];
+    xor_state = 0xCAFE0000u;
     for (int i = 0; i < HEAD_DIM; i++) {
-        query[i] = sinf((float)i * 0.05f + 1.0f);
+        query[i] = xrand();
     }
 
     /* --- Path A (library batched — simulates what ops.cpp does) ---
