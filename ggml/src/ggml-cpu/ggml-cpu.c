@@ -236,7 +236,8 @@ static void ggml_vec_dot_tq_kv_1b_f32(int n, float * GGML_RESTRICT s, size_t bs,
     GGML_UNUSED(bs); GGML_UNUSED(bx); GGML_UNUSED(by); GGML_UNUSED(nrc);
     tq_kv_1b_attention_multi((const float *) vy,
                              (const block_tq_kv_1b *) vx,
-                             s, /*seq_len=*/1, /*head_dim=*/n);
+                             s, /*seq_len=*/1, /*head_dim=*/n,
+                             /*k_stride_blocks=*/0);
 }
 
 static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {

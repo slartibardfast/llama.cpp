@@ -376,7 +376,8 @@ static inline int tq_xor_popcount_16(const uint8_t * a, const uint8_t * b) {
 
 void tq_kv_1b_attention_multi(const float * query,
                                const block_tq_kv_1b * kv_cache,
-                               float * scores, int seq_len, int head_dim) {
+                               float * scores, int seq_len, int head_dim,
+                               int k_stride_blocks) {
     const int n_blocks = head_dim / TQ_KV_1B_BLOCK_SIZE;
     /* If head_dim is not a multiple of the block size, fall back to the
      * single-block path which already handles dim<=128. */
@@ -384,6 +385,12 @@ void tq_kv_1b_attention_multi(const float * query,
         tq_kv_1b_attention(query, kv_cache, scores, seq_len, head_dim);
         return;
     }
+
+    /* k_stride_blocks: number of blocks between consecutive K positions
+     * in the cache buffer. For a GQA layout with n_kv_heads packed per
+     * row, this is n_embd_k_gqa/128 (all heads' blocks), not just
+     * head_dim/128 (one head's blocks). Pass 0 for the legacy default. */
+    if (k_stride_blocks <= 0) k_stride_blocks = n_blocks;
 
     /* Per-block precomputation: rotate query slice, sign-extract, compute norm. */
     uint8_t   q_signs[TQ_MAX_BLOCKS_PER_KEY][TQ_KV_1B_BLOCK_SIZE / 8];
@@ -409,9 +416,11 @@ void tq_kv_1b_attention_multi(const float * query,
         }
     }
 
-    /* Per-K-position attention: sum n_blocks Hamming contributions. */
+    /* Per-K-position attention: sum n_blocks Hamming contributions.
+     * The stride between consecutive K positions may be larger than
+     * n_blocks when the cache row contains multiple KV heads (GQA). */
     for (int s = 0; s < seq_len; s++) {
-        const block_tq_kv_1b * blocks = &kv_cache[s * n_blocks];
+        const block_tq_kv_1b * blocks = &kv_cache[s * k_stride_blocks];
         float total = 0.0f;
         for (int b = 0; b < n_blocks; b++) {
             int hamming = tq_xor_popcount_16(q_signs[b], blocks[b].signs);
@@ -637,6 +646,7 @@ void tq_kv_fused_attention(
     const float          * query,
     const char           * k_base,
     const char           * v_base,
+    size_t                 k_row_stride,
     size_t                 v_row_stride,
     const uint16_t       * mp,
     int                    valid_run,
@@ -658,12 +668,7 @@ void tq_kv_fused_attention(
         n_blocks_k > TQ_MAX_BLOCKS_PER_KEY) {
         return; /* caller bug; legacy path handles odd dims */
     }
-    /* K side uses dense-block stride to match tq_kv_1b_attention_multi
-     * byte-for-byte (see note in header). The legacy K helper indexes
-     * by `s * n_blocks_k`, ignoring nbk1; preserving that here keeps
-     * the fused path numerically equivalent to the unfused TQ path on
-     * the GQA layouts the model uses today. */
-    const block_tq_kv_1b * k_blocks = (const block_tq_kv_1b *) k_base;
+    (void)n_blocks_v;  /* used only for the V-side size check above */
 
     /* Per-K-block Q precomputation (hoisted out of the position loop).
      * Identical to tq_kv_1b_attention_multi lines 393-410. */
@@ -702,8 +707,11 @@ void tq_kv_fused_attention(
             if (mv == -INFINITY) continue;
         }
 
-        /* K-side: Hamming score for position s, sum across DK/128 blocks. */
-        const block_tq_kv_1b * k_row = &k_blocks[s * n_blocks_k];
+        /* K-side: Hamming score for position s, sum across DK/128 blocks.
+         * Stride from the caller — k_row_stride bytes between consecutive
+         * K positions, which may be larger than n_blocks_k * sizeof(block)
+         * when multiple KV heads are packed per row (GQA layout). */
+        const block_tq_kv_1b * k_row = (const block_tq_kv_1b *)(k_base + (size_t)s * k_row_stride);
         float score = 0.0f;
         for (int b = 0; b < n_blocks_k; b++) {
             int hamming = tq_xor_popcount_16(q_signs[b], k_row[b].signs);
@@ -736,7 +744,6 @@ void tq_kv_fused_attention(
          * are interleaved with the other KV head's V data. */
         const block_tq_v_4b * v_row = (const block_tq_v_4b *) (v_base + (size_t) s * v_row_stride);
         tq_v_4b_vec_mad_f32(DV, VKQ32, v_row, vs);
-        (void) n_blocks_v;
 
         S = S * ms + vs;
     }
