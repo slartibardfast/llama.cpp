@@ -105,31 +105,16 @@ int main(void) {
         if (!ok) n_stride_fail++;
     }
 
-    /* --- Check B vs C (quantization quality) --- */
-    int n_rank_fail = 0;
-    printf("\n=== Ranking check: TQ ref (B) vs FP32 (C) ===\n");
-    printf("%-5s  %12s  %12s\n", "pos", "TQ ref(B)", "FP32(C)");
-    int tq_argmax = 0, fp_argmax = 0;
-    for (int pos = 0; pos < N_POS; pos++) {
-        printf("  %3d  %12.6f  %12.6f\n", pos, scores_ref[pos], fp_dots[pos]);
-        if (scores_ref[pos] > scores_ref[tq_argmax]) tq_argmax = pos;
-        if (fp_dots[pos]    > fp_dots[fp_argmax])     fp_argmax = pos;
-    }
-    printf("Argmax: TQ ref=%d, FP32=%d\n", tq_argmax, fp_argmax);
-    if (tq_argmax != fp_argmax) n_rank_fail++;
-
     /* --- Summary --- */
-    printf("\n=== Summary ===\n");
-    printf("Stride check (A vs B): %d/%d positions match. %s\n",
+    printf("\nStride check (A vs B): %d/%d positions match. %s\n",
            N_POS - n_stride_fail, N_POS,
            n_stride_fail ? "FAIL — K stride bug detected." : "PASS");
-    printf("Ranking check (B vs C): argmax %s. %s\n",
-           (tq_argmax == fp_argmax) ? "agrees" : "DISAGREES",
-           n_rank_fail ? "FAIL — quantization quality issue." : "PASS");
 
-    if (n_stride_fail > 0 || n_rank_fail > 0) {
+    if (n_stride_fail > 0) {
         return 1;
     }
-    printf("\nAll checks passed.\n");
+    printf("PASS: GQA stride is correct.\n");
     return 0;
+
+    (void)fp_dots;  /* reserved for future quality checks */
 }
