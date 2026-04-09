@@ -162,6 +162,30 @@ void mirror_buffer_get_tensor(ggml_backend_buffer_t /*buffer*/,
     memcpy(data, (const char *) tensor->data + offset, size);
 }
 
+void mirror_buffer_set_tensor_2d(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor,
+                                 const void * data, size_t offset, size_t size,
+                                 size_t n_copies, size_t stride_tensor, size_t stride_data) {
+    auto * ctx = static_cast<mirror_ctx *>(buffer->context);
+    for (size_t c = 0; c < n_copies; c++) {
+        memcpy((char *) tensor->data + offset + c * stride_tensor,
+               (const char *) data + c * stride_data, size);
+        if (ctx->alt_off != 0) {
+            memcpy((char *) tensor->data + offset + c * stride_tensor + ctx->alt_off,
+                   (const char *) data + c * stride_data, size);
+        }
+    }
+}
+
+void mirror_buffer_get_tensor_2d(ggml_backend_buffer_t /*buffer*/,
+                                 const struct ggml_tensor * tensor,
+                                 void * data, size_t offset, size_t size,
+                                 size_t n_copies, size_t stride_tensor, size_t stride_data) {
+    for (size_t c = 0; c < n_copies; c++) {
+        memcpy((char *) data + c * stride_data,
+               (const char *) tensor->data + offset + c * stride_tensor, size);
+    }
+}
+
 bool mirror_buffer_cpy_tensor(ggml_backend_buffer_t buffer,
                               const struct ggml_tensor * src,
                               struct ggml_tensor * dst) {
@@ -191,6 +215,8 @@ constexpr ggml_backend_buffer_i mirror_buffer_iface = {
     /* .memset_tensor   = */ mirror_buffer_memset_tensor,
     /* .set_tensor      = */ mirror_buffer_set_tensor,
     /* .get_tensor      = */ mirror_buffer_get_tensor,
+    /* .set_tensor_2d   = */ mirror_buffer_set_tensor_2d,
+    /* .get_tensor_2d   = */ mirror_buffer_get_tensor_2d,
     /* .cpy_tensor      = */ mirror_buffer_cpy_tensor,
     /* .clear           = */ mirror_buffer_clear,
     /* .reset           = */ nullptr,
