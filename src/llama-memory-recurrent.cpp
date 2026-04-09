@@ -715,7 +715,7 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
             // overwritten by new tokens. This is required for speculative decoding rollback
             // in recurrent/SSM models where tensor state cannot be partially rewound.
             const int32_t cur_tail = seq_meta.tail;
-            if (cells[next_empty_cell].is_empty()) {
+            if (next_empty_cell < size && cells[next_empty_cell].is_empty()) {
                 bool can_checkpoint = (get_cell_count(seq_id) < 8 && used < size * 0.9);
                 if (!can_checkpoint) {
                     // Try to evict the oldest checkpoint to make room
