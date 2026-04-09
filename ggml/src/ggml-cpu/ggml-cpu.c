@@ -37,6 +37,7 @@
 #include <signal.h>
 #if defined(__gnu_linux__)
 #include <syscall.h>
+#include <sys/mman.h>
 #endif
 
 #ifdef GGML_USE_OPENMP
@@ -1743,6 +1744,21 @@ static void ggml_compute_forward_mul_mat_id(
     // src0->data; for the MIRROR strategy each socket reads its own
     // physical copy.
     const char * src0_base = ggml_tensor_data_numa_local(src0);
+
+    // Pin the shared expert (expert 0) via madvise(MADV_WILLNEED) on
+    // the first call. The shared expert is always active (every token
+    // routes to it), so telling the kernel to page it in eagerly and
+    // keep it resident improves cold-start and reduces page faults.
+    // Subsequent calls are no-ops (the flag persists).
+#if defined(__gnu_linux__)
+    {
+        static int shared_expert_pinned = 0;
+        if (!shared_expert_pinned && nb02 > 0 && ith == 0) {
+            madvise((void *) src0_base, nb02, MADV_WILLNEED);
+            shared_expert_pinned = 1;
+        }
+    }
+#endif
 
     // Prefetch active expert weight tiles into L2 before the matmul loop.
     // At this point the router decision is known (matrix_row_counts is
