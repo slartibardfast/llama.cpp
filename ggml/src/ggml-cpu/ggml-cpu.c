@@ -1685,6 +1685,49 @@ static void ggml_compute_forward_mul_mat_id(
                 matrix_row_counts[i02] += 1;
             }
         }
+
+        // Expert reuse instrumentation (env GGML_MOE_EXPERT_LOG=1).
+        // Tracks how many of the current call's active experts were also
+        // active in the previous call. High reuse = expert caching is worth it.
+        {
+            static int  expert_log_checked = 0;
+            static int  expert_log_enabled = 0;
+            static uint8_t prev_active[512]; // bitmask: prev_active[i] = was expert i active last call
+            static int64_t total_selected = 0;
+            static int64_t total_reused   = 0;
+            static int64_t total_calls    = 0;
+
+            if (!expert_log_checked) {
+                expert_log_enabled = (getenv("GGML_MOE_EXPERT_LOG") != NULL);
+                memset(prev_active, 0, sizeof(prev_active));
+                expert_log_checked = 1;
+            }
+
+            if (expert_log_enabled && n_as <= 512) {
+                int n_active = 0, n_reused = 0;
+                uint8_t cur_active[512];
+                memset(cur_active, 0, (size_t)n_as);
+
+                for (int a = 0; a < n_as; a++) {
+                    if (matrix_row_counts[a] > 0) {
+                        cur_active[a] = 1;
+                        n_active++;
+                        if (prev_active[a]) n_reused++;
+                    }
+                }
+                total_selected += n_active;
+                total_reused   += n_reused;
+                total_calls++;
+
+                memcpy(prev_active, cur_active, (size_t)n_as);
+
+                if ((total_calls % 1000) == 0) {
+                    fprintf(stderr, "[expert-reuse] calls=%lld selected=%lld reused=%lld rate=%.1f%%\n",
+                            (long long)total_calls, (long long)total_selected, (long long)total_reused,
+                            total_selected > 0 ? 100.0 * (double)total_reused / (double)total_selected : 0.0);
+                }
+            }
+        }
     }
 
     // reset current_chunk
