@@ -110,9 +110,8 @@ ggml_tensor * llm_build_qwen35moe::build_norm_gated(
         ggml_tensor * gate,
         int           layer) {
     ggml_tensor * normalized = build_norm(input, weights, nullptr, LLM_NORM_RMS, layer);
-    ggml_tensor * gated_silu = ggml_silu(ctx0, gate);
 
-    return ggml_mul(ctx0, normalized, gated_silu);
+    return ggml_fused_silu_mul(ctx0, gate, normalized);
 }
 
 ggml_tensor * llm_build_qwen35moe ::build_layer_attn(

@@ -20,10 +20,7 @@ extern "C" {
 enum ggml_fusion_id {
     GGML_FUSION_NONE = 0,
     GGML_FUSION_GATE_PREP,      /* softplus(alpha + dt_bias) * ssm_a           */
-    /* Future fusions — add here, implement in ops.cpp + shader:
-     * GGML_FUSION_SILU_GATE,      silu(x) * y
-     * GGML_FUSION_RMS_NORM_ADD,   rms_norm(x) * w + residual
-     */
+    GGML_FUSION_SILU_MUL,       /* silu(x) * y                                */
     GGML_FUSION_COUNT,
 };
 
@@ -46,6 +43,22 @@ GGML_API struct ggml_tensor * ggml_fused_gate_prep(
         struct ggml_tensor  * alpha,
         struct ggml_tensor  * dt_bias,
         struct ggml_tensor  * ssm_a);
+
+/**
+ * Fused SiLU-gated multiply.
+ *
+ * Combines: silu(x) * y into one dispatch.
+ * silu(x) = x / (1 + exp(-x))
+ *
+ * @param ctx  ggml context
+ * @param x    input to SiLU (same shape as y)
+ * @param y    multiplicand
+ * @return     silu(x) * y (same shape as x and y)
+ */
+GGML_API struct ggml_tensor * ggml_fused_silu_mul(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * y);
 
 #ifdef __cplusplus
 }

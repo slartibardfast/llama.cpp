@@ -6064,6 +6064,27 @@ struct ggml_tensor * ggml_fused_gate_prep(
     return result;
 }
 
+// ggml_fused_silu_mul
+
+struct ggml_tensor * ggml_fused_silu_mul(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * y) {
+    GGML_ASSERT(ggml_are_same_shape(x, y));
+
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, x->ne);
+
+    int32_t fusion_params[1];
+    fusion_params[0] = GGML_FUSION_SILU_MUL;
+    ggml_set_op_params(result, fusion_params, sizeof(fusion_params));
+
+    result->op     = GGML_OP_FUSED;
+    result->src[0] = x;
+    result->src[1] = y;
+
+    return result;
+}
+
 // ggml_cross_entropy_loss
 
 struct ggml_tensor * ggml_cross_entropy_loss(
