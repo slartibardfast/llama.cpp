@@ -11363,6 +11363,38 @@ static void ggml_compute_forward_fused_gate_prep(
     }
 }
 
+// ggml_compute_forward_fused_silu_mul
+//
+// Fuses: silu(x) * y
+// dst[i] = (x[i] / (1 + exp(-x[i]))) * y[i]
+
+static void ggml_compute_forward_fused_silu_mul(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * x = dst->src[0];
+    const ggml_tensor * y = dst->src[1];
+
+    GGML_ASSERT(x->type == GGML_TYPE_F32);
+    GGML_ASSERT(y->type == GGML_TYPE_F32);
+
+    const int64_t ne = ggml_nelements(x);
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t dr = (ne + nth - 1) / nth;
+    const int64_t ir0 = dr * ith;
+    const int64_t ir1 = std::min(ir0 + dr, ne);
+
+    const float * src_x = (const float *) x->data;
+    const float * src_y = (const float *) y->data;
+    float       * dst_d = (float *) dst->data;
+
+    for (int64_t i = ir0; i < ir1; i++) {
+        const float xi = src_x[i];
+        dst_d[i] = (xi / (1.0f + expf(-xi))) * src_y[i];
+    }
+}
+
 // ggml_compute_forward_fused — dispatch by fusion_id
 
 void ggml_compute_forward_fused(
@@ -11373,6 +11405,9 @@ void ggml_compute_forward_fused(
     switch (fusion_id) {
         case GGML_FUSION_GATE_PREP:
             ggml_compute_forward_fused_gate_prep(params, dst);
+            break;
+        case GGML_FUSION_SILU_MUL:
+            ggml_compute_forward_fused_silu_mul(params, dst);
             break;
         default:
             GGML_ABORT("unsupported fusion_id %d", fusion_id);
