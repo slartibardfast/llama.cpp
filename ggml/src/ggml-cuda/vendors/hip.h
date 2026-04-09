@@ -10,6 +10,11 @@
 #include <rocwmma/rocwmma-version.hpp>
 #endif // defined(GGML_HIP_ROCWMMA_FATTN)
 
+#ifdef GGML_USE_NCCL
+#include <rccl/rccl.h>
+#endif // GGML_USE_NCCL
+
+
 #define CUBLAS_GEMM_DEFAULT HIPBLAS_GEMM_DEFAULT
 #define CUBLAS_GEMM_DEFAULT_TENSOR_OP HIPBLAS_GEMM_DEFAULT
 #define CUBLAS_OP_N HIPBLAS_OP_N
@@ -28,6 +33,7 @@
 #define CU_MEM_LOCATION_TYPE_DEVICE hipMemLocationTypeDevice
 #define CU_MEM_ACCESS_FLAGS_PROT_READWRITE hipMemAccessFlagsProtReadWrite
 #define CU_CHECK(fn) {hipError_t err = fn; if(err != hipSuccess) { GGML_ABORT("HipVMM Failure: %s\n", hipGetErrorString(err)); }}
+#define NCCL_CHECK(fn) {ncclResult_t err = fn; if(err != ncclSuccess) { GGML_ABORT("RCCL Failure RCCL returned: %i\n", err); }}
 #define __shfl_sync(mask, var, laneMask, width) __shfl(var, laneMask, width)
 #define __shfl_up_sync(mask, var, laneMask, width) __shfl_up(var, laneMask, width)
 #define __shfl_xor_sync(mask, var, laneMask, width) __shfl_xor(var, laneMask, width)
@@ -234,6 +240,12 @@
 
 typedef __hip_bfloat16 nv_bfloat16;
 typedef __hip_bfloat162 nv_bfloat162;
+
+#if HIP_VERSION >= 60200000
+#include <hip/hip_fp8.h>
+typedef __hip_fp8_e4m3 __nv_fp8_e4m3;
+#define FP8_AVAILABLE
+#endif // HIP_VERSION >= 60200000
 
 typedef int8_t int8x4_t __attribute__((ext_vector_type(4)));
 typedef uint8_t uint8x4_t __attribute__((ext_vector_type(4)));
