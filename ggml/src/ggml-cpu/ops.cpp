@@ -8341,7 +8341,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
                     const char * k_base = k_data_local + ic_start*nbk1 + ik2*nbk2 + ik3*nbk3;
                     const char * v_base = v_data_local + ic_start*nbv1 + iv2*nbv2 + iv3*nbv3;
                     tq_kv_fused_attention(pq, k_base, v_base,
-                        (size_t) nbv1,
+                        (size_t) nbk1, (size_t) nbv1,
                         mp ? (const uint16_t *) (mp + ic_start) : NULL,
                         (int) valid_run, (int) DK, (int) DV,
                         scale, slope, logit_softcap,
@@ -8350,7 +8350,9 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
             } else if (valid_run > 0) {
                 const block_tq_kv_1b * k_blocks = (const block_tq_kv_1b *)
                     (k_data_local + ic_start*nbk1 + ik2*nbk2 + ik3*nbk3);
-                tq_kv_1b_attention_multi(pq, k_blocks, tq_thread_buf, (int) valid_run, (int) DK);
+                tq_kv_1b_attention_multi(pq, k_blocks, tq_thread_buf,
+                    (int) valid_run, (int) DK,
+                    (int)(nbk1 / sizeof(block_tq_kv_1b)));
             }
         }
 

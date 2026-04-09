@@ -147,15 +147,22 @@ void tq_kv_1b_attention(const float * query, const block_tq_kv_1b * kv_cache,
  * DRAM bandwidth (a 64K-allocated cache with 4K filled would otherwise
  * read 16x the necessary data and dominate the savings from compression).
  *
- * @param query        Float query vector (head_dim elements)
- * @param kv_cache     Block array (seq_capacity * (head_dim/128) blocks)
- * @param scores       Output scores (valid_count, the rest are not touched)
- * @param valid_count  Number of contiguous valid K positions starting at 0
- * @param head_dim     Head dimension (multiple of 128, max 512)
+ * @param query           Float query vector (head_dim elements)
+ * @param kv_cache        Block array, base pointer for the target KV head
+ * @param scores          Output scores (valid_count elements)
+ * @param valid_count     Number of contiguous valid K positions starting at 0
+ * @param head_dim        Head dimension (multiple of 128, max 512)
+ * @param k_stride_blocks Number of blocks between consecutive K positions
+ *                        in memory. For a single-head cache this equals
+ *                        head_dim/128; for a GQA cache where n_kv_heads
+ *                        are packed per row this equals
+ *                        n_embd_k_gqa/128 (= nbk1/sizeof(block_tq_kv_1b)).
+ *                        Pass 0 to use the legacy default (= head_dim/128).
  */
 void tq_kv_1b_attention_multi(const float * query,
                                const block_tq_kv_1b * kv_cache,
-                               float * scores, int valid_count, int head_dim);
+                               float * scores, int valid_count, int head_dim,
+                               int k_stride_blocks);
 
 /* ============================================================
  * TurboQuant V 4-bit API
@@ -222,6 +229,7 @@ void tq_kv_fused_attention(
     const float          * query,
     const char           * k_base,        /* K cache base, already offset      */
     const char           * v_base,        /* V cache base, already offset      */
+    size_t                 k_row_stride,  /* bytes per K position in K cache   */
     size_t                 v_row_stride,  /* bytes per K position in V cache   */
     const uint16_t       * mp,            /* fp16 mask, NULL for no mask       */
     int                    valid_run,
