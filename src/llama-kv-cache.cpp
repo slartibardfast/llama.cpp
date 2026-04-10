@@ -524,7 +524,11 @@ void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
 
 void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
-    GGML_ASSERT(hparams.n_pos_per_embd() == 1 && "seq_add() is only supported for n_pos_per_embd() == 1");
+    // Note: the n_pos_per_embd() == 1 assert was removed to support IMROPE
+    // models (Qwen3.5). For IMROPE, the KV cache stores a single scalar
+    // position per cell that is broadcast to 4 ROPE dimensions at graph
+    // build time (llama-graph.cpp set_input). Shifting the scalar correctly
+    // shifts all derived dimensions.
 
     auto & cells = v_cells[seq_to_stream[seq_id]];
     auto & head  = v_heads[seq_to_stream[seq_id]];
@@ -569,7 +573,6 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
 
 void llama_kv_cache::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
-    GGML_ASSERT(hparams.n_pos_per_embd() == 1 && "seq_div() is only supported for n_pos_per_embd() == 1");
 
     auto & cells = v_cells[seq_to_stream[seq_id]];
 
@@ -1102,7 +1105,11 @@ bool llama_kv_cache::get_can_shift() const {
     if (model.arch == LLM_ARCH_STEP35) {
         return false;
     }
-    if (hparams.n_pos_per_embd() > 1) {
+    // MROPE (visual models like Qwen2VL) stores true 2D positions that
+    // need per-axis shift — not yet implemented. IMROPE (text models
+    // like Qwen3.5) derives all axes from one scalar base position, so
+    // shifting the scalar correctly shifts all ROPE dimensions.
+    if (hparams.rope_type == LLAMA_ROPE_TYPE_MROPE) {
         return false;
     }
     return true;
