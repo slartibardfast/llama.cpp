@@ -787,7 +787,9 @@ private:
 
         // Auto-detect MTP: if model has MTP layers and no speculative type
         // is explicitly set, auto-enable MTP speculative decoding.
-        if (params_base.speculative.type == COMMON_SPECULATIVE_TYPE_NONE) {
+        // Set LLAMA_NO_MTP_AUTO=1 to bypass auto-enable (for baseline capture).
+        if (params_base.speculative.type == COMMON_SPECULATIVE_TYPE_NONE &&
+            getenv("LLAMA_NO_MTP_AUTO") == nullptr) {
             const int32_t n_mtp = llama_model_n_mtp_layers(llama_get_model(ctx));
             if (n_mtp > 0 && can_spec) {
                 SRV_INF("model has %d MTP layer(s) — auto-enabling MTP speculative decoding\n", n_mtp);
@@ -1249,6 +1251,44 @@ private:
 
         SLT_INF(slot, "processing task, is_child = %d\n", slot.task->is_child());
         return true;
+    }
+
+    // Inline two-phase MTP producer: reads the current llama_context's MTP logits
+    // (fresh after the most recent llama_decode) and proposes the top-1 token as
+    // the next draft. Sets slot.mtp_pending + slot.mtp_draft_token on success;
+    // clears them on any failure (no MTP logits, empty vocab, EOG draft).
+    // Call after any sampling event that commits a token to slot state.
+    void try_set_mtp_draft(server_slot & slot) {
+        slot.mtp_pending     = false;
+        slot.mtp_draft_token = -1;
+        slot.mtp_i_batch     = -1;
+
+        const float * mtp_logits = llama_get_mtp_logits(ctx);
+        if (mtp_logits == nullptr) {
+            return;
+        }
+        const int64_t mtp_n_vocab = llama_get_mtp_n_vocab(ctx);
+        if (mtp_n_vocab <= 0) {
+            return;
+        }
+
+        llama_token draft = 0;
+        float best = mtp_logits[0];
+        for (int64_t i = 1; i < mtp_n_vocab; i++) {
+            if (mtp_logits[i] > best) {
+                best  = mtp_logits[i];
+                draft = (llama_token)i;
+            }
+        }
+
+        // Don't propose EOG tokens as drafts — we would try to decode them as input,
+        // and the verifier's accept path would then sample a bonus from a stopped context.
+        if (llama_vocab_is_eog(vocab, draft)) {
+            return;
+        }
+
+        slot.mtp_draft_token = draft;
+        slot.mtp_pending     = true;
     }
 
     bool process_token(completion_token_output & result, server_slot & slot) {
@@ -2126,10 +2166,17 @@ private:
 
             // generate draft tokens in speculative decoding mode
             const int n_draft_max = slot.get_n_draft_max();
-            const bool is_hybrid = llama_model_is_hybrid(model);
 
-            if (n_draft_max > 0) {
-                // Standard speculative decoding for non-hybrid models
+            // Inline MTP path: model has MTP layers AND spec type is MTP.
+            // We do NOT stuff drafts into the main batch — the verifier block
+            // in the sampling loop handles the two-phase decode. Fall through
+            // to the "no speculative" branch which just adds slot.sampled.
+            const bool use_inline_mtp =
+                (params_base.speculative.type == COMMON_SPECULATIVE_TYPE_MTP) &&
+                (llama_model_n_mtp_layers(model) > 0);
+
+            if (n_draft_max > 0 && !use_inline_mtp) {
+                // Standard speculative decoding for non-MTP models
                 if (mctx) {
                     GGML_ABORT("not supported by multimodal");
                 }
@@ -2966,8 +3013,11 @@ private:
                                 continue;
                             }
 
-                            // Inform speculative state about the acceptance
-                            common_speculative_accept(slot.spec, 1);
+                            // NOTE: do not call common_speculative_accept() here —
+                            // inline MTP bypasses common_speculative_draft(), so
+                            // spec->curr_impl is never set and the assert would fire.
+                            // Acceptance stats are tracked locally via
+                            // slot.n_draft_accepted (line above).
                         }
                     } else {
                         // REJECTED — draft was never decoded, state is clean.
@@ -2997,10 +3047,13 @@ private:
                     }
 
                     slot.t_token_generation = std::max<int64_t>(1, t_current - slot.t_start_generation) / 1e3;
-                    slot.mtp_pending = false;
-                    slot.mtp_draft_token = -1;
-                    slot.mtp_i_batch = -1;
                     slot.i_batch = -1;
+
+                    // Producer: propose next draft from the fresh MTP logits produced
+                    // by the most recent decode. Both accept (draft_batch) and reject
+                    // (T-alone) paths leave valid MTP logits pointing at the right
+                    // next-next position. Clears mtp_pending if logits unavailable.
+                    try_set_mtp_draft(slot);
 
                     continue; // done with this slot for this decode step
                 }
@@ -3041,6 +3094,12 @@ private:
 
                     continue;
                 }
+
+                // Producer: after the first post-prompt sample (and any subsequent
+                // sample that falls through the normal path), propose a draft from
+                // the fresh MTP logits so the next iteration enters the verifier
+                // block above instead of looping through normal sample again.
+                try_set_mtp_draft(slot);
             }
 
             // speculative decoding - main model sample and accept
