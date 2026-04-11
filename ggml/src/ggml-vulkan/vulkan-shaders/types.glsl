@@ -69,6 +69,34 @@ struct block_q4_0_packed16
 #define DATA_A_QUANT_LEGACY
 #endif
 
+// TurboQuant V 4-bit: q4_0-semantic scheme with a 128-element block.
+// Layout matches q4_0 exactly (nibble pairs; low nibbles address the first
+// QUANT_K/2 elements, high nibbles the second half), just with 4x more
+// elements per scale. See ggml/include/ggml-turbo-quant.h for the C layout
+// and ggml/src/ggml-turbo-quant.c for the reference dequant/mad kernels.
+#define QUANT_K_TQ_V_4B 128
+#define QUANT_R_TQ_V_4B 2
+
+struct block_tq_v_4b
+{
+    float16_t d;
+    uint8_t qs[64];
+};
+struct block_tq_v_4b_packed16
+{
+    float16_t d;
+    uint16_t qs[64/2];
+};
+
+#if defined(DATA_A_TQ_V_4B)
+#define QUANT_K QUANT_K_TQ_V_4B
+#define QUANT_R QUANT_R_TQ_V_4B
+#define QUANT_AUXF 1
+#define A_TYPE block_tq_v_4b
+#define A_TYPE_PACKED16 block_tq_v_4b_packed16
+#define DATA_A_QUANT_LEGACY
+#endif
+
 #define QUANT_K_Q4_1 32
 #define QUANT_R_Q4_1 2
 

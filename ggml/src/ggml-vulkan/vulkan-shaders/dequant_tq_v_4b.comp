@@ -1,0 +1,32 @@
+#version 450
+
+// TurboQuant V 4-bit dequant. One workgroup invocation per 128-element block.
+// Layout matches the q4_0 convention: qs[j] packs two nibbles, low nibble
+// goes to output position `j` (first half of the block), high nibble goes
+// to output position `j + QUANT_K/2` (second half). The scale `d` is FP16,
+// negative by q4_0 convention. Dequant: (q - 8) * d.
+//
+// C reference: ggml/src/ggml-turbo-quant.c dequantize_row_tq_v_4b.
+
+#include "dequant_head.glsl"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer A {block_tq_v_4b data_a[];};
+layout (binding = 1) writeonly buffer D {D_TYPE data_b[];};
+
+void main() {
+    const uint ib = gl_GlobalInvocationID.x;
+    if (ib >= p.nel / QUANT_K_TQ_V_4B) {
+        return;
+    }
+
+    const uint b_idx = ib * QUANT_K_TQ_V_4B;
+    const float d = float(data_a[ib].d);
+
+    [[unroll]] for (uint j = 0; j < QUANT_K_TQ_V_4B / 2; ++j) {
+        const uint vui = uint(data_a[ib].qs[j]);
+        data_b[b_idx + j]                          = D_TYPE(d * (float(vui & 0xF) - 8.0f));
+        data_b[b_idx + j + QUANT_K_TQ_V_4B / 2]    = D_TYPE(d * (float(vui >> 4)  - 8.0f));
+    }
+}
