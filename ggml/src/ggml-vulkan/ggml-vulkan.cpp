@@ -64,6 +64,7 @@ DispatchLoaderDynamic & ggml_vk_default_dispatcher();
 
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
+#include "ggml-fusion.h"
 
 #include "ggml-vulkan-shaders.hpp"
 
@@ -792,6 +793,11 @@ struct vk_device_struct {
     vk_pipeline pipeline_swiglu_oai[2];
     vk_pipeline pipeline_geglu_erf[2];
     vk_pipeline pipeline_geglu_quick[2];
+
+    // ggml-fusion (GGML_OP_FUSED dispatch). F32-only per CPU reference.
+    vk_pipeline pipeline_fused_silu_mul_f32;
+    vk_pipeline pipeline_fused_sigmoid_mul_f32;
+    vk_pipeline pipeline_fused_gate_prep_f32;
 
     vk_pipeline pipeline_leaky_relu_f32;
     vk_pipeline pipeline_silu_back_f32;
@@ -4495,6 +4501,12 @@ static void ggml_vk_load_shaders(vk_device& device) {
 
     ggml_vk_create_pipeline(device, device->pipeline_leaky_relu_f32, "leaky_relu_f32", leaky_relu_f32_len, leaky_relu_f32_data, "main", 2, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_silu_back_f32, "silu_back_f32", silu_back_f32_len, silu_back_f32_data, "main", 3, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
+
+    // ggml-fusion: GGML_OP_FUSED pipelines. Split-input element-wise; 3 bindings for the 2-src fusions,
+    // 4 bindings for GATE_PREP (alpha, dt_bias, ssm_a + dst).
+    ggml_vk_create_pipeline(device, device->pipeline_fused_silu_mul_f32,    "fused_silu_mul_f32",    fused_silu_mul_f32_len,    fused_silu_mul_f32_data,    "main", 3, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_fused_sigmoid_mul_f32, "fused_sigmoid_mul_f32", fused_sigmoid_mul_f32_len, fused_sigmoid_mul_f32_data, "main", 3, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_fused_gate_prep_f32,   "fused_gate_prep_f32",   fused_gate_prep_f32_len,   fused_gate_prep_f32_data,   "main", 4, sizeof(vk_op_push_constants), {512, 1, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_diag_mask_inf_f32, "diag_mask_inf_f32", diag_mask_inf_f32_len, diag_mask_inf_f32_data, "main", 2, sizeof(vk_op_diag_mask_push_constants), {1, 512, 1}, {}, 1, true);
 
@@ -9429,6 +9441,22 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
                 break;
         }
         return nullptr;
+    case GGML_OP_FUSED:
+        // Only F32 inputs/output are supported by the CPU reference, so we mirror that.
+        if (src0->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+            return nullptr;
+        }
+        switch (ggml_get_op_params_i32(dst, 0)) {
+            case GGML_FUSION_SILU_MUL:
+                return ctx->device->pipeline_fused_silu_mul_f32;
+            case GGML_FUSION_SIGMOID_MUL:
+                return ctx->device->pipeline_fused_sigmoid_mul_f32;
+            case GGML_FUSION_GATE_PREP:
+                return ctx->device->pipeline_fused_gate_prep_f32;
+            default:
+                break;
+        }
+        return nullptr;
     case GGML_OP_DIAG_MASK_INF:
         if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
             return ctx->device->pipeline_diag_mask_inf_f32;
@@ -10024,6 +10052,7 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
     case GGML_OP_UPSCALE:
     case GGML_OP_UNARY:
     case GGML_OP_GLU:
+    case GGML_OP_FUSED:
     case GGML_OP_CONV_2D_DW:
         {
             uint32_t ne = ggml_nelements(dst);
@@ -11097,6 +11126,35 @@ static void ggml_vk_glu(ggml_backend_vk_context * ctx, vk_context& subctx, const
             (uint32_t)dst->ne[1],
             (uint32_t)dst->ne[2]
         });
+}
+
+// ggml-fusion: dispatch GGML_OP_FUSED to the matching pipeline based on fusion_id.
+//   SILU_MUL / SIGMOID_MUL — 2 src tensors (x, y) + 1 dst
+//   GATE_PREP              — 3 src tensors (alpha, dt_bias, ssm_a) + 1 dst
+// Push constants use the generic vk_op_push_constants layout:
+//   KX = ggml_nelements(dst)
+//   KY = num_v_heads  (only used by GATE_PREP, ignored by the others)
+static void ggml_vk_fused(ggml_backend_vk_context * ctx, vk_context& subctx,
+                           const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * src2,
+                           ggml_tensor * dst) {
+    const int32_t fusion_id = ggml_get_op_params_i32(dst, 0);
+    const uint32_t ne = (uint32_t)ggml_nelements(dst);
+
+    switch (fusion_id) {
+        case GGML_FUSION_SILU_MUL:
+        case GGML_FUSION_SIGMOID_MUL:
+            ggml_vk_op_f32<vk_op_push_constants>(ctx, subctx, src0, src1, nullptr, nullptr, dst, GGML_OP_FUSED,
+                { ne, 0, 0.0f, 0.0f, 0.0f, 0.0f });
+            break;
+        case GGML_FUSION_GATE_PREP: {
+            const uint32_t num_v_heads = (uint32_t)ggml_get_op_params_i32(dst, 1);
+            ggml_vk_op_f32<vk_op_push_constants>(ctx, subctx, src0, src1, src2, nullptr, dst, GGML_OP_FUSED,
+                { ne, num_v_heads, 0.0f, 0.0f, 0.0f, 0.0f });
+            break;
+        }
+        default:
+            GGML_ABORT("ggml_vk_fused: unsupported fusion_id %d", fusion_id);
+    }
 }
 
 static void ggml_vk_diag_mask_inf(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
@@ -13093,6 +13151,10 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         default:
             return false;
         }
+        break;
+    case GGML_OP_FUSED:
+        // ggml-fusion: 2-src and 3-src element-wise fusions. src2 may be nullptr.
+        ggml_vk_fused(ctx, compute_ctx, src0, src1, src2, node);
         break;
     case GGML_OP_DIAG_MASK_INF:
         ggml_vk_diag_mask_inf(ctx, compute_ctx, src0, node);
@@ -15252,6 +15314,34 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     return (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16) &&
                            (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16) &&
                            (op->src[0]->type == op->type);
+                default:
+                    return false;
+            }
+        case GGML_OP_FUSED:
+            // ggml-fusion: match the CPU reference's F32-only constraint and
+            // dispatch per fusion_id stored in op_params[0].
+            if (op->type != GGML_TYPE_F32) {
+                return false;
+            }
+            switch (ggml_get_op_params_i32(op, 0)) {
+                case GGML_FUSION_SILU_MUL:
+                case GGML_FUSION_SIGMOID_MUL:
+                    return op->src[0] && op->src[1] &&
+                           op->src[0]->type == GGML_TYPE_F32 &&
+                           op->src[1]->type == GGML_TYPE_F32 &&
+                           ggml_are_same_shape(op->src[0], op->src[1]) &&
+                           ggml_are_same_shape(op, op->src[0]) &&
+                           ggml_is_contiguous(op->src[0]) &&
+                           ggml_is_contiguous(op->src[1]) &&
+                           ggml_is_contiguous(op);
+                case GGML_FUSION_GATE_PREP:
+                    return op->src[0] && op->src[1] && op->src[2] &&
+                           op->src[0]->type == GGML_TYPE_F32 &&
+                           op->src[1]->type == GGML_TYPE_F32 &&
+                           op->src[2]->type == GGML_TYPE_F32 &&
+                           ggml_is_contiguous(op->src[0]) &&
+                           ggml_is_contiguous(op) &&
+                           ggml_get_op_params_i32(op, 1) > 0;
                 default:
                     return false;
             }

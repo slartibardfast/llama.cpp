@@ -918,6 +918,12 @@ void process_shaders() {
     string_to_spv("leaky_relu_f32", "leaky_relu.comp",  {{"A_TYPE", "float"}, {"D_TYPE", "float"}});
     string_to_spv("silu_back_f32",  "silu_back.comp",   {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}});
 
+    // ggml-fusion (GGML_OP_FUSED dispatch — single enum value per fusion id).
+    // All three fusions are F32-only on the CPU reference, so we only ship f32 shaders.
+    string_to_spv("fused_silu_mul_f32",    "fused_silu_mul.comp",    {});
+    string_to_spv("fused_sigmoid_mul_f32", "fused_sigmoid_mul.comp", {});
+    string_to_spv("fused_gate_prep_f32",   "fused_gate_prep.comp",   {});
+
     string_to_spv("diag_mask_inf_f32", "diag_mask_inf.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float"}});
 
     string_to_spv("soft_max_f32", "soft_max.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}}));
