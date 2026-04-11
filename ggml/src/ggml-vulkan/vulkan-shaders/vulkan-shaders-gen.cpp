@@ -679,6 +679,13 @@ void process_shaders() {
             // variant (Vega 64 doesn't have coopmat1/2 support anyway).
             string_to_spv("flash_attn_f32_f16_tq_v_4b", "flash_attn.comp",
                 merge_maps(fa_base_dict, {{"DATA_A_TQ_V_4B", "1"}, {"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}, {"BLOCK_SIZE", "QUANT_K_TQ_V_4B"}}), fp16, false, false, f16acc);
+
+            // Phase 4 Track 3 follow-up: mixed K=F16 / V=TQ_V_4B flash-attention.
+            // This is the runtime configuration used by --flash-attn on --cache-type-v tq_v_4b
+            // where the K cache stays F16 but the V cache is TurboQuant. The shader follows the
+            // independent-K/V-type path in flash_attn_base.glsl via DATA_K_F16 + DATA_V_TQ_V_4B.
+            string_to_spv("flash_attn_f32_f16_k_f16_v_tq_v_4b", "flash_attn.comp",
+                merge_maps(fa_base_dict, {{"DATA_K_F16", "1"}, {"DATA_V_TQ_V_4B", "1"}, {"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}}), fp16, false, false, f16acc);
         }
     }
 

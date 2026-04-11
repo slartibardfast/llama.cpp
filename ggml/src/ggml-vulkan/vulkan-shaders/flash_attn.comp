@@ -122,11 +122,14 @@ void main() {
     // mo_offset will point to the tile starting at row i*Br and col 0
     uint32_t mo_offset = mo_stride * i;
 
-#if BLOCK_SIZE > 1
-    uint32_t k_offset = (ik2*p.nb12 + ik3*p.nb13) / BLOCK_BYTE_SIZE;
-    uint32_t v_offset = (iv2*p.nb22 + iv3*p.nb23) / BLOCK_BYTE_SIZE;
+#if K_BLOCK_SIZE > 1
+    uint32_t k_offset = (ik2*p.nb12 + ik3*p.nb13) / K_BLOCK_BYTE_SIZE;
 #else
     uint32_t k_offset = (ik2*p.nb12 + ik3*p.nb13) / 2;
+#endif
+#if V_BLOCK_SIZE > 1
+    uint32_t v_offset = (iv2*p.nb22 + iv3*p.nb23) / V_BLOCK_BYTE_SIZE;
+#else
     uint32_t v_offset = (iv2*p.nb22 + iv3*p.nb23) / 2;
 #endif
     uint32_t m_offset = gqa_iq1*KV;
@@ -201,11 +204,11 @@ void main() {
                 if (idx + gl_WorkGroupSize.x <= Bc * HSK / 4 || c < Bc) {
                     FLOAT_TYPEV4 K_Tf = FLOAT_TYPEV4(0);
                     if (!KV_bounds_check || j * Bc + c < KV) {
-#if BLOCK_SIZE > 1
-                        uint coord = (j * Bc + c) * k_stride * BLOCK_SIZE + 4 * d;
-                        uint ib = coord / BLOCK_SIZE;
-                        uint iqs = (coord % BLOCK_SIZE);
-                        K_Tf = dequantize4(ib, iqs, k_offset, BINDING_IDX_K);
+#if K_BLOCK_SIZE > 1
+                        uint coord = (j * Bc + c) * k_stride * K_BLOCK_SIZE + 4 * d;
+                        uint ib = coord / K_BLOCK_SIZE;
+                        uint iqs = (coord % K_BLOCK_SIZE);
+                        K_Tf = dequantize4_k(ib, iqs, k_offset);
 #else
                         K_Tf = FLOAT_TYPEV4(data_kv4[k_offset / 4 + (j * Bc + c) * k_stride / 4 + d]);
 #endif
@@ -235,11 +238,11 @@ void main() {
                     if (SHMEM_STAGING != 0) {
                         K_Tf = kvsh[(c * cols_per_iter + col_tid) * kvsh_stride + (d * D_split + d_tid)];
                     } else {
-#if BLOCK_SIZE > 1
-                        uint coord = (j * Bc + c * cols_per_iter + col_tid) * k_stride * BLOCK_SIZE + 4 * (d * D_split + d_tid);
-                        uint ib = coord / BLOCK_SIZE;
-                        uint iqs = (coord % BLOCK_SIZE);
-                        K_Tf = dequantize4(ib, iqs, k_offset, BINDING_IDX_K);
+#if K_BLOCK_SIZE > 1
+                        uint coord = (j * Bc + c * cols_per_iter + col_tid) * k_stride * K_BLOCK_SIZE + 4 * (d * D_split + d_tid);
+                        uint ib = coord / K_BLOCK_SIZE;
+                        uint iqs = (coord % K_BLOCK_SIZE);
+                        K_Tf = dequantize4_k(ib, iqs, k_offset);
 #else
                         K_Tf = FLOAT_TYPEV4(data_kv4[k_offset / 4 + (j * Bc + c * cols_per_iter + col_tid) * k_stride / 4 + d * D_split + d_tid]);
 #endif
@@ -260,11 +263,11 @@ void main() {
                     if (SHMEM_STAGING != 0) {
                         K_Tf = kvsh[(c * cols_per_iter + col_tid) * kvsh_stride + (d * D_split + d_tid)];
                     } else {
-#if BLOCK_SIZE > 1
-                        uint coord = (j * Bc + c * cols_per_iter + col_tid) * k_stride * BLOCK_SIZE + 4 * (d * D_split + d_tid);
-                        uint ib = coord / BLOCK_SIZE;
-                        uint iqs = (coord % BLOCK_SIZE);
-                        K_Tf = dequantize4(ib, iqs, k_offset, BINDING_IDX_K);
+#if K_BLOCK_SIZE > 1
+                        uint coord = (j * Bc + c * cols_per_iter + col_tid) * k_stride * K_BLOCK_SIZE + 4 * (d * D_split + d_tid);
+                        uint ib = coord / K_BLOCK_SIZE;
+                        uint iqs = (coord % K_BLOCK_SIZE);
+                        K_Tf = dequantize4_k(ib, iqs, k_offset);
 #else
                         K_Tf = FLOAT_TYPEV4(data_kv4[k_offset / 4 + (j * Bc + c * cols_per_iter + col_tid) * k_stride / 4 + d * D_split + d_tid]);
 #endif
@@ -336,11 +339,11 @@ void main() {
                 if (idx + gl_WorkGroupSize.x <= Bc * HSV / 4 || c < Bc) {
                     FLOAT_TYPEV4 V_Tf = FLOAT_TYPEV4(0);
                     if (!KV_bounds_check || j * Bc + c < KV) {
-#if BLOCK_SIZE > 1
-                        uint coord = (j * Bc + c) * v_stride * BLOCK_SIZE + 4 * d;
-                        uint ib = coord / BLOCK_SIZE;
-                        uint iqs = (coord % BLOCK_SIZE);
-                        V_Tf = dequantize4(ib, iqs, v_offset, BINDING_IDX_V);
+#if V_BLOCK_SIZE > 1
+                        uint coord = (j * Bc + c) * v_stride * V_BLOCK_SIZE + 4 * d;
+                        uint ib = coord / V_BLOCK_SIZE;
+                        uint iqs = (coord % V_BLOCK_SIZE);
+                        V_Tf = dequantize4_v(ib, iqs, v_offset);
 #else
                         V_Tf = FLOAT_TYPEV4(data_vv4[v_offset / 4 + (j * Bc + c) * v_stride / 4 + d]);
 #endif
@@ -368,11 +371,11 @@ void main() {
                 if (SHMEM_STAGING != 0) {
                     Vf = kvsh[(c * cols_per_iter + col_tid) * kvsh_stride + (d * D_split + d_tid)];
                 } else {
-#if BLOCK_SIZE > 1
-                    uint coord = (j * Bc + c * cols_per_iter + col_tid) * v_stride * BLOCK_SIZE + 4 * (d * D_split + d_tid);
-                    uint ib = coord / BLOCK_SIZE;
-                    uint iqs = (coord % BLOCK_SIZE);
-                    Vf = dequantize4(ib, iqs, v_offset, BINDING_IDX_V);
+#if V_BLOCK_SIZE > 1
+                    uint coord = (j * Bc + c * cols_per_iter + col_tid) * v_stride * V_BLOCK_SIZE + 4 * (d * D_split + d_tid);
+                    uint ib = coord / V_BLOCK_SIZE;
+                    uint iqs = (coord % V_BLOCK_SIZE);
+                    Vf = dequantize4_v(ib, iqs, v_offset);
 #else
                     Vf = FLOAT_TYPEV4(data_vv4[v_offset / 4 + (j * Bc + c * cols_per_iter + col_tid) * v_stride / 4 + d * D_split + d_tid]);
 #endif
