@@ -11,6 +11,7 @@
 // FIXME: required here for quantization functions
 #include "ggml-quants.h"
 #include "ggml-turbo-quant.h"
+#include "ggml-turbo-kv.h"
 
 #ifdef GGML_USE_CPU_HBM
 #include <hbwmalloc.h>
@@ -751,6 +752,14 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .is_quantized             = true,
         .to_float                 = (ggml_to_float_t) dequantize_row_tq_v_4b,
         .from_float_ref           = (ggml_from_float_t) quantize_row_tq_v_4b_ref,
+    },
+    [GGML_TYPE_TURBO_KV_4B] = {
+        .type_name                = "turbo_kv_4b",
+        .blck_size                = 128,
+        .type_size                = sizeof(block_turbo_kv_4b),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_turbo_kv_4b,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_turbo_kv_4b_ref,
     },
     [GGML_TYPE_Q2_K] = {
         .type_name                = "q2_K",

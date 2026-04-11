@@ -207,6 +207,7 @@ typedef pthread_t ggml_thread_t;
 #endif
 
 #include "ggml-turbo-quant.h"
+#include "ggml-turbo-kv.h"
 
 /* Layer 1 of the systematic shimming architecture: hand-rolled SSE4.1
  * implementations of AVX / AVX2 / F16C intrinsics for Westmere-class
@@ -239,6 +240,44 @@ static void ggml_vec_dot_tq_kv_1b_f32(int n, float * GGML_RESTRICT s, size_t bs,
                              (const block_tq_kv_1b *) vx,
                              s, /*seq_len=*/1, /*head_dim=*/n,
                              /*k_stride_blocks=*/0);
+}
+
+/* SSSE3 turbo_kv_4b inner kernel. Header is self-contained and guarded by
+ * __SSE4_1__/__SSSE3__; on Westmere or newer x86 with -march=native we get
+ * the fast path, otherwise this file's cpu trait for TURBO_KV_4B falls back
+ * to the scalar ggml_vec_dot_turbo_kv_4b_f32 from ggml-base. */
+#if defined(GGML_CPU_HAVE_DOWNLEVEL_X86)
+#include "arch/x86/turbo_kv_4b_sse.h"
+#endif
+
+static void ggml_vec_dot_turbo_kv_4b_f32_cpu(
+    int n, float * GGML_RESTRICT s, size_t bs,
+    const void * GGML_RESTRICT vx, size_t bx,
+    const void * GGML_RESTRICT vy, size_t by, int nrc)
+{
+    GGML_UNUSED(bs); GGML_UNUSED(bx); GGML_UNUSED(by); GGML_UNUSED(nrc);
+
+#if defined(GGML_TURBO_KV_4B_HAVE_SSE)
+    /* Fast path: SSSE3 + SSE4.1 pshufb codebook lookup. */
+    const float * q_rot = (const float *) vy;
+    const block_turbo_kv_4b * block = (const block_turbo_kv_4b *) vx;
+
+    int dim = n;
+    if (dim > TURBO_KV_BLOCK_SIZE) dim = TURBO_KV_BLOCK_SIZE;
+
+    const float norm    = GGML_CPU_FP16_TO_FP32(*(const ggml_fp16_t *) &block->norm);
+    float       inv_std = GGML_CPU_FP16_TO_FP32(*(const ggml_fp16_t *) &block->inv_std_fp16);
+    if (inv_std < 1e-10f) inv_std = sqrtf((float) dim);
+
+    const float per_block_scale = (TURBO_KV_4B_CENT_MAX / 127.0f) / inv_std;
+    const float mse_dot = ggml_vec_dot_turbo_kv_4b_sse_inner(
+        q_rot, block->mse_indices, per_block_scale, dim);
+
+    *s = norm * mse_dot;
+#else
+    /* Fallback: scalar reference from ggml-base. */
+    ggml_vec_dot_turbo_kv_4b_f32(n, s, bs, vx, bx, vy, by, nrc);
+#endif
 }
 
 static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
@@ -332,6 +371,20 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
          * can write into the cache during prompt processing. */
         .from_float               = (ggml_from_float_t) quantize_row_tq_v_4b_ref,
         .vec_dot                  = NULL,
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_TURBO_KV_4B] = {
+        /* Real TurboQuant (quantumaikr/quant.cpp v0.8.0 port). Unlike TQ_V_4B,
+         * turbo_kv_4b registers a real vec_dot so it works with both the
+         * flash attention kq_vec_dot path AND the explicit mul_mat fallback
+         * (-fa off). The cpu wrapper dispatches to the SSSE3 pshufb kernel
+         * on Westmere+ and to the scalar ggml-base reference elsewhere.
+         * vec_dot_type = F32: the query is pre-rotated by turbo_kv_rotate_query
+         * once per row, and the "quantize Q" hook here is the RHT rotation,
+         * not a type conversion. */
+        .from_float               = (ggml_from_float_t) quantize_row_turbo_kv_4b_ref,
+        .vec_dot                  = ggml_vec_dot_turbo_kv_4b_f32_cpu,
         .vec_dot_type             = GGML_TYPE_F32,
         .nrows                    = 1,
     },
