@@ -78,6 +78,24 @@ int main(int argc, char ** argv) {
     }
     int n_past = n_prompt;
 
+    // Phase 2 sanity: print MTP draft stack shape and per-draft top-1
+    const float * mtp = llama_get_mtp_logits(ctx);
+    const int64_t mtp_v = llama_get_mtp_n_vocab(ctx);
+    const int64_t mtp_k = llama_get_mtp_n_drafts(ctx);
+    fprintf(stderr, "\nMTP logits shape: vocab=%lld n_drafts=%lld\n", (long long)mtp_v, (long long)mtp_k);
+    if (mtp && mtp_v > 0 && mtp_k > 0) {
+        for (int64_t j = 0; j < mtp_k; j++) {
+            const float * row = mtp + j * mtp_v;
+            llama_token best = 0;
+            float best_l = row[0];
+            for (int64_t i = 1; i < mtp_v; i++) {
+                if (row[i] > best_l) { best_l = row[i]; best = (llama_token)i; }
+            }
+            fprintf(stderr, "  draft[%lld] top-1 token = %d (logit %.3f)\n",
+                    (long long)j, best, best_l);
+        }
+    }
+
     // Test both full (flags=0) and partial (recurrent-only) snapshots
     for (int pass = 0; pass < 2; pass++) {
         const bool partial = (pass == 1);
