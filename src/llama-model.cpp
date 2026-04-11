@@ -3066,8 +3066,8 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     // embedding table a second time at the tail (GET_ROWS(tok_embd, mtp_greedy_tokens)), and
     // two extra CPU-GPU splits per forward pass measurably hurt latency on full-GPU offload.
     // When the model has NEXTN layers and the output layer is already on GPU, mirror the input
-    // layer onto the same device. With VK_EXT_external_memory_host (see Phase 4 Track 1) the
-    // mmap'd embedding is imported into a Vulkan host buffer at zero extra VRAM cost.
+    // layer onto the same device. With VK_EXT_external_memory_host enabled on the Vulkan
+    // backend, the mmap'd embedding is imported into a Vulkan host buffer at zero extra VRAM cost.
     const bool offload_input_with_output =
         pimpl->dev_output.dev &&
         ggml_backend_dev_type(pimpl->dev_output.dev) != GGML_BACKEND_DEVICE_TYPE_CPU &&

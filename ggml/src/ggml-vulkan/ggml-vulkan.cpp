@@ -847,8 +847,12 @@ struct vk_device_struct {
     vk_pipeline pipeline_conv2d_dw_cwhn_f32, pipeline_conv2d_dw_cwhn_f16_f32;
 
     std::map<vk_fa_pipeline_state, vk_pipeline> pipeline_flash_attn_f32_f16[GGML_TYPE_COUNT];
-    // Phase 4 Track 3 follow-up: mixed K=F16, V=TQ_V_4B pipeline slot for --cache-type-v tq_v_4b.
-    std::map<vk_fa_pipeline_state, vk_pipeline> pipeline_flash_attn_f32_f16_k_f16_v_tq_v_4b;
+    // Mixed K/V type flash-attention pipelines. Keyed on (k_type, v_type) pair —
+    // populated lazily by ggml_vk_flash_attn when k->type != v->type, and
+    // iterated during pipeline compilation. Scalar path only (no coopmat1/2
+    // variants). Used for configurations like --cache-type-v q4_0 where K stays
+    // F16 but V is a quantised type.
+    std::map<std::pair<ggml_type, ggml_type>, std::map<vk_fa_pipeline_state, vk_pipeline>> pipeline_flash_attn_f32_f16_kv_mixed;
 
     std::map<std::pair<uint32_t, uint32_t>, vk_pipeline> pipeline_fa_mask_opt;
 
@@ -3469,6 +3473,17 @@ static void ggml_vk_load_shaders(vk_device& device) {
 #define CREATE_FA(TYPE, NAMELC, FAPATH, SUFFIX) \
         CREATE_FA_FOR_MAP(device->pipeline_flash_attn_f32_f16[TYPE], NAMELC, FAPATH, SUFFIX)
 
+    // Name the mixed K/V map slots as local references to avoid macro-argument
+    // parsing issues (the `{k, v}` brace-list contains a comma that the
+    // preprocessor can't see through).
+    auto &kv_mixed_f16_q4_0    = device->pipeline_flash_attn_f32_f16_kv_mixed[{GGML_TYPE_F16, GGML_TYPE_Q4_0}];
+    auto &kv_mixed_f16_q4_1    = device->pipeline_flash_attn_f32_f16_kv_mixed[{GGML_TYPE_F16, GGML_TYPE_Q4_1}];
+    auto &kv_mixed_f16_q5_0    = device->pipeline_flash_attn_f32_f16_kv_mixed[{GGML_TYPE_F16, GGML_TYPE_Q5_0}];
+    auto &kv_mixed_f16_q5_1    = device->pipeline_flash_attn_f32_f16_kv_mixed[{GGML_TYPE_F16, GGML_TYPE_Q5_1}];
+    auto &kv_mixed_f16_q8_0    = device->pipeline_flash_attn_f32_f16_kv_mixed[{GGML_TYPE_F16, GGML_TYPE_Q8_0}];
+    auto &kv_mixed_f16_iq4_nl  = device->pipeline_flash_attn_f32_f16_kv_mixed[{GGML_TYPE_F16, GGML_TYPE_IQ4_NL}];
+    auto &kv_mixed_f16_tq_v_4b = device->pipeline_flash_attn_f32_f16_kv_mixed[{GGML_TYPE_F16, GGML_TYPE_TQ_V_4B}];
+
     if (device->fp16) {
         CREATE_FA(GGML_TYPE_F32, f32, FA_SCALAR, )
         CREATE_FA(GGML_TYPE_F16, f16, FA_SCALAR, )
@@ -3479,8 +3494,14 @@ static void ggml_vk_load_shaders(vk_device& device) {
         CREATE_FA(GGML_TYPE_Q5_1, q5_1, FA_SCALAR, )
         CREATE_FA(GGML_TYPE_IQ4_NL, iq4_nl, FA_SCALAR, )
         CREATE_FA(GGML_TYPE_TQ_V_4B, tq_v_4b, FA_SCALAR, )
-        // Phase 4 Track 3 follow-up: mixed K=F16, V=TQ_V_4B variant.
-        CREATE_FA_FOR_MAP(device->pipeline_flash_attn_f32_f16_k_f16_v_tq_v_4b, k_f16_v_tq_v_4b, FA_SCALAR, )
+        // Mixed K=F16, V=quant flash-attention variants.
+        CREATE_FA_FOR_MAP(kv_mixed_f16_q4_0,    k_f16_v_q4_0,    FA_SCALAR, )
+        CREATE_FA_FOR_MAP(kv_mixed_f16_q4_1,    k_f16_v_q4_1,    FA_SCALAR, )
+        CREATE_FA_FOR_MAP(kv_mixed_f16_q5_0,    k_f16_v_q5_0,    FA_SCALAR, )
+        CREATE_FA_FOR_MAP(kv_mixed_f16_q5_1,    k_f16_v_q5_1,    FA_SCALAR, )
+        CREATE_FA_FOR_MAP(kv_mixed_f16_q8_0,    k_f16_v_q8_0,    FA_SCALAR, )
+        CREATE_FA_FOR_MAP(kv_mixed_f16_iq4_nl,  k_f16_v_iq4_nl,  FA_SCALAR, )
+        CREATE_FA_FOR_MAP(kv_mixed_f16_tq_v_4b, k_f16_v_tq_v_4b, FA_SCALAR, )
     } else {
         CREATE_FA(GGML_TYPE_F32, f32, FA_SCALAR, _fp32)
         CREATE_FA(GGML_TYPE_F16, f16, FA_SCALAR, _fp32)
@@ -3491,8 +3512,14 @@ static void ggml_vk_load_shaders(vk_device& device) {
         CREATE_FA(GGML_TYPE_Q5_1, q5_1, FA_SCALAR, _fp32)
         CREATE_FA(GGML_TYPE_IQ4_NL, iq4_nl, FA_SCALAR, _fp32)
         CREATE_FA(GGML_TYPE_TQ_V_4B, tq_v_4b, FA_SCALAR, _fp32)
-        // Phase 4 Track 3 follow-up: mixed K=F16, V=TQ_V_4B variant.
-        CREATE_FA_FOR_MAP(device->pipeline_flash_attn_f32_f16_k_f16_v_tq_v_4b, k_f16_v_tq_v_4b, FA_SCALAR, _fp32)
+        // Mixed K=F16, V=quant flash-attention variants.
+        CREATE_FA_FOR_MAP(kv_mixed_f16_q4_0,    k_f16_v_q4_0,    FA_SCALAR, _fp32)
+        CREATE_FA_FOR_MAP(kv_mixed_f16_q4_1,    k_f16_v_q4_1,    FA_SCALAR, _fp32)
+        CREATE_FA_FOR_MAP(kv_mixed_f16_q5_0,    k_f16_v_q5_0,    FA_SCALAR, _fp32)
+        CREATE_FA_FOR_MAP(kv_mixed_f16_q5_1,    k_f16_v_q5_1,    FA_SCALAR, _fp32)
+        CREATE_FA_FOR_MAP(kv_mixed_f16_q8_0,    k_f16_v_q8_0,    FA_SCALAR, _fp32)
+        CREATE_FA_FOR_MAP(kv_mixed_f16_iq4_nl,  k_f16_v_iq4_nl,  FA_SCALAR, _fp32)
+        CREATE_FA_FOR_MAP(kv_mixed_f16_tq_v_4b, k_f16_v_tq_v_4b, FA_SCALAR, _fp32)
     }
 #if defined(VK_KHR_cooperative_matrix) && defined(GGML_VULKAN_COOPMAT_GLSLC_SUPPORT)
     if (device->coopmat1_fa_support) {
@@ -4233,7 +4260,7 @@ static void ggml_vk_load_shaders(vk_device& device) {
     ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_IQ4_XS],  "dequant_iq4_xs",  dequant_iq4_xs_len,  dequant_iq4_xs_data,  "main", 2, 5 * sizeof(uint32_t), {256 * 32, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_IQ4_NL],  "dequant_iq4_nl",  dequant_iq4_nl_len,  dequant_iq4_nl_data,  "main", 2, 5 * sizeof(uint32_t), {256 * 16, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_MXFP4],   "dequant_mxfp4",   dequant_mxfp4_len,   dequant_mxfp4_data,   "main", 2, 5 * sizeof(uint32_t), {256 * 16, 1, 1}, {}, 1);
-    // Phase 4 Track 3: TurboQuant V 4-bit. 128-element block; the workgroup size
+    // TurboQuant V 4-bit. 128-element block; the workgroup size
     // in the shader is 256, so 256 blocks (= 256 * 128 output elements) per workgroup.
     ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_TQ_V_4B], "dequant_tq_v_4b", dequant_tq_v_4b_len, dequant_tq_v_4b_data, "main", 2, 5 * sizeof(uint32_t), {256 * 128, 1, 1}, {}, 1);
 
@@ -8993,18 +9020,26 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
 
     {
         std::lock_guard<std::recursive_mutex> guard(ctx->device->mutex);
-        // Phase 4 Track 3 follow-up: route K=F16 + V=TQ_V_4B to the dedicated
-        // mixed-type pipeline map, since the ordinary keying is k->type only.
-        const bool use_mixed_k_f16_v_tq_v_4b =
-            k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_TQ_V_4B;
-        auto &pipelines = use_mixed_k_f16_v_tq_v_4b
-            ? ctx->device->pipeline_flash_attn_f32_f16_k_f16_v_tq_v_4b
-            : ctx->device->pipeline_flash_attn_f32_f16[k->type];
-        auto it = pipelines.find(fa_pipeline_state);
-        if (it != pipelines.end()) {
-            pipeline = it->second;
+        // Route mixed K/V types to the pair-keyed mixed-type pipeline map —
+        // the single-type path is keyed on k->type only and can't represent
+        // the (k_type != v_type) case.
+        if (k->type != v->type) {
+            auto key = std::make_pair(k->type, v->type);
+            auto &pipelines = ctx->device->pipeline_flash_attn_f32_f16_kv_mixed[key];
+            auto it = pipelines.find(fa_pipeline_state);
+            if (it != pipelines.end()) {
+                pipeline = it->second;
+            } else {
+                pipelines[fa_pipeline_state] = pipeline = std::make_shared<vk_pipeline_struct>();
+            }
         } else {
-            pipelines[fa_pipeline_state] = pipeline = std::make_shared<vk_pipeline_struct>();
+            auto &pipelines = ctx->device->pipeline_flash_attn_f32_f16[k->type];
+            auto it = pipelines.find(fa_pipeline_state);
+            if (it != pipelines.end()) {
+                pipeline = it->second;
+            } else {
+                pipelines[fa_pipeline_state] = pipeline = std::make_shared<vk_pipeline_struct>();
+            }
         }
     }
 
@@ -15267,7 +15302,7 @@ static void ggml_backend_vk_device_get_props(ggml_backend_dev_t dev, struct ggml
     ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *)dev->context;
     const vk_device& device = ggml_vk_get_device(ctx->device);
 
-    // ggml-fusion Phase 4 Track 1: enable buffer_from_host_ptr when the device advertises
+    // Enable buffer_from_host_ptr when the device advertises
     // VK_EXT_external_memory_host with a non-zero minImportedHostPointerAlignment. This lets
     // llama-model.cpp:8229 route mmap'd weight regions through ggml_backend_dev_buffer_from_host_ptr
     // via the existing ggml_vk_buffer_from_host_ptr import path, eliminating the CPU_Mapped
@@ -15482,15 +15517,25 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                 // It's straightforward to support different K/V dequant, but would
                 // significantly increase the number of pipelines
                 if (op->src[1]->type != op->src[2]->type) {
-                    // Phase 4 Track 3 follow-up: a dedicated scalar flash-attn shader
-                    // variant supports K=F16 + V=TQ_V_4B for the --cache-type-v tq_v_4b path.
-                    const bool mixed_f16_tq_v_4b =
-                        op->src[1]->type == GGML_TYPE_F16 &&
-                        op->src[2]->type == GGML_TYPE_TQ_V_4B;
-                    if (!mixed_f16_tq_v_4b) {
+                    // Dedicated scalar flash-attn variants cover K=F16 paired with
+                    // each supported V quant type, for the --cache-type-v <quant>
+                    // runtime path (K stays F16 by default).
+                    if (op->src[1]->type != GGML_TYPE_F16) {
                         return false;
                     }
-                    // Only the scalar path carries the mixed-type shader variant.
+                    switch (op->src[2]->type) {
+                        case GGML_TYPE_Q4_0:
+                        case GGML_TYPE_Q4_1:
+                        case GGML_TYPE_Q5_0:
+                        case GGML_TYPE_Q5_1:
+                        case GGML_TYPE_Q8_0:
+                        case GGML_TYPE_IQ4_NL:
+                        case GGML_TYPE_TQ_V_4B:
+                            break;
+                        default:
+                            return false;
+                    }
+                    // Only the scalar path carries the mixed-type shader variants.
                     if (coopmat2) {
                         return false;
                     }

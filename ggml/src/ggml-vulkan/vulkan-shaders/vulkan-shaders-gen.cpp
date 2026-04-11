@@ -674,18 +674,34 @@ void process_shaders() {
                 }
             }
 
-            // Phase 4 Track 3: TurboQuant V 4-bit flash-attention. Not in type_names because we
-            // don't need the mul_mat / mmq / dequant-loop companions — only the scalar flash_attn
-            // variant (Vega 64 doesn't have coopmat1/2 support anyway).
+            // Scalar flash-attention variant for TurboQuant V 4-bit. Not in type_names because
+            // we don't need the mul_mat / mmq / dequant-loop companions — only the scalar
+            // flash_attn variant (TQ_V_4B is intended strictly as a V-cache quant type).
             string_to_spv("flash_attn_f32_f16_tq_v_4b", "flash_attn.comp",
                 merge_maps(fa_base_dict, {{"DATA_A_TQ_V_4B", "1"}, {"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}, {"BLOCK_SIZE", "QUANT_K_TQ_V_4B"}}), fp16, false, false, f16acc);
 
-            // Phase 4 Track 3 follow-up: mixed K=F16 / V=TQ_V_4B flash-attention.
-            // This is the runtime configuration used by --flash-attn on --cache-type-v tq_v_4b
-            // where the K cache stays F16 but the V cache is TurboQuant. The shader follows the
-            // independent-K/V-type path in flash_attn_base.glsl via DATA_K_F16 + DATA_V_TQ_V_4B.
-            string_to_spv("flash_attn_f32_f16_k_f16_v_tq_v_4b", "flash_attn.comp",
-                merge_maps(fa_base_dict, {{"DATA_K_F16", "1"}, {"DATA_V_TQ_V_4B", "1"}, {"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}}), fp16, false, false, f16acc);
+            // Mixed K=F16 / V=quant flash-attention variants. These cover the runtime
+            // configurations used by --flash-attn on --cache-type-v <quant>, where K stays
+            // F16 but V is one of the supported quantised types. The shaders follow the
+            // independent-K/V-type path in flash_attn_base.glsl via DATA_K_F16 + DATA_V_<quant>,
+            // and the legacy single-type DATA_A_<quant> path is untouched — this is an
+            // additive set of shader variants.
+            {
+                const std::vector<std::pair<std::string, std::string>> mixed_v_types = {
+                    {"q4_0",    "DATA_V_Q4_0"},
+                    {"q4_1",    "DATA_V_Q4_1"},
+                    {"q5_0",    "DATA_V_Q5_0"},
+                    {"q5_1",    "DATA_V_Q5_1"},
+                    {"q8_0",    "DATA_V_Q8_0"},
+                    {"iq4_nl",  "DATA_V_IQ4_NL"},
+                    {"tq_v_4b", "DATA_V_TQ_V_4B"},
+                };
+                for (const auto& vt : mixed_v_types) {
+                    string_to_spv("flash_attn_f32_f16_k_f16_v_" + vt.first, "flash_attn.comp",
+                        merge_maps(fa_base_dict, {{"DATA_K_F16", "1"}, {vt.second, "1"}, {"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}}),
+                        fp16, false, false, f16acc);
+                }
+            }
         }
     }
 
