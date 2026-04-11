@@ -1817,35 +1817,59 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
 
         // Extract MTP logits if available.
-        // Layout: [mtp_n_drafts × mtp_n_vocab] stacked. mtp_n_drafts > 1 when the
-        // graph ran a chained rollout (LLAMA_MTP_ROLLOUT / cparams n_draft_rollout);
-        // consumers index the j-th draft at offset j * mtp_n_vocab.
-        if (res->t_logits_mtp != nullptr && n_outputs > 0) {
+        //
+        // The stacked tensor produced by build_mtp_head has shape
+        //   [mtp_n_vocab, ubatch.n_tokens * n_draft_rollout]
+        // laid out iteration-major by ggml_concat along dim 1:
+        //   rows 0..n_pos-1                        = iter 0, positions 0..n_pos-1
+        //   rows n_pos..2*n_pos-1                  = iter 1, positions 0..n_pos-1
+        //   ...
+        //   rows (k-1)*n_pos..k*n_pos-1            = iter k-1, positions 0..n_pos-1
+        //
+        // Note: build_mtp_head does NOT apply inp_out_ids filtering — it
+        // operates on the full unfiltered mtp_inp_hidden, so the row count
+        // per iteration is ubatch.n_tokens (not n_outputs). For prompt eval
+        // with n_outputs=1 and ubatch.n_tokens=12, mtp_n_tokens = 12*k, and
+        // we must divide by 12, not 1.
+        //
+        // Consumers of llama_get_mtp_logits always want forward drafts from
+        // the LAST batch position — for Plan A's spec batch [T, D1..Dk] that's
+        // position k (the final draft slot), predicting tokens beyond the
+        // committed bonus. Extract only the last-position's k rows into a
+        // contiguous [mtp_n_vocab * k] buffer.
+        if (res->t_logits_mtp != nullptr && ubatch.n_tokens > 0) {
             ggml_backend_t backend_mtp = ggml_backend_sched_get_tensor_backend(sched.get(), res->t_logits_mtp);
             if (backend_mtp != nullptr) {
                 const int64_t mtp_n_vocab  = res->t_logits_mtp->ne[0];
                 const int64_t mtp_n_tokens = res->t_logits_mtp->ne[1];
+                const int64_t n_pos        = (int64_t) ubatch.n_tokens;
 
-                // The stacked tensor is [vocab, n_output_positions * n_draft_rollout].
-                // For single-token generation (Plan A's path), n_output_positions = 1
-                // so mtp_n_tokens == n_draft_rollout. For prompt eval with multiple
-                // output positions, drafts of the LAST position are the last n_drafts
-                // rows — those are the useful ones for the next iteration.
-                //
-                // Copy only the last-position block: the last mtp_n_drafts_cur rows.
-                // For Plan A phase 2 we copy everything (n_output_positions is always
-                // 1 in the single-token gen path); support for prompt-eval rollouts
-                // will need the graph to annotate per-position draft counts, tracked
-                // as a follow-up. For now mtp_n_drafts == mtp_n_tokens.
-                const int64_t n_drafts = mtp_n_tokens;
-                const size_t bytes = mtp_n_vocab * n_drafts * sizeof(float);
+                int64_t n_rollout = n_pos > 0 ? (mtp_n_tokens / n_pos) : 0;
+                if (n_rollout * n_pos != mtp_n_tokens || n_rollout <= 0) {
+                    // Shape doesn't factor cleanly — fall back to treating
+                    // the whole tensor as 1 iteration (old behaviour).
+                    n_rollout = 1;
+                }
 
-                mtp_logits_buf.resize(mtp_n_vocab * n_drafts);
+                // First copy the full stacked tensor to a temporary host buffer.
+                std::vector<float> full_buf((size_t)(mtp_n_vocab * mtp_n_tokens));
                 ggml_backend_tensor_get_async(backend_mtp, res->t_logits_mtp,
-                    mtp_logits_buf.data(), 0, bytes);
+                    full_buf.data(), 0, mtp_n_vocab * mtp_n_tokens * sizeof(float));
+                ggml_backend_sched_synchronize(sched.get());
+
+                // Gather the last batch position's rows across all iterations.
+                mtp_logits_buf.resize((size_t)(mtp_n_vocab * n_rollout));
+                const int64_t last_pos = n_pos - 1;
+                for (int64_t k = 0; k < n_rollout; k++) {
+                    const int64_t src_row = k * n_pos + last_pos;
+                    std::memcpy(
+                        mtp_logits_buf.data() + (size_t)(k * mtp_n_vocab),
+                        full_buf.data() + (size_t)(src_row * mtp_n_vocab),
+                        (size_t)(mtp_n_vocab * sizeof(float)));
+                }
                 mtp_logits_valid = true;
                 this->mtp_n_vocab  = mtp_n_vocab;
-                this->mtp_n_drafts = n_drafts;
+                this->mtp_n_drafts = n_rollout;
             }
         } else {
             mtp_logits_valid = false;
