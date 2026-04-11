@@ -3051,10 +3051,6 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         return {dev, &pimpl->gpu_buft_list.at(dev)};
     };
 
-    // assign the input layer
-    // there is very little benefit to offloading the input layer, so always keep it on the CPU
-    pimpl->dev_input = { cpu_dev, &pimpl->cpu_buft_list };
-
     // assign the repeating layers to the devices according to the splits
     pimpl->dev_layer.resize(n_layer);
     for (int il = 0; il < n_layer; ++il) {
@@ -3063,6 +3059,24 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
 
     // assign the output layer
     pimpl->dev_output = get_layer_buft_list(n_layer);
+
+    // assign the input layer
+    // Normally there is very little benefit to offloading the input layer, so it lives on CPU
+    // and GET_ROWS(tok_embd, input_tokens) runs on CPU. For MTP spec decode we re-read the
+    // embedding table a second time at the tail (GET_ROWS(tok_embd, mtp_greedy_tokens)), and
+    // two extra CPU-GPU splits per forward pass measurably hurt latency on full-GPU offload.
+    // When the model has NEXTN layers and the output layer is already on GPU, mirror the input
+    // layer onto the same device. With VK_EXT_external_memory_host (see Phase 4 Track 1) the
+    // mmap'd embedding is imported into a Vulkan host buffer at zero extra VRAM cost.
+    const bool offload_input_with_output =
+        pimpl->dev_output.dev &&
+        ggml_backend_dev_type(pimpl->dev_output.dev) != GGML_BACKEND_DEVICE_TYPE_CPU &&
+        hparams.nextn_predict_layers > 0;
+    if (offload_input_with_output) {
+        pimpl->dev_input = pimpl->dev_output;
+    } else {
+        pimpl->dev_input = { cpu_dev, &pimpl->cpu_buft_list };
+    }
 
     const auto TENSOR_DUPLICATED      = llama_model_loader::TENSOR_DUPLICATED;
     const auto TENSOR_NOT_REQUIRED    = llama_model_loader::TENSOR_NOT_REQUIRED;
@@ -8226,8 +8240,14 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         bool is_default_buft = buft == ggml_backend_dev_buffer_type(dev);
 
         std::vector<ggml_backend_buffer_ptr> bufs;
+        // Try the buffer_from_host_ptr path first (zero-copy mmap sharing). If any file-range
+        // import returns NULL (e.g. Vulkan's max_buffer_size exceeded for a large ctx), fall
+        // back to the standard alloc path for this ctx rather than hard-failing. Partial
+        // progress is rolled back so the fallback allocates the entire ctx cleanly.
+        bool import_succeeded = false;
         if (ml.use_mmap && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft) {
             GGML_ASSERT(!ml.no_alloc);
+            import_succeeded = true;
             for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
                 // only the mmap region containing the tensors in the model is mapped to the backend buffer
                 // this is important for metal with apple silicon: if the entire model could be mapped to a metal buffer,
@@ -8242,12 +8262,18 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                 const size_t max_size = ggml_get_max_tensor_size(ctx);
                 ggml_backend_buffer_t buf = ggml_backend_dev_buffer_from_host_ptr(dev, (char *) addr + first, last - first, max_size);
                 if (buf == nullptr) {
-                    throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
+                    // Roll back any buffers already imported for earlier files in this ctx
+                    // and fall through to the standard alloc path.
+                    bufs.clear();
+                    buf_map.clear();
+                    import_succeeded = false;
+                    break;
                 }
                 bufs.emplace_back(buf);
                 buf_map.emplace(idx, buf);
             }
-        } else {
+        }
+        if (!import_succeeded) {
             ggml_backend_buffer_t buf;
             if (ml.no_alloc) {
                 buf = ggml_backend_buft_alloc_buffer(buft, /*size =*/ 0); // dummy buffer

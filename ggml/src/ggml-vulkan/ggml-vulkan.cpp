@@ -2568,8 +2568,14 @@ static std::vector<uint32_t> ggml_vk_find_memory_properties(const vk::PhysicalDe
     return indices;
 }
 
+// `import_ptr` and `import_bind_offset`: when importing a host pointer via
+// VK_EXT_external_memory_host, `import_ptr` must be aligned to
+// device->min_imported_host_pointer_alignment; `import_bind_offset` lets the
+// caller expose a sub-alignment base so that ggml tensor->data arithmetic
+// can work against an unaligned logical pointer (`import_ptr + import_bind_offset`)
+// while the underlying VkDeviceMemory is still imported from the aligned `import_ptr`.
 static vk_buffer ggml_vk_create_buffer(vk_device& device, size_t size, const std::initializer_list<vk::MemoryPropertyFlags> & req_flags_list,
-                                       void *import_ptr = nullptr) {
+                                       void *import_ptr = nullptr, size_t import_bind_offset = 0) {
     VK_LOG_DEBUG("ggml_vk_create_buffer(" << device->name << ", " << size << ", " << to_string(req_flags_list.begin()[0]) << ", " << to_string(req_flags_list.begin()[req_flags_list.size()-1]) << ")");
     if (size > device->max_buffer_size) {
         throw vk::OutOfDeviceMemoryError("Requested buffer size exceeds device buffer size limit");
@@ -2653,12 +2659,20 @@ static vk_buffer ggml_vk_create_buffer(vk_device& device, size_t size, const std
         }
 
         buf->memory_property_flags = mem_props.memoryTypes[memory_type_idx].propertyFlags;
+
+        // The VkDeviceMemory allocation must cover [0, import_bind_offset + mem_req.size)
+        // and its size must be a multiple of min_imported_host_pointer_alignment. The caller
+        // has already aligned `import_ptr` to that alignment, so we just need to round up.
+        const uint64_t import_align = device->min_imported_host_pointer_alignment;
+        const size_t import_needed = (size_t) mem_req.size + import_bind_offset;
+        const size_t import_alloc_size = (import_needed + import_align - 1) & ~(import_align - 1);
+
         try {
             vk::ImportMemoryHostPointerInfoEXT import_info;
             import_info.handleType = vk::ExternalMemoryHandleTypeFlagBits::eHostAllocationEXT;
             import_info.pHostPointer = import_ptr;
             import_info.setPNext(&mem_flags_info);
-            buf->device_memory = device->device.allocateMemory({ size, memory_type_idx, &import_info });
+            buf->device_memory = device->device.allocateMemory({ import_alloc_size, memory_type_idx, &import_info });
         } catch (const vk::SystemError& e) {
         }
     } else {
@@ -2703,14 +2717,16 @@ static vk_buffer ggml_vk_create_buffer(vk_device& device, size_t size, const std
     buf->ptr = nullptr;
 
     if (import_ptr) {
-        buf->ptr = import_ptr;
+        // Expose the sub-aligned logical base (import_ptr + import_bind_offset) to ggml so
+        // tensor->data arithmetic lands at the caller's originally requested pointer.
+        buf->ptr = (char *) import_ptr + import_bind_offset;
     } else {
         if (buf->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible) {
             buf->ptr = device->device.mapMemory(buf->device_memory, 0, VK_WHOLE_SIZE);
         }
     }
 
-    device->device.bindBufferMemory(buf->buffer, buf->device_memory, 0);
+    device->device.bindBufferMemory(buf->buffer, buf->device_memory, import_ptr ? import_bind_offset : 0);
 
     buf->device = device;
     buf->size = size;
@@ -15222,6 +15238,15 @@ static enum ggml_backend_dev_type ggml_backend_vk_device_get_type(ggml_backend_d
 
 static void ggml_backend_vk_device_get_props(ggml_backend_dev_t dev, struct ggml_backend_dev_props * props) {
     ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *)dev->context;
+    const vk_device& device = ggml_vk_get_device(ctx->device);
+
+    // ggml-fusion Phase 4 Track 1: enable buffer_from_host_ptr when the device advertises
+    // VK_EXT_external_memory_host with a non-zero minImportedHostPointerAlignment. This lets
+    // llama-model.cpp:8229 route mmap'd weight regions through ggml_backend_dev_buffer_from_host_ptr
+    // via the existing ggml_vk_buffer_from_host_ptr import path, eliminating the CPU_Mapped
+    // fallback that forced a GET_ROWS split on token_embd.weight.
+    const bool buffer_from_host_ptr_supported =
+        device->external_memory_host && device->min_imported_host_pointer_alignment > 0;
 
     props->name        = ggml_backend_vk_device_get_name(dev);
     props->description = ggml_backend_vk_device_get_description(dev);
@@ -15231,7 +15256,7 @@ static void ggml_backend_vk_device_get_props(ggml_backend_dev_t dev, struct ggml
     props->caps = {
         /* .async                 = */ true,
         /* .host_buffer           = */ true,
-        /* .buffer_from_host_ptr  = */ false,
+        /* .buffer_from_host_ptr  = */ buffer_from_host_ptr_supported,
         /* .events                = */ true,
     };
 }
@@ -15919,20 +15944,35 @@ static vk_buffer ggml_vk_buffer_from_host_ptr(vk_device & device, void * ptr, si
     if (!device->external_memory_host) {
         return {};
     }
+    if (size == 0) {
+        return {};
+    }
 
+    // Single-buffer imports cannot exceed the device's max buffer size. For llama.cpp loads
+    // the largest ctx (main Vulkan0 weights) is typically multi-GB while Vulkan's
+    // maxStorageBufferRange is ~2 GB on most drivers. Return {} so the caller can fall back
+    // to the standard alloc path; this is not an error.
+    if (size > device->max_buffer_size) {
+        return {};
+    }
+
+    // mmap'd GGUF regions are page-aligned at the base but the model-loader passes
+    // (base + first_tensor_offset, last - first_tensor_offset), so `ptr` may be sub-aligned.
+    // Round the import pointer DOWN to min_imported_host_pointer_alignment and pass the
+    // sub-alignment delta through to ggml_vk_create_buffer as bind_offset. The caller
+    // receives a buf->ptr that matches the original unaligned `ptr`, so ggml tensor->data
+    // arithmetic continues to work without changes in llama-model.cpp.
+    const uint64_t align = device->min_imported_host_pointer_alignment;
     uintptr_t uptr = reinterpret_cast<uintptr_t>(ptr);
-    if (uptr & (device->min_imported_host_pointer_alignment - 1)) {
-        return {};
-    }
-    if (size & (device->min_imported_host_pointer_alignment - 1)) {
-        return {};
-    }
+    uintptr_t aligned_uptr = uptr & ~(align - 1);
+    const size_t sub_offset = (size_t) (uptr - aligned_uptr);
+    void * aligned_ptr = reinterpret_cast<void *>(aligned_uptr);
 
     const vk::MemoryPropertyFlags property_flags = vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent | vk::MemoryPropertyFlagBits::eHostCached;
 
     vk_buffer buf {};
     try {
-        buf = ggml_vk_create_buffer(device, size, { property_flags }, ptr);
+        buf = ggml_vk_create_buffer(device, size, { property_flags }, aligned_ptr, sub_offset);
     } catch (vk::SystemError& e) {
         GGML_LOG_WARN("ggml_vulkan: Failed ggml_vk_create_buffer (%s)\n", e.what());
     }
