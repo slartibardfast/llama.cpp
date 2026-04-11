@@ -112,6 +112,8 @@ FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
 #define BLOCK_BYTE_SIZE 18
 #elif defined(DATA_A_Q4_1)
 #define BLOCK_BYTE_SIZE 20
+#elif defined(DATA_A_TQ_V_4B)
+#define BLOCK_BYTE_SIZE 66
 #endif
 
 #if defined(DATA_A_Q4_0) || defined(DATA_A_Q4_1)
@@ -142,6 +144,38 @@ FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
 #else
         return FLOAT_TYPE(v_packed.v_data_packed16[a_offset + ib].d) * (nibbles - FLOAT_TYPE(8.0f));
 #endif
+    }
+}
+#endif
+
+#if defined(DATA_A_TQ_V_4B)
+// TurboQuant V 4-bit. 128-element block, same q4_0-style nibble semantics but
+// with the larger half. iqs arrives as a multiple of 4 in [0, 128); the low
+// half covers positions 0..63 (low nibbles of qs[0..63]) and the high half
+// covers positions 64..127 (high nibbles of the SAME qs bytes, not the next
+// 64). Because iqs is always 4-aligned and 64 is 4-aligned, the 4 elements
+// returned are always within the same half — no crossings.
+FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
+    if (binding_idx == BINDING_IDX_K) {
+        uint byte_idx = iqs & 0x3F;     // 0..63, the byte index within either half
+        uint shift    = (iqs & 0x40) >> 4; // 0 for low nibbles, 4 for high nibbles
+        uint vui_lo = uint(k_packed.k_data_packed16[a_offset + ib].qs[byte_idx / 2 + 0]);
+        uint vui_hi = uint(k_packed.k_data_packed16[a_offset + ib].qs[byte_idx / 2 + 1]);
+        vui_lo >>= shift;
+        vui_hi >>= shift;
+
+        FLOAT_TYPEV4 nibbles = FLOAT_TYPEV4(vui_lo & 0xF, (vui_lo >> 8) & 0xF, vui_hi & 0xF, (vui_hi >> 8) & 0xF);
+        return FLOAT_TYPE(k_packed.k_data_packed16[a_offset + ib].d) * (nibbles - FLOAT_TYPE(8.0f));
+    } else {
+        uint byte_idx = iqs & 0x3F;
+        uint shift    = (iqs & 0x40) >> 4;
+        uint vui_lo = uint(v_packed.v_data_packed16[a_offset + ib].qs[byte_idx / 2 + 0]);
+        uint vui_hi = uint(v_packed.v_data_packed16[a_offset + ib].qs[byte_idx / 2 + 1]);
+        vui_lo >>= shift;
+        vui_hi >>= shift;
+
+        FLOAT_TYPEV4 nibbles = FLOAT_TYPEV4(vui_lo & 0xF, (vui_lo >> 8) & 0xF, vui_hi & 0xF, (vui_hi >> 8) & 0xF);
+        return FLOAT_TYPE(v_packed.v_data_packed16[a_offset + ib].d) * (nibbles - FLOAT_TYPE(8.0f));
     }
 }
 #endif

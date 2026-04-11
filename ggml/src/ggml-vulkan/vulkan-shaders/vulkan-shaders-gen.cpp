@@ -673,6 +673,12 @@ void process_shaders() {
                         merge_maps(fa_base_dict, {{data_a_key, "1"}, {"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}, {"BLOCK_SIZE", "QUANT_K_"+to_uppercase(tname) }}), fp16, false, false, f16acc);
                 }
             }
+
+            // Phase 4 Track 3: TurboQuant V 4-bit flash-attention. Not in type_names because we
+            // don't need the mul_mat / mmq / dequant-loop companions — only the scalar flash_attn
+            // variant (Vega 64 doesn't have coopmat1/2 support anyway).
+            string_to_spv("flash_attn_f32_f16_tq_v_4b", "flash_attn.comp",
+                merge_maps(fa_base_dict, {{"DATA_A_TQ_V_4B", "1"}, {"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}, {"BLOCK_SIZE", "QUANT_K_TQ_V_4B"}}), fp16, false, false, f16acc);
         }
     }
 
