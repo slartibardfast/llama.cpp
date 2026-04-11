@@ -1258,36 +1258,23 @@ private:
     // the next draft. Sets slot.mtp_pending + slot.mtp_draft_token on success;
     // clears them on any failure (no MTP logits, empty vocab, EOG draft).
     // Call after any sampling event that commits a token to slot state.
+    //
+    // Phase 3 refactor: delegates the actual MTP logits readout to
+    // common_mtp_read_drafts() so both this path and the standard speculative
+    // framework path share the same chained-rollout-aware code. This function
+    // now just picks the first draft and populates the legacy scalar fields;
+    // Phase 4 will widen the slot state to hold the full draft vector.
     void try_set_mtp_draft(server_slot & slot) {
         slot.mtp_pending     = false;
         slot.mtp_draft_token = -1;
         slot.mtp_i_batch     = -1;
 
-        const float * mtp_logits = llama_get_mtp_logits(ctx);
-        if (mtp_logits == nullptr) {
-            return;
-        }
-        const int64_t mtp_n_vocab = llama_get_mtp_n_vocab(ctx);
-        if (mtp_n_vocab <= 0) {
+        llama_tokens drafts = common_mtp_read_drafts(ctx, /*k_max=*/1);
+        if (drafts.empty()) {
             return;
         }
 
-        llama_token draft = 0;
-        float best = mtp_logits[0];
-        for (int64_t i = 1; i < mtp_n_vocab; i++) {
-            if (mtp_logits[i] > best) {
-                best  = mtp_logits[i];
-                draft = (llama_token)i;
-            }
-        }
-
-        // Don't propose EOG tokens as drafts — we would try to decode them as input,
-        // and the verifier's accept path would then sample a bonus from a stopped context.
-        if (llama_vocab_is_eog(vocab, draft)) {
-            return;
-        }
-
-        slot.mtp_draft_token = draft;
+        slot.mtp_draft_token = drafts.front();
         slot.mtp_pending     = true;
     }
 

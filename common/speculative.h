@@ -39,3 +39,18 @@ void common_speculative_accept(common_speculative * spec, uint16_t n_accepted);
 
 // print statistics about the speculative decoding
 void common_speculative_print_stats(const common_speculative * spec);
+
+// Read MTP-head draft tokens from the target context's most recent decode.
+//
+// Uses llama_get_mtp_logits + llama_get_mtp_n_drafts + llama_get_mtp_n_vocab,
+// which come from the model's MTP head output (chained rollout when built
+// with n_draft_rollout > 1). Returns up to k_max draft tokens, stopping
+// early on an EOG prediction. Returns an empty vector if the model has no
+// MTP head or the buffer is unavailable.
+//
+// Consumers: both the standard speculative framework
+// (common_speculative_state_mtp::draft()) and the inline two-phase MTP
+// producer in tools/server/server-context.cpp use this helper. Extracted
+// to avoid drift between the two code paths and to put all chained-rollout
+// awareness in one place.
+llama_tokens common_mtp_read_drafts(llama_context * ctx_tgt, int k_max);

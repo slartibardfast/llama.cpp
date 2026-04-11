@@ -493,6 +493,7 @@ struct common_speculative_state_mtp : public common_speculative_state {
             llama_token id_last,
             llama_tokens & result) override {
         GGML_UNUSED(prompt_tgt);
+        GGML_UNUSED(id_last);
 
         // After a draft rejection, MTP logits are from the DRAFT position
         // (last in the [sampled, draft] batch), not from the sampled position.
@@ -504,35 +505,15 @@ struct common_speculative_state_mtp : public common_speculative_state {
             return;  // empty result = no draft = normal single-token decode
         }
 
-        const float * mtp_logits = llama_get_mtp_logits(ctx_tgt);
-        if (mtp_logits == nullptr) {
-            return;
+        // Pull up to n_max drafts from the target's chained-rollout MTP output.
+        // At chained rollout n > 1, this returns multiple lookahead drafts from
+        // a single main decode; at rollout = 1 (default), it returns one draft
+        // matching the previous single-argmax behaviour exactly.
+        const int k_max = std::max(1, params.n_max);
+        llama_tokens drafts = common_mtp_read_drafts(ctx_tgt, k_max);
+        for (llama_token t : drafts) {
+            result.push_back(t);
         }
-
-        // FastMTP: use reduced vocab size (e.g., 32K instead of 248K)
-        // Token IDs 0..mtp_n_vocab-1 map directly to full vocab IDs
-        const int64_t mtp_n_vocab = llama_get_mtp_n_vocab(ctx_tgt);
-        if (mtp_n_vocab <= 0) {
-            return;
-        }
-
-        // Argmax of MTP logits over reduced vocabulary
-        llama_token draft_token = 0;
-        float best_logit = mtp_logits[0];
-        for (int64_t i = 1; i < mtp_n_vocab; i++) {
-            if (mtp_logits[i] > best_logit) {
-                best_logit = mtp_logits[i];
-                draft_token = (llama_token)i;
-            }
-        }
-
-        const auto * vocab = llama_model_get_vocab(llama_get_model(ctx_tgt));
-        if (!llama_vocab_is_eog(vocab, draft_token)) {
-            result.push_back(draft_token);
-        }
-
-        GGML_UNUSED(id_last);
-        GGML_UNUSED(params);
     }
 
     void accept(uint16_t n_accepted) override {
@@ -1101,6 +1082,56 @@ void common_speculative_begin(common_speculative * spec, const llama_tokens & pr
         impl->begin(prompt);
         impl->n_call_begin++;
     }
+}
+
+llama_tokens common_mtp_read_drafts(llama_context * ctx_tgt, int k_max) {
+    llama_tokens result;
+
+    if (k_max <= 0) {
+        return result;
+    }
+
+    const float * mtp_logits = llama_get_mtp_logits(ctx_tgt);
+    if (mtp_logits == nullptr) {
+        return result;
+    }
+
+    const int64_t mtp_n_vocab  = llama_get_mtp_n_vocab(ctx_tgt);
+    const int64_t mtp_n_drafts = llama_get_mtp_n_drafts(ctx_tgt);
+    if (mtp_n_vocab <= 0 || mtp_n_drafts <= 0) {
+        return result;
+    }
+
+    // When the graph was built with chained rollout, the stacked tensor holds
+    // drafts for multiple output positions interleaved iteration-major. At
+    // single-token generation (the Plan A path) there is exactly one output
+    // position, so rows 0..n-1 correspond directly to rollout iterations
+    // 0..n-1, i.e. predictions for positions P+2, P+3, ..., P+n+1 given the
+    // last committed token at P+1. Pick up to k_max consecutive rows from row 0.
+    const auto * vocab = llama_model_get_vocab(llama_get_model(ctx_tgt));
+
+    const int64_t k = std::min<int64_t>(mtp_n_drafts, (int64_t)k_max);
+    result.reserve((size_t)k);
+
+    for (int64_t j = 0; j < k; j++) {
+        const float * row = mtp_logits + j * mtp_n_vocab;
+        llama_token best = 0;
+        float       best_logit = row[0];
+        for (int64_t i = 1; i < mtp_n_vocab; i++) {
+            if (row[i] > best_logit) {
+                best_logit = row[i];
+                best       = (llama_token)i;
+            }
+        }
+        // Don't propose EOG tokens as drafts — decoding them as input would
+        // immediately terminate the sequence on the verifier side.
+        if (llama_vocab_is_eog(vocab, best)) {
+            break;
+        }
+        result.push_back(best);
+    }
+
+    return result;
 }
 
 llama_tokens common_speculative_draft(
