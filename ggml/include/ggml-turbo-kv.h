@@ -164,6 +164,57 @@ void turbo_kv_4b_attention_multi(
     int                        head_dim,
     int                        k_stride_blocks);
 
+/* ============================================================
+ * Fused dequant + inverse-RHT + RoPE + dot attention kernel.
+ *
+ * Pre-RoPE K storage: K is stored quantized without RoPE. This kernel
+ * dequants each K position to f32, applies inverse RHT to recover the
+ * original (pre-RoPE) K vector, applies RoPE using the position-specific
+ * cos/sin cache, then dots with the (already-RoPE'd) query.
+ *
+ * The cos/sin cache is precomputed once per decode step for all positions
+ * (not per K position in the inner loop). Shape: [n_rot] per position,
+ * interleaved [cos0, sin0, cos1, sin1, ...].
+ *
+ * This kernel NEVER materializes the full K cache as f32 — it processes
+ * one K position at a time into a thread-local scratch buffer. This is
+ * the "fused kernel" approach from KVQuant/FlashQ/TurboAttention that
+ * the article identifies as essential for bandwidth savings.
+ *
+ * @param query_roped   Q vector with RoPE already applied (head_dim f32)
+ * @param kv_cache      First K block for position 0 in this head
+ * @param k_positions   Per-position absolute position indices [valid_count]
+ * @param rope_cos_sin  Precomputed [cos,sin] pairs per position per dim
+ *                      Layout: [valid_count][n_rot] interleaved cos/sin
+ *                      If NULL, skips RoPE (fallback to rotated-space dot)
+ * @param scores        Output scores [valid_count]
+ * @param valid_count   Number of K positions
+ * @param head_dim      Head dimension (256 for Qwen3.5)
+ * @param n_rot         Number of dimensions to rotate (64 for Qwen3.5)
+ * @param k_stride_blocks  Blocks between consecutive K positions
+ * ============================================================ */
+void turbo_kv_4b_attention_fused_rope(
+    const float              * query_roped,
+    const block_turbo_kv_4b  * kv_cache,
+    const float              * rope_cos_sin,
+    float                    * scores,
+    int                        valid_count,
+    int                        head_dim,
+    int                        n_rot,
+    int                        k_stride_blocks);
+
+/* Precompute cos/sin cache for a batch of positions.
+ * Output: [n_positions][n_rot] interleaved [cos0, sin0, cos1, sin1, ...].
+ * Each position gets n_rot floats (n_rot/2 pairs × 2 values).
+ * Uses the standard RoPE theta computation: theta_i = pos * freq_base^(-2i/n_rot).
+ * For M-RoPE: all dimensions use the same position (text-only model). */
+void turbo_kv_precompute_rope_cache(
+    float        * cache_out,
+    const int32_t * positions,
+    int             n_positions,
+    int             n_rot,
+    float           freq_base);
+
 #ifdef __cplusplus
 }
 #endif

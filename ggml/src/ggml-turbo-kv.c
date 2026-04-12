@@ -443,3 +443,90 @@ void ggml_vec_dot_turbo_kv_4b_f32(
 
     *s = total;
 }
+
+/* ============================================================
+ * Precompute cos/sin cache for on-the-fly RoPE in fused kernel.
+ *
+ * Output layout: cache_out[pos_idx * n_rot + i] where i is interleaved
+ * [cos0, sin0, cos1, sin1, ...] for n_rot/2 dimension pairs.
+ *
+ * Uses the standard RoPE formula: theta_i = pos * freq_base^(-2i/n_rot).
+ * For M-RoPE text-only: all sections use the same position.
+ * ============================================================ */
+void turbo_kv_precompute_rope_cache(
+    float        * cache_out,
+    const int32_t * positions,
+    int             n_positions,
+    int             n_rot,
+    float           freq_base)
+{
+    const float theta_scale = 1.0f / powf(freq_base, 2.0f / (float) n_rot);
+    for (int s = 0; s < n_positions; s++) {
+        const float pos = (float) positions[s];
+        float * row = cache_out + s * n_rot;
+        float theta = pos;
+        for (int i0 = 0; i0 < n_rot; i0 += 2) {
+            row[i0 + 0] = cosf(theta);
+            row[i0 + 1] = sinf(theta);
+            theta *= theta_scale;
+        }
+    }
+}
+
+/* ============================================================
+ * Fused dequant + inverse-RHT + RoPE + dot attention kernel.
+ *
+ * Per K position:
+ *   1. Dequant turbo_kv_4b blocks → f32 in RHT space
+ *   2. Inverse RHT → pre-RoPE K in original space
+ *   3. Apply RoPE from precomputed cos/sin cache
+ *   4. Dot with Q_roped → score
+ *
+ * Thread-local scratch: one head_dim-sized f32 buffer, never materializes
+ * the full K cache.
+ * ============================================================ */
+void turbo_kv_4b_attention_fused_rope(
+    const float              * query_roped,
+    const block_turbo_kv_4b  * kv_cache,
+    const float              * rope_cos_sin,
+    float                    * scores,
+    int                        valid_count,
+    int                        head_dim,
+    int                        n_rot,
+    int                        k_stride_blocks)
+{
+    const int n_blocks = head_dim / TURBO_KV_BLOCK_SIZE;
+    if (n_blocks <= 0 || n_blocks > 4) return;
+    if (k_stride_blocks <= 0) k_stride_blocks = n_blocks;
+
+    float k_scratch[4 * TURBO_KV_BLOCK_SIZE]; /* per-position scratch */
+
+    for (int s = 0; s < valid_count; s++) {
+        const block_turbo_kv_4b * k_row = &kv_cache[s * k_stride_blocks];
+
+        /* Step 1+2: Dequant + inverse RHT into k_scratch.
+         * dequantize_row_turbo_kv_4b handles: codebook lookup → inv_RHT → scale by norm */
+        dequantize_row_turbo_kv_4b(k_row, k_scratch, head_dim);
+
+        /* Step 3: Apply RoPE from precomputed cache.
+         * Rotates dimension pairs [i0, i0+1] using precomputed cos/sin. */
+        if (rope_cos_sin) {
+            const float * cs = rope_cos_sin + s * n_rot;
+            for (int i0 = 0; i0 < n_rot; i0 += 2) {
+                const float cos_t = cs[i0 + 0];
+                const float sin_t = cs[i0 + 1];
+                const float k0 = k_scratch[i0];
+                const float k1 = k_scratch[i0 + 1];
+                k_scratch[i0 + 0] = k0 * cos_t - k1 * sin_t;
+                k_scratch[i0 + 1] = k0 * sin_t + k1 * cos_t;
+            }
+        }
+
+        /* Step 4: Dot product with Q_roped */
+        float dot = 0.0f;
+        for (int i = 0; i < head_dim; i++) {
+            dot += query_roped[i] * k_scratch[i];
+        }
+        scores[s] = dot;
+    }
+}
