@@ -227,8 +227,16 @@ llama_kv_cache::llama_kv_cache(
         if (split_k) {
             const uint32_t n_rot      = hparams.n_rot(il);
             const uint32_t n_head_kv  = hparams.n_head_kv(il);
+            const uint32_t n_embd_head = hparams.n_embd_head_k(il);
             const uint32_t n_rot_gqa  = n_rot * n_head_kv;
             const uint32_t n_stat_gqa = n_embd_k_gqa - n_rot_gqa;
+
+            if (n_rot == 0 || n_rot == n_embd_head) {
+                throw std::runtime_error(
+                    "split K cache requires 0 < n_rot < n_embd_head_k, but layer " + std::to_string(il) +
+                    " has n_rot=" + std::to_string(n_rot) + ", n_embd_head_k=" + std::to_string(n_embd_head) +
+                    ". Use a single --cache-type-k instead.");
+            }
 
             k_rope_t   = ggml_new_tensor_3d(ctx, type_k,        n_rot_gqa,  kv_size, n_stream);
             k_static_t = ggml_new_tensor_3d(ctx, type_k_static, n_stat_gqa, kv_size, n_stream);

@@ -1863,7 +1863,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * sinks,
          ggml_tensor * v_mla,
                float   kq_scale,
-                 int   il) const {
+                 int   il,
+         ggml_tensor * kq_pre) const {
     const bool v_trans = v->nb[1] > v->nb[2];
 
     // split the batch into streams if needed
@@ -1877,7 +1878,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
     ggml_tensor * cur;
 
-    const bool use_flash_attn = cparams.flash_attn && kq_b == nullptr;
+    const bool use_flash_attn = cparams.flash_attn && kq_b == nullptr && kq_pre == nullptr;
     if (use_flash_attn) {
         GGML_ASSERT(kq_b == nullptr && "Flash attention does not support KQ bias yet");
 
@@ -1920,12 +1921,14 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
         cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
     } else {
-        ggml_tensor * kq = ggml_mul_mat(ctx0, k, q);
-        cb(kq, "kq", il);
-
-        // note: this op tends to require high floating point range
-        //       while for some models F16 is enough, for others it is not, so we default to F32 here
-        ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
+        ggml_tensor * kq;
+        if (kq_pre) {
+            kq = kq_pre;
+        } else {
+            kq = ggml_mul_mat(ctx0, k, q);
+            cb(kq, "kq", il);
+            ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
+        }
 
         if (arch == LLM_ARCH_GROK) {
             // need to do the following:
@@ -2174,26 +2177,18 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
     if (mctx_cur->is_split_k()) {
-        // Split K read path: get flat 3D views, dequant to f32, reshape to 4D, RoPE on rope, concat.
-        // The flat views avoid block-size alignment issues with quantized types.
-        const int64_t n_rot  = hparams.n_rot(il);
-        const int64_t n_stat = hparams.n_embd_head_k(il) - n_rot;
+        // Split attention: Q@K^T = Q_rope@K_rope^T + Q_static@K_static^T
+        // Eliminates the concat and (for block-aligned types) the K_static f32 cast.
+        const int64_t n_rot     = hparams.n_rot(il);
+        const int64_t n_stat    = hparams.n_embd_head_k(il) - n_rot;
         const int64_t n_head_kv = hparams.n_head_kv(il);
-        const uint32_t n_kv = mctx_cur->get_n_kv();
+        const uint32_t n_kv     = mctx_cur->get_n_kv();
 
-        // Get flat [n_rot_gqa, n_kv, ns] and [n_stat_gqa, n_kv, ns]
+        // --- K_rope: always cast to f32 (needed for RoPE) ---
         ggml_tensor * k_rope = mctx_cur->get_k_rope(ctx0, il);
-        ggml_tensor * k_stat = mctx_cur->get_k_static(ctx0, il);
-
-        // Dequant to f32 (block-aligned at the gqa level)
         k_rope = ggml_cast(ctx0, k_rope, GGML_TYPE_F32);
-        k_stat = ggml_cast(ctx0, k_stat, GGML_TYPE_F32);
-
-        // Reshape f32 tensors to 4D [n_rot, n_head_kv, n_kv, ns]
         k_rope = ggml_reshape_4d(ctx0, k_rope, n_rot, n_head_kv, n_kv, k_rope->ne[2]);
-        k_stat = ggml_reshape_4d(ctx0, k_stat, n_stat, n_head_kv, n_kv, k_stat->ne[2]);
 
-        // Apply RoPE to rope portion only
         int sections[4];
         std::copy(hparams.rope_sections.begin(), hparams.rope_sections.end(), sections);
         k_rope = ggml_rope_multi(ctx0, k_rope,
@@ -2205,9 +2200,74 @@ ggml_tensor * llm_graph_context::build_attn(
             cparams.yarn_beta_fast, cparams.yarn_beta_slow);
         cb(k_rope, "k_rope_on_the_fly", il);
 
-        // Concatenate [n_rot | n_stat] along head_dim (dimension 0)
-        k = ggml_concat(ctx0, k_rope, k_stat, 0);
-        cb(k, "k_split_concat", il);
+        // --- K_static: keep quantized if block-aligned, else cast to f32 ---
+        ggml_tensor * k_stat = mctx_cur->get_k_static(ctx0, il);
+        const ggml_type type_ks = mctx_cur->type_k_static();
+        const bool ks_block_aligned = (n_stat % ggml_blck_size(type_ks) == 0);
+
+        if (!ks_block_aligned) {
+            k_stat = ggml_cast(ctx0, k_stat, GGML_TYPE_F32);
+        }
+        k_stat = ggml_reshape_4d(ctx0, k_stat, n_stat, n_head_kv, n_kv, k_stat->ne[2]);
+        cb(k_stat, "k_stat_split", il);
+
+        // --- Permute K portions for attention: [dim, n_head_kv, n_kv, ns] → [dim, n_kv, n_head_kv, ns] ---
+        // Save un-permuted k_rope to pass to build_attn_mha for metadata (ne[3] = n_stream).
+        ggml_tensor * k_rope_orig = k_rope;
+        k_rope = ggml_permute(ctx0, k_rope, 0, 2, 1, 3);
+        k_stat = ggml_permute(ctx0, k_stat, 0, 2, 1, 3);
+
+        // --- Permute and split Q along head_dim ---
+        const int64_t ns = k_rope->ne[3];
+        ggml_tensor * q_perm = ggml_view_4d(ctx0, q,
+            q->ne[0], q->ne[1], q->ne[2]/ns, ns,
+            q->nb[1], q->nb[2], q->nb[3]/ns, 0);
+        q_perm = ggml_permute(ctx0, q_perm, 0, 2, 1, 3);
+        // q_perm: [head_dim, n_tokens, n_heads, ns]
+
+        ggml_tensor * q_rope = ggml_view_4d(ctx0, q_perm,
+            n_rot, q_perm->ne[1], q_perm->ne[2], q_perm->ne[3],
+            q_perm->nb[1], q_perm->nb[2], q_perm->nb[3], 0);
+
+        ggml_tensor * q_stat = ggml_view_4d(ctx0, q_perm,
+            n_stat, q_perm->ne[1], q_perm->ne[2], q_perm->ne[3],
+            q_perm->nb[1], q_perm->nb[2], q_perm->nb[3],
+            n_rot * ggml_element_size(q_perm));
+
+        // --- Two mul_mats + add ---
+        ggml_tensor * kq_rope = ggml_mul_mat(ctx0, k_rope, q_rope);
+        ggml_mul_mat_set_prec(kq_rope, GGML_PREC_F32);
+        cb(kq_rope, "kq_rope", il);
+
+        ggml_tensor * kq_stat = ggml_mul_mat(ctx0, k_stat, q_stat);
+        ggml_mul_mat_set_prec(kq_stat, GGML_PREC_F32);
+        cb(kq_stat, "kq_stat", il);
+
+        ggml_tensor * kq = ggml_add(ctx0, kq_rope, kq_stat);
+        cb(kq, "kq_split", il);
+
+        // Pass pre-computed kq to build_attn_mha (skips its internal mul_mat).
+        // k_rope_orig (un-permuted) passed for n_stream metadata only.
+        ggml_tensor * cur_attn = build_attn_mha(q, k_rope_orig,
+            v, kq_b, kq_mask, sinks, v_mla, kq_scale, il, kq);
+        cb(cur_attn, "kqv_out", il);
+
+        if (inp->self_v_rot) {
+            cur_attn = ggml_mul_mat_aux(ctx0, cur_attn, inp->self_v_rot);
+        }
+
+        if (wo) {
+            cur_attn = build_lora_mm(wo, cur_attn);
+            if (arch == LLM_ARCH_GLM4 || arch == LLM_ARCH_GLM4_MOE || arch == LLM_ARCH_JAIS2) {
+                ggml_mul_mat_set_prec(cur_attn, GGML_PREC_F32);
+            }
+        }
+
+        if (wo_b) {
+            cur_attn = ggml_add(ctx0, cur_attn, wo_b);
+        }
+
+        return cur_attn;
     } else {
         k = mctx_cur->get_k(ctx0, il);
 
