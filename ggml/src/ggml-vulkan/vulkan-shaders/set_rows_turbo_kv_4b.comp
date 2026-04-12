@@ -56,8 +56,8 @@ void main() {
     const uint dst_row = data_b[src_row];
 #endif
 
-    // Read source data: flat addressing, same as CPY
-    const uint src_base = src_row * p.ne00 + blk_in_row * QUANT_K_TURBO_KV_4B;
+    // Read source data: use nb01 stride (handles non-contiguous views)
+    const uint src_base = src_row * p.nb01 + blk_in_row * QUANT_K_TURBO_KV_4B;
     float val0 = data_a[src_base + tid];
     float val1 = data_a[src_base + tid + 64];
 

@@ -37,7 +37,9 @@ layout (binding = 0) readonly buffer A {float data_a[];};
 layout (binding = 1) writeonly buffer D {block_turbo_kv_4b data_b[];};
 
 void main() {
-    const uint block_id = gl_WorkGroupID.x;
+    const uint block_id = gl_WorkGroupID.z * gl_NumWorkGroups.y * gl_NumWorkGroups.x
+                        + gl_WorkGroupID.y * gl_NumWorkGroups.x
+                        + gl_WorkGroupID.x;
     if (block_id >= p.ne / QUANT_K_TURBO_KV_4B) return;
 
     const uint tid = gl_SubgroupInvocationID;

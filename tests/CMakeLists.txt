@@ -265,6 +265,9 @@ target_link_libraries(test-turbo-kv-gpu-roundtrip PRIVATE ggml-base ggml)
 add_executable(test-turbo-kv-gpu-quantize test-turbo-kv-gpu-quantize.cpp)
 target_link_libraries(test-turbo-kv-gpu-quantize PRIVATE ggml-base ggml)
 
+add_executable(test-turbo-kv-set-rows test-turbo-kv-set-rows.cpp)
+target_link_libraries(test-turbo-kv-set-rows PRIVATE ggml-base ggml)
+
 add_executable(test-turbo-kv-4b-attn test-turbo-kv-4b-attn.cpp)
 target_link_libraries(test-turbo-kv-4b-attn PRIVATE ggml-base)
 

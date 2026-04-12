@@ -32,7 +32,10 @@ layout (binding = 0) readonly buffer A {block_turbo_kv_4b data_a[];};
 layout (binding = 1) writeonly buffer D {D_TYPE data_b[];};
 
 void main() {
-    const uint block_id = gl_WorkGroupID.x;
+    // Reconstruct flat block ID from 3D dispatch grid (grid capped at 512 per dim)
+    const uint block_id = gl_WorkGroupID.z * gl_NumWorkGroups.y * gl_NumWorkGroups.x
+                        + gl_WorkGroupID.y * gl_NumWorkGroups.x
+                        + gl_WorkGroupID.x;
     if (block_id >= p.ne / QUANT_K_TURBO_KV_4B) return;
 
     const uint tid = gl_SubgroupInvocationID;
