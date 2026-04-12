@@ -587,6 +587,10 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
         mctx->get_attn()->set_input_v_rot(inp_attn->self_v_rot);
     }
 
+    if (inp_attn->self_k_pos) {
+        mctx->get_attn()->set_input_k_pos(inp_attn->self_k_pos);
+    }
+
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
     if (inp_rs->s_copy) {
@@ -2200,14 +2204,11 @@ ggml_tensor * llm_graph_context::build_attn(
             cparams.yarn_beta_fast, cparams.yarn_beta_slow);
         cb(k_rope, "k_rope_on_the_fly", il);
 
-        // --- K_static: keep quantized if block-aligned, else cast to f32 ---
+        // --- K_static: cast to f32, reshape to 4D ---
+        // (Quantized tensors can't be permuted — permute breaks block boundaries.
+        // The split attention still wins because it eliminates the concat.)
         ggml_tensor * k_stat = mctx_cur->get_k_static(ctx0, il);
-        const ggml_type type_ks = mctx_cur->type_k_static();
-        const bool ks_block_aligned = (n_stat % ggml_blck_size(type_ks) == 0);
-
-        if (!ks_block_aligned) {
-            k_stat = ggml_cast(ctx0, k_stat, GGML_TYPE_F32);
-        }
+        k_stat = ggml_cast(ctx0, k_stat, GGML_TYPE_F32);
         k_stat = ggml_reshape_4d(ctx0, k_stat, n_stat, n_head_kv, n_kv, k_stat->ne[2]);
         cb(k_stat, "k_stat_split", il);
 

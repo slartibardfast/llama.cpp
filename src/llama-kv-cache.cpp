@@ -1850,18 +1850,18 @@ void llama_kv_cache::set_input_k_pos(ggml_tensor * dst, const slot_info & sinfo)
 
     int32_t * data = (int32_t *) dst->data;
     const auto & cells = v_cells[sinfo.s0];
-    // dst shape is [n_kv * 4] for M-RoPE. Each token gets 4 identical
-    // position indices (all sections use the same position for text-only
-    // models; vision models would differ). This matches the inp_pos layout
-    // used by ggml_rope_multi in the model's forward pass.
+    // dst shape is [n_kv * 4] for M-RoPE. ggml_rope_multi indexes positions
+    // as pos[i2 + ne2 * section], i.e. STRIDED layout:
+    //   [pos0_s0, pos1_s0, ..., posN_s0, pos0_s1, pos1_s1, ..., posN_s1, ...]
+    // NOT interleaved [pos0_s0, pos0_s1, pos0_s2, pos0_s3, pos1_s0, ...].
     const uint32_t n_kv = (uint32_t) (dst->ne[0] / 4);
 
     for (uint32_t i = 0; i < n_kv; ++i) {
         const int32_t pos = cells.is_empty(i) ? 0 : (int32_t) cells.pos_get(i);
-        data[i*4 + 0] = pos;
-        data[i*4 + 1] = pos;
-        data[i*4 + 2] = pos;
-        data[i*4 + 3] = pos;
+        data[i + n_kv * 0] = pos;
+        data[i + n_kv * 1] = pos;
+        data[i + n_kv * 2] = pos;
+        data[i + n_kv * 3] = 0;   // section 3 is unused padding (matches inp_pos layout)
     }
 }
 
