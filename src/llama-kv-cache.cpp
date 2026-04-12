@@ -94,6 +94,17 @@ llama_kv_cache::llama_kv_cache(
     model(model), hparams(model.hparams), v_trans(v_trans), type_k_static_(type_k_static),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type) {
 
+    // Block-quantized V types can't use the transposed layout: the scatter-write
+    // reshapes to [1, N] (violates blck_size alignment), and the transposed read
+    // cuts across block boundaries (dequant would read partial blocks). Force
+    // non-transposed, which uses the standard row-wise write + transpose at
+    // attention time via ggml_cont(ggml_transpose(v)).
+    if (this->v_trans && type_v == GGML_TYPE_TURBO_KV_4B) {
+        LLAMA_LOG_INFO("%s: forcing v_trans=false for %s V cache (block-quantized)\n",
+                __func__, ggml_type_name(type_v));
+        this->v_trans = false;
+    }
+
     GGML_ASSERT(kv_size % n_pad == 0);
 
     const uint32_t n_layer_kv = hparams.n_layer_kv();
