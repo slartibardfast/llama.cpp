@@ -259,6 +259,8 @@ target_link_libraries(test-turbo-kv-rht PRIVATE ggml-base)
 add_executable(test-turbo-kv-4b-attn test-turbo-kv-4b-attn.cpp)
 target_link_libraries(test-turbo-kv-4b-attn PRIVATE ggml-base)
 
+add_executable(test-split-k-attention test-split-k-attention.cpp)
+
 if (NOT GGML_BACKEND_DL)
     # these tests use the backends directly and cannot be built with dynamic loading
     llama_build_and_test(test-barrier.cpp)
