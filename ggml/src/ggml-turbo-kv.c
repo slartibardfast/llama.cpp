@@ -24,6 +24,10 @@
 
 #include <math.h>
 #include <string.h>
+
+#ifdef __SSE4_1__
+#include <smmintrin.h>
+#endif
 #include <float.h>
 
 /* ============================================================
@@ -73,6 +77,43 @@ static void walsh_hadamard(float * data, int n) {
     }
 }
 
+#ifdef __SSE4_1__
+/* SSE4.1 Walsh-Hadamard butterfly. n must be power of 2, >= 4.
+ *
+ * Stage 1 (stride 1): [u0,v0,u1,v1] -> [u0+v0, u0-v0, u1+v1, u1-v1]
+ *   hadd/hsub give horizontal add/sub, unpacklo interleaves them.
+ *
+ * Stage 2 (stride 2): [a,b,c,d] -> [a+c, b+d, a-c, b-d]
+ *   movelh/movehl split low/high halves, add/sub, shuffle to recombine.
+ *
+ * Stage 3+ (stride >= 4): contiguous 4-wide load, add, sub, store. */
+static void walsh_hadamard_sse(float * data, int n) {
+    for (int i = 0; i < n; i += 4) {
+        __m128 a = _mm_loadu_ps(&data[i]);
+        _mm_storeu_ps(&data[i], _mm_unpacklo_ps(_mm_hadd_ps(a, a),
+                                                 _mm_hsub_ps(a, a)));
+    }
+    for (int i = 0; i < n; i += 4) {
+        __m128 a  = _mm_loadu_ps(&data[i]);
+        __m128 lo = _mm_movelh_ps(a, a);
+        __m128 hi = _mm_movehl_ps(a, a);
+        _mm_storeu_ps(&data[i], _mm_shuffle_ps(_mm_add_ps(lo, hi),
+                                                _mm_sub_ps(lo, hi),
+                                                _MM_SHUFFLE(1, 0, 1, 0)));
+    }
+    for (int len = 4; len < n; len <<= 1) {
+        for (int i = 0; i < n; i += (len << 1)) {
+            for (int j = 0; j < len; j += 4) {
+                __m128 u = _mm_loadu_ps(&data[i + j]);
+                __m128 v = _mm_loadu_ps(&data[i + j + len]);
+                _mm_storeu_ps(&data[i + j],       _mm_add_ps(u, v));
+                _mm_storeu_ps(&data[i + j + len], _mm_sub_ps(u, v));
+            }
+        }
+    }
+}
+#endif
+
 /* Round n down to the nearest power of 2 (n2 <= n, n2 is a power of 2). */
 static inline int turbo_kv_pow2_floor(int n) {
     int n2 = 1;
@@ -84,15 +125,29 @@ void turbo_kv_rht_forward(float * data, int n, uint32_t seed) {
     if (!data || n <= 0) return;
     const int n2 = turbo_kv_pow2_floor(n);
 
-    /* Step 1: random sign flip */
+#ifdef __SSE4_1__
+    /* Vectorized sign flip + scale: XOR sign bits, mul by 1/sqrt(n2) */
+    if (n2 >= 4) {
+        for (int i = 0; i < n2; i += 4) {
+            __m128 d = _mm_loadu_ps(&data[i]);
+            uint32_t smask[4] __attribute__((aligned(16)));
+            for (int k = 0; k < 4; k++) {
+                smask[k] = turbo_kv_random_sign(seed, i+k) < 0 ? 0x80000000u : 0;
+            }
+            _mm_storeu_ps(&data[i], _mm_xor_ps(d, _mm_load_ps((const float*)smask)));
+        }
+        walsh_hadamard_sse(data, n2);
+        const __m128 vscale = _mm_set1_ps(1.0f / sqrtf((float) n2));
+        for (int i = 0; i < n2; i += 4) {
+            _mm_storeu_ps(&data[i], _mm_mul_ps(_mm_loadu_ps(&data[i]), vscale));
+        }
+        return;
+    }
+#endif
     for (int i = 0; i < n2; i++) {
         data[i] *= (float) turbo_kv_random_sign(seed, i);
     }
-
-    /* Step 2: Walsh-Hadamard butterfly */
     walsh_hadamard(data, n2);
-
-    /* Step 3: normalize by 1/sqrt(n2) */
     const float scale = 1.0f / sqrtf((float) n2);
     for (int i = 0; i < n2; i++) {
         data[i] *= scale;
@@ -103,7 +158,24 @@ void turbo_kv_rht_inverse(float * data, int n, uint32_t seed) {
     if (!data || n <= 0) return;
     const int n2 = turbo_kv_pow2_floor(n);
 
-    /* Inverse: scale, butterfly, sign-flip (reverse order of forward) */
+#ifdef __SSE4_1__
+    if (n2 >= 4) {
+        const __m128 vscale = _mm_set1_ps(1.0f / sqrtf((float) n2));
+        for (int i = 0; i < n2; i += 4) {
+            _mm_storeu_ps(&data[i], _mm_mul_ps(_mm_loadu_ps(&data[i]), vscale));
+        }
+        walsh_hadamard_sse(data, n2);
+        for (int i = 0; i < n2; i += 4) {
+            __m128 d = _mm_loadu_ps(&data[i]);
+            uint32_t smask[4] __attribute__((aligned(16)));
+            for (int k = 0; k < 4; k++) {
+                smask[k] = turbo_kv_random_sign(seed, i+k) < 0 ? 0x80000000u : 0;
+            }
+            _mm_storeu_ps(&data[i], _mm_xor_ps(d, _mm_load_ps((const float*)smask)));
+        }
+        return;
+    }
+#endif
     const float scale = 1.0f / sqrtf((float) n2);
     for (int i = 0; i < n2; i++) {
         data[i] *= scale;
