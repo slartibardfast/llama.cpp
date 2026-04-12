@@ -179,18 +179,25 @@ ggml_tensor * llm_build_qwen35moe ::build_layer_attn(
 
     Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
 
-    // Apply IMRoPE
+    // Apply IMRoPE to Q (always)
     Qcur = ggml_rope_multi(
             ctx0, Qcur, inp_pos, nullptr,
             n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
             ext_factor, attn_factor, beta_fast, beta_slow
             );
 
-    Kcur = ggml_rope_multi(
-            ctx0, Kcur, inp_pos, nullptr,
-            n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
-            ext_factor, attn_factor, beta_fast, beta_slow
-            );
+    // Apply IMRoPE to K — SKIP for pre-RoPE K cache types (turbo_kv_4b).
+    // Pre-RoPE stores K without position encoding; RoPE is applied on-the-fly
+    // at attention time using per-cell positions from the KV cache. This
+    // preserves channel-wise outlier structure for better quantization
+    // (KVQuant NeurIPS 2024 finding).
+    if (!inp->self_k_pos) {
+        Kcur = ggml_rope_multi(
+                ctx0, Kcur, inp_pos, nullptr,
+                n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
+                ext_factor, attn_factor, beta_fast, beta_slow
+                );
+    }
 
     cb(Qcur, "Qcur", il);
     cb(Kcur, "Kcur", il);
@@ -460,6 +467,19 @@ void llm_build_qwen35moe::build_mtp_head(
 
     const int n_transformer_layers = n_layer - hparams.nextn_predict_layers;
 
+    // Plan A Phase 2: chained MTP rollout count. Default 1 keeps existing behavior;
+    // set LLAMA_MTP_ROLLOUT=N to produce N stacked draft logits from one main decode,
+    // each iteration reusing the SAME MTP layer weights with the previous iteration's
+    // argmax as the new greedy-token input. Quality degrades past k=1 because the
+    // head isn't trained for multi-step rollout — measured via acceptance-rate sweep.
+    uint32_t n_draft_rollout = hparams.nextn_predict_layers;
+    if (const char * e = std::getenv("LLAMA_MTP_ROLLOUT")) {
+        const int v = std::atoi(e);
+        if (v > 0) {
+            n_draft_rollout = (uint32_t)v;
+        }
+    }
+
     // Use unfiltered hidden state for MTP (needs all batch tokens for attention KV cache)
     ggml_tensor * hidden_state = mtp_inp_hidden ? mtp_inp_hidden : res->t_embd;
     GGML_ASSERT(hidden_state != nullptr);
@@ -482,8 +502,16 @@ void llm_build_qwen35moe::build_mtp_head(
 
     ggml_tensor * mtp_hidden = hidden_state;
 
-    for (uint32_t k = 0; k < hparams.nextn_predict_layers; ++k) {
-        const int il = n_transformer_layers + k;
+    // Collect per-iteration MTP logits for chained rollout. For k=1 this has a single
+    // element and we assign it directly; for k>1 we concat along the n_tokens axis
+    // to produce a [n_vocab_mtp, k] stacked draft tensor.
+    std::vector<ggml_tensor *> rollout_logits;
+    rollout_logits.reserve(n_draft_rollout);
+
+    for (uint32_t k = 0; k < n_draft_rollout; ++k) {
+        // Chained rollout reuses the SAME MTP layer weights across iterations
+        // (there's only 1 physical MTP block per Qwen3.5 model).
+        const int il = n_transformer_layers;
         const auto & layer = model.layers[il];
 
         if (layer.nextn.eh_proj == nullptr) {
@@ -561,16 +589,32 @@ void llm_build_qwen35moe::build_mtp_head(
         ggml_tensor * mtp_logits = build_lora_mm(lm_head_reduced, mtp_normed);
         cb(mtp_logits, "mtp_logits", il);
 
-        // Store MTP outputs in graph result
-        res->t_embd_mtp   = mtp_hidden;
-        res->t_logits_mtp = mtp_logits;
+        // Store this iteration's logits into the rollout stack.
+        // t_embd_mtp keeps the most-recent hidden state (end-of-loop value).
+        rollout_logits.push_back(mtp_logits);
+        res->t_embd_mtp = mtp_hidden;
 
-        // For recursive MTP (multiple layers), feed greedy tokens forward
-        if (k + 1 < hparams.nextn_predict_layers) {
+        // For chained rollout, feed this iteration's argmax forward as the
+        // next iteration's greedy-token input.
+        if (k + 1 < n_draft_rollout) {
             greedy_tokens = ggml_argmax(ctx0, mtp_logits);
             cb(greedy_tokens, "mtp_greedy_next", il);
         }
 
         ggml_build_forward_expand(gf, mtp_logits);
+    }
+
+    // Stack collected rollout logits into a single [n_vocab_mtp, k * n_tokens] tensor.
+    // Consumers of llama_get_mtp_logits() know to stride by n_vocab_mtp to iterate drafts.
+    if (rollout_logits.size() == 1) {
+        res->t_logits_mtp = rollout_logits[0];
+    } else if (rollout_logits.size() > 1) {
+        ggml_tensor * stacked = rollout_logits[0];
+        for (size_t i = 1; i < rollout_logits.size(); i++) {
+            stacked = ggml_concat(ctx0, stacked, rollout_logits[i], 1);
+        }
+        cb(stacked, "mtp_logits_stacked", -1);
+        res->t_logits_mtp = stacked;
+        ggml_build_forward_expand(gf, stacked);
     }
 }

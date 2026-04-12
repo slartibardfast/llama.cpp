@@ -207,6 +207,7 @@ typedef pthread_t ggml_thread_t;
 #endif
 
 #include "ggml-turbo-quant.h"
+#include "ggml-turbo-kv.h"
 
 /* Layer 1 of the systematic shimming architecture: hand-rolled SSE4.1
  * implementations of AVX / AVX2 / F16C intrinsics for Westmere-class
@@ -239,6 +240,36 @@ static void ggml_vec_dot_tq_kv_1b_f32(int n, float * GGML_RESTRICT s, size_t bs,
                              (const block_tq_kv_1b *) vx,
                              s, /*seq_len=*/1, /*head_dim=*/n,
                              /*k_stride_blocks=*/0);
+}
+
+/* SSSE3 turbo_kv_4b inner kernel. Header is self-contained and guarded by
+ * __SSE4_1__/__SSSE3__; on Westmere or newer x86 with -march=native we get
+ * the fast path, otherwise this file's cpu trait for TURBO_KV_4B falls back
+ * to the scalar ggml_vec_dot_turbo_kv_4b_f32 from ggml-base. */
+#if defined(GGML_CPU_HAVE_DOWNLEVEL_X86)
+#include "arch/x86/turbo_kv_4b_sse.h"
+#endif
+
+static void ggml_vec_dot_turbo_kv_4b_f32_cpu(
+    int n, float * GGML_RESTRICT s, size_t bs,
+    const void * GGML_RESTRICT vx, size_t bx,
+    const void * GGML_RESTRICT vy, size_t by, int nrc)
+{
+    GGML_UNUSED(bs); GGML_UNUSED(bx); GGML_UNUSED(by); GGML_UNUSED(nrc);
+
+    /* Delegate to the batched kernel with valid_count=1. The batched kernel
+     * rotates Q once per call — for the vec_dot path this is one rotation
+     * per K position (same overhead as before). But when the FA special
+     * case in ops.cpp calls turbo_kv_4b_attention_multi directly with
+     * valid_count=N, the rotation runs once per thread per head, not once
+     * per K position. So this wrapper is a correct fallback, not the hot path. */
+    turbo_kv_4b_attention_multi(
+        (const float *) vy,
+        (const block_turbo_kv_4b *) vx,
+        s,
+        /*valid_count=*/1,
+        /*head_dim=*/n,
+        /*k_stride_blocks=*/0);
 }
 
 static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
@@ -332,6 +363,19 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
          * can write into the cache during prompt processing. */
         .from_float               = (ggml_from_float_t) quantize_row_tq_v_4b_ref,
         .vec_dot                  = NULL,
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_TURBO_KV_4B] = {
+        /* Real TurboQuant (quantumaikr/quant.cpp v0.8.0 port). Unlike TQ_V_4B,
+         * turbo_kv_4b registers a real vec_dot so it works with both the
+         * flash attention kq_vec_dot path AND the explicit mul_mat fallback
+         * (-fa off). The cpu wrapper dispatches to the SSSE3 pshufb kernel
+         * on Westmere+ and to the scalar ggml-base reference elsewhere.
+         *
+         * turbo_kv_4b_attention_multi handles Q rotation internally. */
+        .from_float               = (ggml_from_float_t) quantize_row_turbo_kv_4b_ref,
+        .vec_dot                  = ggml_vec_dot_turbo_kv_4b_f32_cpu,
         .vec_dot_type             = GGML_TYPE_F32,
         .nrows                    = 1,
     },
@@ -3130,7 +3174,8 @@ struct ggml_cplan ggml_graph_plan(
                         // When split-KV is active (which now admits TQ_KV_1B),
                         // the partials buffer follows AFTER this TQ scratch —
                         // see partials_offset in the split-KV path of ops.cpp.
-                        if (node->src[1]->type == GGML_TYPE_TQ_KV_1B) {
+                        if (node->src[1]->type == GGML_TYPE_TQ_KV_1B ||
+                            node->src[1]->type == GGML_TYPE_TURBO_KV_4B) {
                             const size_t cache_line_f32 = CACHE_LINE_SIZE/sizeof(float);
                             const size_t tq_stride = ((nek1 + cache_line_f32 - 1) / cache_line_f32) * cache_line_f32;
                             cur += sizeof(float) * (size_t) n_tasks * tq_stride;

@@ -7,6 +7,7 @@
 #include "simd-gemm.h"
 #include "ggml.h"
 #include "ggml-turbo-quant.h"
+#include "ggml-turbo-kv.h"
 #include "unary-ops.h"
 #include "vec.h"
 
@@ -8304,9 +8305,34 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     // separate per-position loop below.
     const bool   use_tq_kv_1b    = (k->type == GGML_TYPE_TQ_KV_1B);
     const bool   use_tq_kv_fused = use_tq_kv_1b && (v->type == GGML_TYPE_TQ_V_4B);
+    // TURBO_KV_4B batched FA path: DISABLED pending investigation of wdata
+    // layout collision during prompt eval. The one_chunk function fires for
+    // both PP (multi-token Q, non-tiled since K is quantized) and decode
+    // (single-token Q). During PP, the per-thread score buffer at offset
+    // nth*fa_scratch_str may collide with the tiled/split-KV scratch region.
+    // The batched kernel (turbo_kv_4b_attention_multi) is correct — 17/17
+    // test fixture pass, short-prompt smoke test at 2.67 t/s — but tool-call
+    // prompts with ~300+ context tokens produce garbage scores.
+    //
+    // The non-FA vec_dot path (FA off, per-call) works correctly at all
+    // context lengths (12/12 tool-call battery pass). Use that for now.
+    //
+    // TODO: fix the wdata offset calculation to match the actual FA scratch
+    // layout for the non-tiled, non-split-KV path (which is what fires when
+    // K is quantized and neq1 > 1).
+    // Batched turbo_kv_4b: only in single-token generation (N==1).
+    // During PP (N>1), the non-tiled one_chunk path processes N Q rows
+    // sequentially per thread. The batched kernel is correct per-row but
+    // something in the multi-token one_chunk data path produces wrong
+    // attention scores at scale. Guard to N==1 for safety; PP falls back
+    // to per-call vec_dot (slow rotation, correct output).
+    const bool   use_turbo_kv_4b = (k->type == GGML_TYPE_TURBO_KV_4B) && !write_partials;
+    // Both TQ_KV_1B and TURBO_KV_4B need per-thread score scratch buffers.
+    // The allocation pattern is identical: ceil(nek1 / cache_line) * cache_line floats per thread.
+    const bool   need_batched_buf = use_tq_kv_1b || use_turbo_kv_4b;
     const size_t fa_scratch_str = (size_t)(1*DK + 2*DV + CACHE_LINE_SIZE_F32);
     const size_t tq_thread_str  = ((nek1 + CACHE_LINE_SIZE_F32 - 1) / CACHE_LINE_SIZE_F32) * CACHE_LINE_SIZE_F32;
-    float * const tq_thread_buf = use_tq_kv_1b
+    float * const tq_thread_buf = need_batched_buf
         ? ((float *) params->wdata + (size_t) params->nth * fa_scratch_str + (size_t) ith * tq_thread_str)
         : nullptr;
 
@@ -8390,6 +8416,45 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
             }
         }
 
+        // TURBO_KV_4B batched attention: same pattern as TQ_KV_1B above.
+        // Rotate Q once, loop over all K positions, write scores to per-thread buffer.
+        if (use_turbo_kv_4b) {
+            int64_t valid_end = ic_end;
+            if (mp) {
+                for (int64_t ic = ic_start; ic < ic_end; ++ic) {
+                    if (GGML_CPU_FP16_TO_FP32(mp[ic]) == -INFINITY) {
+                        valid_end = ic;
+                        break;
+                    }
+                }
+            }
+            const int64_t valid_run = valid_end - ic_start;
+            if (valid_run > 0) {
+                const block_turbo_kv_4b * k_blocks = (const block_turbo_kv_4b *)
+                    (k_data_local + ic_start*nbk1 + ik2*nbk2 + ik3*nbk3);
+                turbo_kv_4b_attention_multi(pq, k_blocks, tq_thread_buf,
+                    (int) valid_run, (int) DK,
+                    (int)(nbk1 / sizeof(block_turbo_kv_4b)));
+
+                // DEBUG: validate first 3 scores against per-call vec_dot
+                static int dbg_count = 0;
+                if (dbg_count < 3) {
+                    for (int64_t s = 0; s < std::min(valid_run, (int64_t)3); s++) {
+                        float ref_score = 0.0f;
+                        const char * k_pos = k_data_local + (ic_start + s)*nbk1 + ik2*nbk2 + ik3*nbk3;
+                        kq_vec_dot(DK, &ref_score, 0, k_pos, 0, Q_q, 0, 1);
+                        float batched_score = tq_thread_buf[s];
+                        float err = fabsf(ref_score - batched_score);
+                        if (err > 1e-3f) {
+                            fprintf(stderr, "[TURBO_KV_4B_DEBUG] MISMATCH s=%lld ref=%.6f batched=%.6f err=%.6f valid_run=%lld DK=%lld iq1=%d iq2=%d ith=%d\n",
+                                    (long long)s, ref_score, batched_score, err, (long long)valid_run, (long long)DK, iq1, iq2, ith);
+                        }
+                    }
+                    dbg_count++;
+                }
+            }
+        }
+
         // online softmax / attention
         // loop over n_kv and n_head_kv
         // ref: https://arxiv.org/pdf/2112.05682.pdf
@@ -8403,7 +8468,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
 
             float s; // KQ value
 
-            if (use_tq_kv_1b) {
+            if (use_tq_kv_1b || use_turbo_kv_4b) {
                 s = tq_thread_buf[ic - ic_start];
             } else {
                 const char * k_data = k_data_local + ( ic*nbk1 + ik2*nbk2 + ik3*nbk3);
@@ -8965,7 +9030,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
         // When TQ_KV_1B K is active, the per-thread score scratch lives
         // right after the per-thread Q/VKQ scratch. Partials must follow
         // BOTH to avoid collision.
-        if (k->type == GGML_TYPE_TQ_KV_1B) {
+        if (k->type == GGML_TYPE_TQ_KV_1B || k->type == GGML_TYPE_TURBO_KV_4B) {
             const size_t tq_stride = ((nek1 + CACHE_LINE_SIZE_F32 - 1) / CACHE_LINE_SIZE_F32) * CACHE_LINE_SIZE_F32;
             partials_offset += (size_t) nth * tq_stride;
         }

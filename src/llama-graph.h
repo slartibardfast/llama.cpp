@@ -312,6 +312,11 @@ public:
     ggml_tensor * self_k_rot = nullptr;
     ggml_tensor * self_v_rot = nullptr;
 
+    // Pre-RoPE K storage: per-cell position indices for on-the-fly RoPE.
+    // Non-null only when K cache type uses pre-RoPE storage (e.g. turbo_kv_4b).
+    // Shape: I32 [n_kv * n_stream]. Populated by set_input with pos_get(i).
+    ggml_tensor * self_k_pos = nullptr;
+
     // note: these have to be copies because in order to be able to reuse a graph, its inputs
     //       need to carry these parameters with them. otherwise, they can point to freed
     //       llm_graph_params from a previous batch, causing stack-use-after-return
@@ -888,7 +893,8 @@ struct llm_graph_context {
             ggml_tensor * sinks,   // [n_head_q]
             ggml_tensor * v_mla,   // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
                   float   kq_scale,
-                    int   il) const;
+                    int   il,
+            ggml_tensor * kq_pre = nullptr) const; // pre-computed Q@K^T scores (split attention)
 
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 

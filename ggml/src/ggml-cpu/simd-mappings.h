@@ -18,6 +18,18 @@
 #include <riscv_vector.h>
 #endif
 
+/* Layer 1 of the systematic shimming architecture: register-resident
+ * SSE4.1 fp16->fp32 conversion for Westmere-class x86 (SSE4.1 + POPCNT,
+ * no F16C). The SSE f16 vector-load macros below route through
+ * ggml_x86_cvtph_ps so the hot ggml_vec_dot_f16 kernel stops
+ * hammering the 256KB ggml_table_f32_f16 lookup table with
+ * stack-spilled scalar conversions. See arch/x86/downlevel.h for
+ * the algorithm and provenance. */
+#if defined(__SSE4_1__) && !defined(__F16C__) && !defined(__ARM_NEON) && !defined(__AVX__)
+#include "arch/x86/downlevel.h"
+#define GGML_SIMD_MAPPINGS_HAVE_X86_DOWNLEVEL 1
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -941,6 +953,15 @@ inline static void __wasm_f16x4_store(ggml_fp16_t * p, v128_t x) {
 #define GGML_F16_EPR  4
 
 static inline __m128 __sse_f16x4_load(const ggml_fp16_t * x) {
+#if defined(GGML_SIMD_MAPPINGS_HAVE_X86_DOWNLEVEL)
+    /* Register-resident path: one aligned-free 8-byte load, then
+     * Giesen's half_to_float_SSE2 (~19 SSE2 instructions, no memory
+     * traffic except the initial load, no LUT, no stack bounce).
+     * Replaces 4× ggml_table_f32_f16 L2 lookups + 4× scalar stores
+     * + reload, which was ~45% of ggml_vec_dot_f16 self time on
+     * Westmere per perf profile. */
+    return ggml_x86_cvtph_ps(_mm_loadl_epi64((const __m128i *) x));
+#else
     float tmp[4];
 
     tmp[0] = GGML_CPU_FP16_TO_FP32(x[0]);
@@ -949,6 +970,7 @@ static inline __m128 __sse_f16x4_load(const ggml_fp16_t * x) {
     tmp[3] = GGML_CPU_FP16_TO_FP32(x[3]);
 
     return _mm_loadu_ps(tmp);
+#endif
 }
 
 static inline void __sse_f16x4_store(ggml_fp16_t * x, __m128 y) {

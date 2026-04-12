@@ -12,6 +12,7 @@ llama_memory_hybrid::llama_memory_hybrid(
         const llama_model & model,
                             /* attn */
                 ggml_type   type_k,
+                ggml_type   type_k_static,
                 ggml_type   type_v,
                      bool   v_trans,
                  uint32_t   kv_size,
@@ -33,6 +34,7 @@ llama_memory_hybrid::llama_memory_hybrid(
     mem_attn(new llama_kv_cache(
         model,
         type_k,
+        type_k_static,
         type_v,
         v_trans,
         offload,
