@@ -2,9 +2,20 @@
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_EXT_shader_8bit_storage : require
 
+#ifdef FLOAT16
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#endif
+
 #if USE_SUBGROUP_ADD || USE_SUBGROUP_ADD_NO_SHMEM
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
+#ifdef FLOAT16
+#extension GL_EXT_shader_subgroup_extended_types_float16 : require
+#endif
+#endif
+
+#ifndef FLOAT_TYPEV4
+#define FLOAT_TYPEV4 vec4
 #endif
 
 #ifdef MUL_MAT_ID
