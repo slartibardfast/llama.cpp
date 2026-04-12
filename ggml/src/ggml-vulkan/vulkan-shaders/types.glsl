@@ -97,6 +97,34 @@ struct block_tq_v_4b_packed16
 #define DATA_A_QUANT_LEGACY
 #endif
 
+#define QUANT_K_TURBO_KV_4B 128
+#define QUANT_R_TURBO_KV_4B 2
+
+struct block_turbo_kv_4b
+{
+    uint16_t norm;
+    uint16_t residual_norm;
+    uint16_t inv_std_fp16;
+    uint16_t _pad;
+    uint8_t mse_indices[64];
+};
+struct block_turbo_kv_4b_packed16
+{
+    uint16_t norm;
+    uint16_t residual_norm;
+    uint16_t inv_std_fp16;
+    uint16_t _pad;
+    uint16_t mse_indices[32];
+};
+
+#if defined(DATA_A_TURBO_KV_4B)
+#define QUANT_K QUANT_K_TURBO_KV_4B
+#define QUANT_R QUANT_R_TURBO_KV_4B
+#define QUANT_AUXF 1
+#define A_TYPE block_turbo_kv_4b
+#define A_TYPE_PACKED16 block_turbo_kv_4b_packed16
+#endif
+
 #define QUANT_K_Q4_1 32
 #define QUANT_R_Q4_1 2
 

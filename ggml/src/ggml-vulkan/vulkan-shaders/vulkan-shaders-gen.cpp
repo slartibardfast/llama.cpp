@@ -825,6 +825,16 @@ void process_shaders() {
     string_to_spv("get_rows_tq_v_4b",          "get_rows_quant.comp",  {{"TEMP_TYPE", "FLOAT_TYPE"}, {"DATA_A_TQ_V_4B", "1"}, {"B_TYPE", "int"}, {"D_TYPE", "float16_t"}, {"FLOAT_TYPE", "float"}});
     string_to_spv("get_rows_tq_v_4b_f32",      "get_rows_quant.comp",  {{"TEMP_TYPE", "FLOAT_TYPE"}, {"DATA_A_TQ_V_4B", "1"}, {"B_TYPE", "int"}, {"D_TYPE", "float"},      {"FLOAT_TYPE", "float"}});
 
+    // TURBO_KV_4B: RHT + Lloyd-Max codebook. All shaders use subgroup-cooperative
+    // inverse/forward Walsh-Hadamard Transform via subgroupShuffleXor.
+    string_to_spv("dequant_turbo_kv_4b",          "dequant_turbo_kv_4b.comp",      {{"D_TYPE", "float16_t"}});
+    string_to_spv("get_rows_turbo_kv_4b",         "get_rows_turbo_kv_4b.comp",     {{"D_TYPE", "float16_t"}});
+    string_to_spv("get_rows_turbo_kv_4b_f32",     "get_rows_turbo_kv_4b.comp",     {{"D_TYPE", "float"}});
+    string_to_spv("cpy_f32_turbo_kv_4b",          "cpy_f32_turbo_kv_4b.comp",      {{"A_TYPE", "float"}});
+    string_to_spv("cpy_turbo_kv_4b_f32",          "dequant_turbo_kv_4b.comp",      {{"D_TYPE", "float"}});
+    string_to_spv("set_rows_turbo_kv_4b_f32",     "set_rows_turbo_kv_4b.comp",     {{"A_TYPE", "float"}});
+    string_to_spv("set_rows_turbo_kv_4b_f16",     "set_rows_turbo_kv_4b.comp",     {{"A_TYPE", "float16_t"}});
+
     auto get_type_str = [](bool f16) {
         return f16 ? "float16_t" : "float";
     };

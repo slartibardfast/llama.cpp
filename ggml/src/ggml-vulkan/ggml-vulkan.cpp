@@ -4277,6 +4277,16 @@ static void ggml_vk_load_shaders(vk_device& device) {
     // TurboQuant V 4-bit. 128-element block; the workgroup size
     // in the shader is 256, so 256 blocks (= 256 * 128 output elements) per workgroup.
     ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_TQ_V_4B], "dequant_tq_v_4b", dequant_tq_v_4b_len, dequant_tq_v_4b_data, "main", 2, 5 * sizeof(uint32_t), {256 * 128, 1, 1}, {}, 1);
+    // TURBO_KV_4B: RHT + codebook. All shaders use subgroup-cooperative FWHT
+    // via subgroupShuffleXor. Workgroup = subgroup size, one block per workgroup.
+    if (device->subgroup_shuffle && device->subgroup_arithmetic) {
+        const uint32_t ss = device->subgroup_size;
+        ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_TURBO_KV_4B],       "dequant_turbo_kv_4b",       dequant_turbo_kv_4b_len,       dequant_turbo_kv_4b_data,       "main", 2, sizeof(vk_op_unary_push_constants),  {128, 1, 1}, {ss, 1, 1}, 1, false, true, ss);
+        ggml_vk_create_pipeline(device, device->pipeline_get_rows[GGML_TYPE_TURBO_KV_4B],      "get_rows_turbo_kv_4b",      get_rows_turbo_kv_4b_len,      get_rows_turbo_kv_4b_data,      "main", 3, sizeof(vk_op_binary_push_constants), {128, 1, 1}, {ss, 1, 1}, 1, false, true, ss);
+        ggml_vk_create_pipeline(device, device->pipeline_get_rows_f32[GGML_TYPE_TURBO_KV_4B],  "get_rows_turbo_kv_4b_f32",  get_rows_turbo_kv_4b_f32_len,  get_rows_turbo_kv_4b_f32_data,  "main", 3, sizeof(vk_op_binary_push_constants), {128, 1, 1}, {ss, 1, 1}, 1, false, true, ss);
+        ggml_vk_create_pipeline(device, device->pipeline_cpy_f32_quant[GGML_TYPE_TURBO_KV_4B], "cpy_f32_turbo_kv_4b",       cpy_f32_turbo_kv_4b_len,       cpy_f32_turbo_kv_4b_data,       "main", 2, sizeof(vk_op_unary_push_constants),  {128, 1, 1}, {ss, 1, 1}, 1, false, true, ss);
+        ggml_vk_create_pipeline(device, device->pipeline_cpy_quant_f32[GGML_TYPE_TURBO_KV_4B], "cpy_turbo_kv_4b_f32",       cpy_turbo_kv_4b_f32_len,       cpy_turbo_kv_4b_f32_data,       "main", 2, sizeof(vk_op_unary_push_constants),  {128, 1, 1}, {ss, 1, 1}, 1, false, true, ss);
+    }
 
     // get_rows
     ggml_vk_create_pipeline(device, device->pipeline_get_rows[GGML_TYPE_F32 ], "get_rows_f32",  get_rows_f32_len,  get_rows_f32_data,  "main", 3, sizeof(vk_op_binary_push_constants), { 512, 1, 1}, {}, 1);
@@ -4428,6 +4438,12 @@ static void ggml_vk_load_shaders(vk_device& device) {
     }
 #undef SET_ROWS
 
+    // TURBO_KV_4B set_rows — uses subgroup FWHT, can't use the SET_ROWS macro
+    if (device->subgroup_shuffle && device->subgroup_arithmetic) {
+        const uint32_t ss = device->subgroup_size;
+        ggml_vk_create_pipeline(device, device->pipeline_set_rows_i32[GGML_TYPE_TURBO_KV_4B], "set_rows_turbo_kv_4b_f32", set_rows_turbo_kv_4b_f32_len, set_rows_turbo_kv_4b_f32_data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {ss}, 1, true, true, ss);
+        ggml_vk_create_pipeline(device, device->pipeline_set_rows_i64[GGML_TYPE_TURBO_KV_4B], "set_rows_turbo_kv_4b_f32", set_rows_turbo_kv_4b_f32_len, set_rows_turbo_kv_4b_f32_data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {ss}, 1, true, true, ss);
+    }
 
     ggml_vk_create_pipeline(device, device->pipeline_cpy_quant_f32[GGML_TYPE_Q4_0], "cpy_q4_0_f32", cpy_q4_0_f32_len, cpy_q4_0_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {(uint32_t)ggml_blck_size(GGML_TYPE_Q4_0), 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_cpy_quant_f32[GGML_TYPE_Q4_1], "cpy_q4_1_f32", cpy_q4_1_f32_len, cpy_q4_1_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {(uint32_t)ggml_blck_size(GGML_TYPE_Q4_1), 1, 1}, {}, 1);
@@ -6132,6 +6148,7 @@ static vk_pipeline ggml_vk_get_to_fp16(ggml_backend_vk_context * ctx, ggml_type 
         case GGML_TYPE_IQ4_XS:
         case GGML_TYPE_IQ4_NL:
         case GGML_TYPE_MXFP4:
+        case GGML_TYPE_TURBO_KV_4B:
             break;
         default:
             return nullptr;
@@ -7372,6 +7389,8 @@ static vk_pipeline ggml_vk_get_cpy_pipeline(ggml_backend_vk_context * ctx, const
         case GGML_TYPE_Q5_1:
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_IQ4_NL:
+        case GGML_TYPE_TQ_V_4B:
+        case GGML_TYPE_TURBO_KV_4B:
             return ctx->device->pipeline_cpy_f32_quant[to];
         default:
             break;
@@ -7386,6 +7405,8 @@ static vk_pipeline ggml_vk_get_cpy_pipeline(ggml_backend_vk_context * ctx, const
         case GGML_TYPE_Q5_1:
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_IQ4_NL:
+        case GGML_TYPE_TQ_V_4B:
+        case GGML_TYPE_TURBO_KV_4B:
             return ctx->device->pipeline_cpy_quant_f32[src->type];
         default:
             break;
@@ -15630,6 +15651,7 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     case GGML_TYPE_IQ4_NL:
                     case GGML_TYPE_MXFP4:
                     case GGML_TYPE_TQ_V_4B:
+                    case GGML_TYPE_TURBO_KV_4B:
                     case GGML_TYPE_I32:
                         return true;
                     default:
@@ -15649,7 +15671,8 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     case GGML_TYPE_Q8_0:
                     case GGML_TYPE_IQ4_NL:
                     case GGML_TYPE_TQ_V_4B:
-                        return true;
+                    case GGML_TYPE_TURBO_KV_4B:
+                        return device->subgroup_shuffle && device->subgroup_arithmetic;
                     default:
                         return false;
                 }
@@ -15673,6 +15696,7 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     case GGML_TYPE_Q8_0:
                     case GGML_TYPE_IQ4_NL:
                     case GGML_TYPE_TQ_V_4B:
+                    case GGML_TYPE_TURBO_KV_4B:
                         return true;
                     default:
                         break;
@@ -15687,6 +15711,7 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     case GGML_TYPE_Q5_1:
                     case GGML_TYPE_Q8_0:
                     case GGML_TYPE_TQ_V_4B:
+                    case GGML_TYPE_TURBO_KV_4B:
                     case GGML_TYPE_IQ4_NL:
                         return true;
                     default:

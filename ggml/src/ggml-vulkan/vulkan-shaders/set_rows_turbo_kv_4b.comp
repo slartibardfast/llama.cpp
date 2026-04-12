@@ -1,0 +1,78 @@
+#version 450
+
+// SET_ROWS: quantize input rows into TURBO_KV_4B blocks in the KV cache.
+// Input type selected by defines: A_TYPE = float or float16_t.
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+#include "types.glsl"
+#include "turbo_kv_4b_rht.glsl"
+
+layout (push_constant) uniform parameter {
+    uint ne00; uint ne01; uint ne02; uint ne03;
+    uint nb00; uint nb01; uint nb02; uint nb03;
+    uint ne10; uint ne11; uint ne12; uint ne13;
+    uint nb10; uint nb11; uint nb12; uint nb13;
+    uint d_offset;
+    uint s_offset;
+} p;
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer A {A_TYPE data_a[];};
+layout (binding = 1) readonly buffer B {int data_b[];};
+layout (binding = 2) writeonly buffer D {block_turbo_kv_4b data_d[];};
+
+void main() {
+    // Each workgroup handles one block of one row.
+    // gl_WorkGroupID.x = block within row, gl_WorkGroupID.y = row index.
+    const uint row_idx = gl_WorkGroupID.y;
+    const uint blk_in_row = gl_WorkGroupID.x;
+    const uint tid = gl_SubgroupInvocationID;
+
+    // Row mapping via index tensor
+    const uint dst_row = uint(data_b[row_idx]);
+    const uint src_offset = row_idx * p.nb01 / 4; // nb01 in bytes, /4 for float stride
+    const uint base_elem = blk_in_row * QUANT_K_TURBO_KV_4B;
+
+    float val0 = float(data_a[src_offset + base_elem + tid]);
+    float val1 = float(data_a[src_offset + base_elem + tid + 64]);
+
+    // Quantize: norm → normalize → forward RHT → inv_std → nearest codebook → pack
+    float sum_sq = subgroupAdd(val0 * val0 + val1 * val1);
+    float norm = sqrt(sum_sq);
+    float rcp_norm = 1.0 / max(norm, 1e-10);
+    val0 *= rcp_norm;
+    val1 *= rcp_norm;
+
+    turbo_kv_forward_rht(val0, val1, tid);
+
+    float max_abs = subgroupMax(max(abs(val0), abs(val1)));
+    float inv_std = 2.7326 / max(max_abs, 1e-10);
+
+    uint idx0 = turbo_kv_nearest(val0 * inv_std);
+    uint idx1 = turbo_kv_nearest(val1 * inv_std);
+
+    // Pack indices
+    uint partner0 = subgroupShuffleXor(idx0, 1);
+    uint partner1 = subgroupShuffleXor(idx1, 1);
+
+    const uint dst_blk = (p.d_offset + dst_row * (p.ne00 / QUANT_K_TURBO_KV_4B)) + blk_in_row;
+
+    if ((tid & 1u) == 0) {
+        data_d[dst_blk].mse_indices[tid / 2]       = uint8_t(idx0 | (partner0 << 4));
+        data_d[dst_blk].mse_indices[(tid + 64) / 2] = uint8_t(idx1 | (partner1 << 4));
+    }
+    if (tid == 0) {
+        data_d[dst_blk].norm = turbo_kv_f32_to_fp16_bits(norm);
+        data_d[dst_blk].inv_std_fp16 = turbo_kv_f32_to_fp16_bits(inv_std);
+        data_d[dst_blk].residual_norm = uint16_t(0);
+        data_d[dst_blk]._pad = uint16_t(0);
+    }
+}
