@@ -4090,7 +4090,7 @@ static void ggml_vk_load_shaders(vk_device& device) {
     }
     uint32_t rm_iq = 2 * rm_kq;
 
-    const bool use_subgroups = device->subgroup_arithmetic && device->architecture != vk_device_architecture::AMD_GCN;
+    const bool use_subgroups = device->subgroup_arithmetic;
     // Ensure a subgroup size >= 16 is available
     const bool use_subgroups16 = use_subgroups && subgroup_min_size_16;
 
@@ -4153,8 +4153,9 @@ static void ggml_vk_load_shaders(vk_device& device) {
             ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f32[w][GGML_TYPE_Q5_K][i], "mul_mat_vec_q5_k_f16_f32", arr_dmmv_q5_k_f16_f32_len[reduc16], arr_dmmv_q5_k_f16_f32_data[reduc16], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_kq, 1, 1}, {wg_size_subgroup16, rm_kq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
             // f16acc K-quant variants — FP16 accumulation for RPM on GCN.
             // Two B-type variants: F32 B (common) and F16 B (when scheduler narrows).
-            // Currently q5_k only; extend after other K-quant shaders adopt FLOAT_TYPEV4.
             if (device->fp16) {
+                ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f16[w][GGML_TYPE_Q4_K][i], "mul_mat_vec_q4_k_f16_f16", arr_dmmv_q4_k_f16_f16_len[reduc16], arr_dmmv_q4_k_f16_f16_data[reduc16], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_kq, 1, 1}, {wg_size_subgroup16, rm_kq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
+                ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f16acc[w][GGML_TYPE_Q4_K][i], "mul_mat_vec_q4_k_f32_f16acc", arr_dmmv_q4_k_f32_f16acc_len[reduc16], arr_dmmv_q4_k_f32_f16acc_data[reduc16], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_kq, 1, 1}, {wg_size_subgroup16, rm_kq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f16_f16[w][GGML_TYPE_Q5_K][i], "mul_mat_vec_q5_k_f16_f16", arr_dmmv_q5_k_f16_f16_len[reduc16], arr_dmmv_q5_k_f16_f16_data[reduc16], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_kq, 1, 1}, {wg_size_subgroup16, rm_kq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f16acc[w][GGML_TYPE_Q5_K][i], "mul_mat_vec_q5_k_f32_f16acc", arr_dmmv_q5_k_f32_f16acc_len[reduc16], arr_dmmv_q5_k_f32_f16acc_data[reduc16], "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {rm_kq, 1, 1}, {wg_size_subgroup16, rm_kq, i+1}, 1, true, use_subgroups16, force_subgroup_size16);
             }

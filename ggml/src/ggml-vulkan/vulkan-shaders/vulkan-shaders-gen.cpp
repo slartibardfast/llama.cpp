@@ -706,7 +706,7 @@ void process_shaders() {
     }
 
     std::map<std::string, std::string> base_dict = {{"FLOAT_TYPE", "float"}, {"FLOAT_TYPEV2", "vec2"}, {"FLOAT_TYPEV4", "vec4"}};
-    std::map<std::string, std::string> base_dict_f16acc = {{"FLOAT_TYPE", "float16_t"}, {"FLOAT_TYPEV2", "f16vec2"}, {"FLOAT_TYPEV4", "f16vec4"}, {"FLOAT16", "1"}};
+    std::map<std::string, std::string> base_dict_f16acc = {{"FLOAT_TYPE", "float16_t"}, {"FLOAT_TYPEV2", "f16vec2"}, {"FLOAT_TYPEV4", "f16vec4"}, {"FLOAT16", "1"}, {"ACC_TYPE", "float"}};
 
     for (const auto& tname : type_names) {
         // mul mat vec
@@ -726,8 +726,7 @@ void process_shaders() {
         // B stays F32 to match what the scheduler provides; accumulation is FP16.
         // D_TYPE stays float — only the intermediate accumulation is packed FP16.
         // Gated at runtime on fp16 && !integer_dot_product (fires on GCN, not RDNA2).
-        // Currently q5_k only; extend after other K-quant shaders adopt FLOAT_TYPEV4.
-        if (tname == "q5_k") {
+        if (tname == "q4_k" || tname == "q5_k") {
             // B=F32 + acc=F16 (the common case: activations are F32, accumulate in packed FP16)
             string_to_spv("mul_mat_vec_" + tname + "_f32_f16acc", shader, merge_maps(base_dict_f16acc, {{data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPEV2", "vec2"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}}));
             string_to_spv("mul_mat_vec_" + tname + "_f32_f16acc_subgroup", shader, merge_maps(base_dict_f16acc, {{data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPEV2", "vec2"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}}));
@@ -1231,16 +1230,15 @@ void write_output_files() {
     }
     }
 
-    // f16acc (RPM) arrays for q5_k. Two variants:
+    // f16acc (RPM) arrays for K-quants with phased sub-block shaders.
+    // Two variants per type:
     //   _f32_f16acc: B=F32 + accumulate in FP16 (the common case)
     //   _f16_f16:    B=F16 + accumulate in FP16 (when scheduler narrows B)
-    // Extend to other K-quants after their shaders adopt FLOAT_TYPEV4/FLOAT_TYPEV2.
-    {
-        const std::string tname = "q5_k";
+    for (const std::string& tname : {"q4_k", "q5_k"}) {
         for (const std::string& variant : {"f32_f16acc", "f16_f16"}) {
             hdr << "extern const void * arr_dmmv_"   << tname << "_" << variant << "_data[3];\n";
             hdr << "extern const uint64_t arr_dmmv_" << tname << "_" << variant << "_len[3];\n";
-            if (basename(input_filepath) == "mul_mat_vec_q5_k.comp") {
+            if (basename(input_filepath) == "mul_mat_vec_" + tname + ".comp") {
                 src << "const void * arr_dmmv_"   << tname << "_" << variant << "_data[3] = {mul_mat_vec_" << tname << "_" << variant << "_data, mul_mat_vec_" << tname << "_" << variant << "_subgroup_data, mul_mat_vec_" << tname << "_" << variant << "_subgroup_no_shmem_data};\n";
                 src << "const uint64_t arr_dmmv_" << tname << "_" << variant << "_len[3] =  {mul_mat_vec_" << tname << "_" << variant << "_len,  mul_mat_vec_" << tname << "_" << variant << "_subgroup_len, mul_mat_vec_"  << tname << "_" << variant << "_subgroup_no_shmem_len};\n";
             }
