@@ -96,6 +96,7 @@ public:
     llama_kv_cache(
             const llama_model & model,
                     ggml_type   type_k,
+                    ggml_type   type_k_static, // split K: static dims type. GGML_TYPE_COUNT = no split
                     ggml_type   type_v,
                          bool   v_trans,
                          bool   offload,
@@ -153,7 +154,10 @@ public:
     bool get_has_shift() const;
 
     ggml_type type_k() const;
+    ggml_type type_k_static() const;
     ggml_type type_v() const;
+
+    bool is_split_k() const;
 
     //
     // graph_build API
@@ -165,9 +169,17 @@ public:
     ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
 
+    // split K: get views of rope and static portions
+    ggml_tensor * get_k_rope  (ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
+    ggml_tensor * get_k_static(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
+
     // store k_cur and v_cur in the cache based on the provided head location
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const;
     ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo) const;
+
+    // split K: store rope and static portions separately
+    ggml_tensor * cpy_k_rope  (ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const;
+    ggml_tensor * cpy_k_static(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const;
 
     //
     // preparation API
@@ -223,11 +235,18 @@ private:
         ggml_tensor * k;
         ggml_tensor * v;
 
+        // split K: separate tensors for RoPE and static dims
+        ggml_tensor * k_rope   = nullptr; // [n_rot * n_head_kv, kv_size, n_stream]
+        ggml_tensor * k_static = nullptr; // [(head_dim - n_rot) * n_head_kv, kv_size, n_stream]
+
         std::vector<ggml_tensor *> k_stream;
         std::vector<ggml_tensor *> v_stream;
     };
 
     bool v_trans = true;  // the value tensor is transposed
+
+    // split K cache types (GGML_TYPE_COUNT means no split)
+    ggml_type type_k_static_ = GGML_TYPE_COUNT;
 
     const uint32_t n_seq_max = 1;
     const uint32_t n_stream  = 1;
@@ -354,11 +373,18 @@ public:
     uint32_t get_n_kv() const;
 
     ggml_type type_k() const;
+    ggml_type type_k_static() const;
     ggml_type type_v() const;
+
+    bool is_split_k() const;
 
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il) const;
+
+    // split K: get views of rope and static portions
+    ggml_tensor * get_k_rope  (ggml_context * ctx, int32_t il) const;
+    ggml_tensor * get_k_static(ggml_context * ctx, int32_t il) const;
 
     // store k_cur and v_cur in the cache based on the provided head location
     // note: the heads in k_cur and v_cur should be laid out contiguously in memory
@@ -368,6 +394,10 @@ public:
     //   - v_idxs [n_tokens] or [n_tokens*n_embd_v_gqa] depending if V cache is transposed
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const;
     ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il) const;
+
+    // split K: store rope and static portions separately
+    ggml_tensor * cpy_k_rope  (ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const;
+    ggml_tensor * cpy_k_static(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const;
 
     // create destination indices for each head of the current batch for where it would be written in the KV cache
     // the indices address the global KV cache (not per stream) - this is not relevant for the user of this API, but

@@ -373,28 +373,10 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
          * (-fa off). The cpu wrapper dispatches to the SSSE3 pshufb kernel
          * on Westmere+ and to the scalar ggml-base reference elsewhere.
          *
-         * vec_dot_type = TURBO_KV_Q_ROT_F32: the Q row (src1) is pre-rotated
-         * once by turbo_kv_rotate_query_ggml in mul_mat's pre-convert step,
-         * not per vec_dot call. The vec_dot therefore receives a ready
-         * rotated query and skips rotation entirely. */
+         * turbo_kv_4b_attention_multi handles Q rotation internally. */
         .from_float               = (ggml_from_float_t) quantize_row_turbo_kv_4b_ref,
         .vec_dot                  = ggml_vec_dot_turbo_kv_4b_f32_cpu,
-        /* Temporarily disabled: vec_dot_type = GGML_TYPE_TURBO_KV_Q_ROT_F32
-         * pending investigation into why the hoisted-rotation path regresses
-         * vs per-call rotation. Suspected causes: serialized single-thread
-         * rotation (only 2 blocks per row, only 2 of 12 threads participate)
-         * vs. fully-parallel vec_dot with in-kernel rotation. */
         .vec_dot_type             = GGML_TYPE_F32,
-        .nrows                    = 1,
-    },
-    [GGML_TYPE_TURBO_KV_Q_ROT_F32] = {
-        /* Pseudo-type: from_float runs turbo_kv_rotate_query_ggml which
-         * RHT-rotates the input f32 row. Used only as TURBO_KV_4B's
-         * vec_dot_type. Never backs a real tensor, so vec_dot is NULL.
-         * row_size = n_elements * 4 bytes (same as F32). */
-        .from_float               = (ggml_from_float_t) turbo_kv_rotate_query_ggml,
-        .vec_dot                  = NULL,
-        .vec_dot_type             = GGML_TYPE_TURBO_KV_Q_ROT_F32,
         .nrows                    = 1,
     },
     [GGML_TYPE_Q2_K] = {

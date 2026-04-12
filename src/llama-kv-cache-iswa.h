@@ -16,6 +16,7 @@ public:
     llama_kv_cache_iswa(
             const llama_model & model,
                     ggml_type   type_k,
+                    ggml_type   type_k_static,
                     ggml_type   type_v,
                          bool   v_trans,
                          bool   offload,

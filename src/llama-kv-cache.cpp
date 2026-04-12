@@ -79,6 +79,7 @@ static ggml_tensor * ggml_mul_mat_aux(
 llama_kv_cache::llama_kv_cache(
         const llama_model & model,
                 ggml_type   type_k,
+                ggml_type   type_k_static,
                 ggml_type   type_v,
                      bool   v_trans,
                      bool   offload,
@@ -90,7 +91,7 @@ llama_kv_cache::llama_kv_cache(
            llama_swa_type   swa_type,
     const layer_filter_cb & filter,
     const  layer_reuse_cb & reuse) :
-    model(model), hparams(model.hparams), v_trans(v_trans),
+    model(model), hparams(model.hparams), v_trans(v_trans), type_k_static_(type_k_static),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type) {
 
     GGML_ASSERT(kv_size % n_pad == 0);
@@ -110,7 +111,8 @@ llama_kv_cache::llama_kv_cache(
         auto it = ctx_map.find(buft);
         if (it == ctx_map.end()) {
             ggml_init_params params = {
-                /*.mem_size   =*/ size_t(2u*(1 + n_stream)*n_layer_kv*ggml_tensor_overhead()),
+                // extra factor for split K: k_rope + k_static tensors per layer
+                /*.mem_size   =*/ size_t((type_k_static != GGML_TYPE_COUNT ? 4u : 2u)*(1 + n_stream)*n_layer_kv*ggml_tensor_overhead()),
                 /*.mem_buffer =*/ NULL,
                 /*.no_alloc   =*/ true,
             };
@@ -216,24 +218,46 @@ llama_kv_cache::llama_kv_cache(
 
         const bool has_k = true;
         const bool has_v = !is_mla;
+        const bool split_k = (type_k_static != GGML_TYPE_COUNT) && has_k;
 
-        ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, type_k, n_embd_k_gqa, kv_size, n_stream) : nullptr;
+        ggml_tensor * k = nullptr;
+        ggml_tensor * k_rope_t   = nullptr;
+        ggml_tensor * k_static_t = nullptr;
+
+        if (split_k) {
+            const uint32_t n_rot      = hparams.n_rot(il);
+            const uint32_t n_head_kv  = hparams.n_head_kv(il);
+            const uint32_t n_rot_gqa  = n_rot * n_head_kv;
+            const uint32_t n_stat_gqa = n_embd_k_gqa - n_rot_gqa;
+
+            k_rope_t   = ggml_new_tensor_3d(ctx, type_k,        n_rot_gqa,  kv_size, n_stream);
+            k_static_t = ggml_new_tensor_3d(ctx, type_k_static, n_stat_gqa, kv_size, n_stream);
+            ggml_format_name(k_rope_t,   "cache_k_rope_l%d",   il);
+            ggml_format_name(k_static_t, "cache_k_static_l%d", il);
+        } else {
+            k = has_k ? ggml_new_tensor_3d(ctx, type_k, n_embd_k_gqa, kv_size, n_stream) : nullptr;
+            has_k && ggml_format_name(k, "cache_k_l%d", il);
+        }
+
         ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, type_v, n_embd_v_gqa, kv_size, n_stream) : nullptr;
-
-        has_k && ggml_format_name(k, "cache_k_l%d", il);
         has_v && ggml_format_name(v, "cache_v_l%d", il);
 
         std::vector<ggml_tensor *> k_stream;
         std::vector<ggml_tensor *> v_stream;
 
         for (uint32_t s = 0; s < n_stream; ++s) {
-            k_stream.push_back(has_k ? ggml_view_2d(ctx, k, n_embd_k_gqa, kv_size, k->nb[1], s*k->nb[2]) : nullptr);
+            if (split_k) {
+                // k_stream not used for split K (no single K tensor to view)
+                k_stream.push_back(nullptr);
+            } else {
+                k_stream.push_back(has_k ? ggml_view_2d(ctx, k, n_embd_k_gqa, kv_size, k->nb[1], s*k->nb[2]) : nullptr);
+            }
             v_stream.push_back(has_v ? ggml_view_2d(ctx, v, n_embd_v_gqa, kv_size, v->nb[1], s*v->nb[2]) : nullptr);
         }
 
         map_layer_ids[il] = layers.size();
 
-        layers.push_back({ il, k, v, k_stream, v_stream, });
+        layers.push_back({ il, k, v, k_rope_t, k_static_t, k_stream, v_stream, });
     }
 
     if (reuse) {
@@ -285,10 +309,17 @@ llama_kv_cache::llama_kv_cache(
         const size_t memory_size_k = size_k_bytes();
         const size_t memory_size_v = size_v_bytes();
 
-        LLAMA_LOG_INFO("%s: size = %7.2f MiB (%6u cells, %3d layers, %2u/%u seqs), K (%s): %7.2f MiB, V (%s): %7.2f MiB\n", __func__,
-                (float)(memory_size_k + memory_size_v) / (1024.0f * 1024.0f), kv_size, (int) layers.size(), n_seq_max, n_stream,
-                ggml_type_name(type_k), (float)memory_size_k / (1024.0f * 1024.0f),
-                ggml_type_name(type_v), (float)memory_size_v / (1024.0f * 1024.0f));
+        if (is_split_k()) {
+            LLAMA_LOG_INFO("%s: size = %7.2f MiB (%6u cells, %3d layers, %2u/%u seqs), K (%s:%s): %7.2f MiB, V (%s): %7.2f MiB\n", __func__,
+                    (float)(memory_size_k + memory_size_v) / (1024.0f * 1024.0f), kv_size, (int) layers.size(), n_seq_max, n_stream,
+                    ggml_type_name(type_k), ggml_type_name(type_k_static_), (float)memory_size_k / (1024.0f * 1024.0f),
+                    ggml_type_name(type_v), (float)memory_size_v / (1024.0f * 1024.0f));
+        } else {
+            LLAMA_LOG_INFO("%s: size = %7.2f MiB (%6u cells, %3d layers, %2u/%u seqs), K (%s): %7.2f MiB, V (%s): %7.2f MiB\n", __func__,
+                    (float)(memory_size_k + memory_size_v) / (1024.0f * 1024.0f), kv_size, (int) layers.size(), n_seq_max, n_stream,
+                    ggml_type_name(type_k), (float)memory_size_k / (1024.0f * 1024.0f),
+                    ggml_type_name(type_v), (float)memory_size_v / (1024.0f * 1024.0f));
+        }
     }
 
     const char * LLAMA_ATTN_ROT_DISABLE = getenv("LLAMA_ATTN_ROT_DISABLE");
@@ -302,6 +333,7 @@ llama_kv_cache::llama_kv_cache(
         n_embd_head_k_all > 0 &&
         ggml_is_quantized(type_k) &&
         type_k != GGML_TYPE_TURBO_KV_4B && // turbo_kv_4b has its own RHT rotation internally
+        type_k_static == GGML_TYPE_COUNT && // split K handles dims independently
         hparams.n_embd_head_k() % 64 == 0;
 
     attn_rot_v =
@@ -1137,11 +1169,22 @@ bool llama_kv_cache::get_has_shift() const {
 }
 
 ggml_type llama_kv_cache::type_k() const {
+    if (is_split_k()) {
+        return layers[0].k_rope->type;
+    }
     return layers[0].k->type;
+}
+
+ggml_type llama_kv_cache::type_k_static() const {
+    return type_k_static_;
 }
 
 ggml_type llama_kv_cache::type_v() const {
     return layers[0].v->type;
+}
+
+bool llama_kv_cache::is_split_k() const {
+    return type_k_static_ != GGML_TYPE_COUNT;
 }
 
 uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
@@ -1301,6 +1344,94 @@ ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggm
     v_cur = ggml_reshape_2d(ctx, v_cur, 1, ggml_nelements(v_cur));
 
     return ggml_set_rows(ctx, v_view, v_cur, v_idxs);
+}
+
+// split K: get a 3D view of the rope portion of the K cache.
+// Returns [n_rot_gqa, n_kv, ns]. Caller must cast to f32 then reshape to 4D.
+ggml_tensor * llama_kv_cache::get_k_rope(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
+    GGML_ASSERT(is_split_k());
+
+    const int32_t ikv = map_layer_ids.at(il);
+    auto * kr = layers[ikv].k_rope;
+
+    const uint64_t kv_size    = get_size();
+    const uint64_t n_rot_gqa  = kr->ne[0];
+    const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
+
+    return ggml_view_3d(ctx, kr,
+            n_rot_gqa, n_kv, ns,
+            ggml_row_size(kr->type, n_rot_gqa),
+            ggml_row_size(kr->type, n_rot_gqa*kv_size),
+            ggml_row_size(kr->type, n_rot_gqa*kv_size)*sinfo.s0);
+}
+
+// split K: get a 3D view of the static (non-RoPE) portion of the K cache.
+// Returns [n_stat_gqa, n_kv, ns]. Caller must cast to f32 then reshape to 4D.
+ggml_tensor * llama_kv_cache::get_k_static(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
+    GGML_ASSERT(is_split_k());
+
+    const int32_t ikv = map_layer_ids.at(il);
+    auto * ks = layers[ikv].k_static;
+
+    const uint64_t kv_size    = get_size();
+    const uint64_t n_stat_gqa = ks->ne[0];
+    const uint32_t ns = sinfo.s1 - sinfo.s0 + 1;
+
+    return ggml_view_3d(ctx, ks,
+            n_stat_gqa, n_kv, ns,
+            ggml_row_size(ks->type, n_stat_gqa),
+            ggml_row_size(ks->type, n_stat_gqa*kv_size),
+            ggml_row_size(ks->type, n_stat_gqa*kv_size)*sinfo.s0);
+}
+
+// split K: write the rope portion of k_cur to k_rope cache
+ggml_tensor * llama_kv_cache::cpy_k_rope(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const {
+    GGML_UNUSED(sinfo);
+    GGML_ASSERT(is_split_k());
+
+    const int32_t ikv = map_layer_ids.at(il);
+    ggml_tensor * kr = layers[ikv].k_rope;
+
+    const int64_t n_head    = k_cur->ne[1];
+    const int64_t n_tokens  = k_cur->ne[2];
+    const int64_t n_rot_gqa = k_cur->ne[0] * n_head;
+
+    GGML_ASSERT(ggml_row_size(k_cur->type, k_cur->ne[0]) == k_cur->nb[1]);
+
+    k_cur = ggml_view_2d(ctx, k_cur, n_rot_gqa, n_tokens, k_cur->nb[2], 0);
+
+    const int64_t ns = kr->ne[2];
+    if (ns > 1) {
+        const int64_t kv_size = get_size();
+        kr = ggml_reshape_2d(ctx, kr, n_rot_gqa, kv_size*ns);
+    }
+
+    return ggml_set_rows(ctx, kr, k_cur, k_idxs);
+}
+
+// split K: write the static portion of k_cur to k_static cache
+ggml_tensor * llama_kv_cache::cpy_k_static(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const {
+    GGML_UNUSED(sinfo);
+    GGML_ASSERT(is_split_k());
+
+    const int32_t ikv = map_layer_ids.at(il);
+    ggml_tensor * ks = layers[ikv].k_static;
+
+    const int64_t n_head     = k_cur->ne[1];
+    const int64_t n_tokens   = k_cur->ne[2];
+    const int64_t n_stat_gqa = k_cur->ne[0] * n_head;
+
+    GGML_ASSERT(ggml_row_size(k_cur->type, k_cur->ne[0]) == k_cur->nb[1]);
+
+    k_cur = ggml_view_2d(ctx, k_cur, n_stat_gqa, n_tokens, k_cur->nb[2], 0);
+
+    const int64_t ns = ks->ne[2];
+    if (ns > 1) {
+        const int64_t kv_size = get_size();
+        ks = ggml_reshape_2d(ctx, ks, n_stat_gqa, kv_size*ns);
+    }
+
+    return ggml_set_rows(ctx, ks, k_cur, k_idxs);
 }
 
 ggml_tensor * llama_kv_cache::build_input_k_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const {
@@ -1740,7 +1871,11 @@ size_t llama_kv_cache::size_k_bytes() const {
     size_t size_k_bytes = 0;
 
     for (const auto & layer : layers) {
-        size_k_bytes += ggml_nbytes(layer.k);
+        if (is_split_k()) {
+            size_k_bytes += ggml_nbytes(layer.k_rope) + ggml_nbytes(layer.k_static);
+        } else {
+            size_k_bytes += ggml_nbytes(layer.k);
+        }
     }
 
     return size_k_bytes;
@@ -2005,6 +2140,8 @@ void llama_kv_cache::state_write_meta(llama_io_write_i & io, const cell_ranges_t
 }
 
 void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t & cr) const {
+    GGML_ASSERT(!is_split_k() && "state save/load not yet implemented for split K cache");
+
     const auto & cells = v_cells[cr.strm];
 
     const uint32_t v_trans = this->v_trans ? 1 : 0;
@@ -2478,8 +2615,16 @@ ggml_type llama_kv_cache_context::type_k() const {
     return kv->type_k();
 }
 
+ggml_type llama_kv_cache_context::type_k_static() const {
+    return kv->type_k_static();
+}
+
 ggml_type llama_kv_cache_context::type_v() const {
     return kv->type_v();
+}
+
+bool llama_kv_cache_context::is_split_k() const {
+    return kv->is_split_k();
 }
 
 ggml_tensor * llama_kv_cache_context::get_k(ggml_context * ctx, int32_t il) const {
@@ -2490,12 +2635,28 @@ ggml_tensor * llama_kv_cache_context::get_v(ggml_context * ctx, int32_t il) cons
     return kv->get_v(ctx, il, n_kv, sinfos[i_cur]);
 }
 
+ggml_tensor * llama_kv_cache_context::get_k_rope(ggml_context * ctx, int32_t il) const {
+    return kv->get_k_rope(ctx, il, n_kv, sinfos[i_cur]);
+}
+
+ggml_tensor * llama_kv_cache_context::get_k_static(ggml_context * ctx, int32_t il) const {
+    return kv->get_k_static(ctx, il, n_kv, sinfos[i_cur]);
+}
+
 ggml_tensor * llama_kv_cache_context::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const {
     return kv->cpy_k(ctx, k_cur, k_idxs, il, sinfos[i_cur]);
 }
 
 ggml_tensor * llama_kv_cache_context::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il) const {
     return kv->cpy_v(ctx, v_cur, v_idxs, il, sinfos[i_cur]);
+}
+
+ggml_tensor * llama_kv_cache_context::cpy_k_rope(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const {
+    return kv->cpy_k_rope(ctx, k_cur, k_idxs, il, sinfos[i_cur]);
+}
+
+ggml_tensor * llama_kv_cache_context::cpy_k_static(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const {
+    return kv->cpy_k_static(ctx, k_cur, k_idxs, il, sinfos[i_cur]);
 }
 
 ggml_tensor * llama_kv_cache_context::build_input_k_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const {
@@ -2543,8 +2704,9 @@ void llama_kv_cache_context::set_input_v_rot(ggml_tensor * dst) const {
 }
 
 ggml_tensor * llama_kv_cache_context::build_input_k_pos(ggml_context * ctx) const {
-    // Only for pre-RoPE K types (turbo_kv_4b). Returns nullptr otherwise.
-    if (type_k() != GGML_TYPE_TURBO_KV_4B) {
+    // Pre-RoPE K: needed for split K (RoPE applied on-the-fly to rope dims)
+    // and for turbo_kv_4b (pre-RoPE storage).
+    if (!is_split_k() && type_k() != GGML_TYPE_TURBO_KV_4B) {
         return nullptr;
     }
     const uint32_t n_kv = get_n_kv();

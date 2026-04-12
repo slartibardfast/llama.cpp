@@ -2136,38 +2136,96 @@ ggml_tensor * llm_graph_context::build_attn(
         const auto & k_idxs = inp->get_k_idxs();
         const auto & v_idxs = inp->get_v_idxs();
 
-        ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
+        if (mctx_cur->is_split_k()) {
+            // Split k_cur at n_rot boundary into rope and static portions.
+            // k_cur shape: [n_embd_head, n_head_kv, n_tokens]
+            const int64_t n_rot  = hparams.n_rot(il);
+            const int64_t n_head = k_cur->ne[1];
+            const int64_t n_tok  = k_cur->ne[2];
+            const int64_t n_stat = k_cur->ne[0] - n_rot;
+
+            // Extract rope dims [0..n_rot) — strided view then contiguous copy
+            ggml_tensor * k_rope_cur = ggml_view_3d(ctx0, k_cur,
+                    n_rot, n_head, n_tok,
+                    k_cur->nb[1], k_cur->nb[2], 0);
+            k_rope_cur = ggml_cont(ctx0, k_rope_cur);
+            cb(k_rope_cur, "k_rope_cur", il);
+
+            // Extract static dims [n_rot..head_dim)
+            ggml_tensor * k_stat_cur = ggml_view_3d(ctx0, k_cur,
+                    n_stat, n_head, n_tok,
+                    k_cur->nb[1], k_cur->nb[2],
+                    n_rot * ggml_element_size(k_cur));
+            k_stat_cur = ggml_cont(ctx0, k_stat_cur);
+            cb(k_stat_cur, "k_stat_cur", il);
+
+            ggml_build_forward_expand(gf, mctx_cur->cpy_k_rope  (ctx0, k_rope_cur, k_idxs, il));
+            ggml_build_forward_expand(gf, mctx_cur->cpy_k_static(ctx0, k_stat_cur, k_idxs, il));
+        } else {
+            ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
+        }
         ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
     }
 
     const auto & kq_mask = inp->get_kq_mask();
 
     ggml_tensor * q = q_cur;
-    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+    ggml_tensor * k = nullptr;
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
-    // Pre-RoPE K storage: K was stored without RoPE. Apply it now on the
-    // dequantized f32 K using the per-cell position indices. This is the
-    // standard KVQuant approach — quantization quality improves because K's
-    // channel-wise outlier structure is preserved (not scrambled by RoPE).
-    if (inp->self_k_pos) {
-        // Dequant quantized K to f32 (via ggml_cast which calls to_float)
-        k = ggml_cast(ctx0, k, GGML_TYPE_F32);
+    if (mctx_cur->is_split_k()) {
+        // Split K read path: get flat 3D views, dequant to f32, reshape to 4D, RoPE on rope, concat.
+        // The flat views avoid block-size alignment issues with quantized types.
+        const int64_t n_rot  = hparams.n_rot(il);
+        const int64_t n_stat = hparams.n_embd_head_k(il) - n_rot;
+        const int64_t n_head_kv = hparams.n_head_kv(il);
+        const uint32_t n_kv = mctx_cur->get_n_kv();
 
-        // Apply RoPE using per-cell positions from the KV cache.
-        // Use ggml_rope_multi for M-RoPE support (Qwen3.5 sections [11,11,10,0]).
-        // The position tensor is [n_kv * 4] for M-RoPE, matching the model's
-        // inp_pos layout used during the original Q RoPE in the model file.
+        // Get flat [n_rot_gqa, n_kv, ns] and [n_stat_gqa, n_kv, ns]
+        ggml_tensor * k_rope = mctx_cur->get_k_rope(ctx0, il);
+        ggml_tensor * k_stat = mctx_cur->get_k_static(ctx0, il);
+
+        // Dequant to f32 (block-aligned at the gqa level)
+        k_rope = ggml_cast(ctx0, k_rope, GGML_TYPE_F32);
+        k_stat = ggml_cast(ctx0, k_stat, GGML_TYPE_F32);
+
+        // Reshape f32 tensors to 4D [n_rot, n_head_kv, n_kv, ns]
+        k_rope = ggml_reshape_4d(ctx0, k_rope, n_rot, n_head_kv, n_kv, k_rope->ne[2]);
+        k_stat = ggml_reshape_4d(ctx0, k_stat, n_stat, n_head_kv, n_kv, k_stat->ne[2]);
+
+        // Apply RoPE to rope portion only
         int sections[4];
         std::copy(hparams.rope_sections.begin(), hparams.rope_sections.end(), sections);
-        k = ggml_rope_multi(ctx0, k,
+        k_rope = ggml_rope_multi(ctx0, k_rope,
             inp->self_k_pos, nullptr,
-            hparams.n_rot(il), sections,
+            n_rot, sections,
             hparams.rope_type,
             cparams.n_ctx_orig_yarn, cparams.rope_freq_base, cparams.rope_freq_scale,
             cparams.yarn_ext_factor, cparams.yarn_attn_factor,
             cparams.yarn_beta_fast, cparams.yarn_beta_slow);
-        cb(k, "k_rope_on_the_fly", il);
+        cb(k_rope, "k_rope_on_the_fly", il);
+
+        // Concatenate [n_rot | n_stat] along head_dim (dimension 0)
+        k = ggml_concat(ctx0, k_rope, k_stat, 0);
+        cb(k, "k_split_concat", il);
+    } else {
+        k = mctx_cur->get_k(ctx0, il);
+
+        // Pre-RoPE K storage (single-tensor, e.g. turbo_kv_4b)
+        if (inp->self_k_pos) {
+            k = ggml_cast(ctx0, k, GGML_TYPE_F32);
+
+            int sections[4];
+            std::copy(hparams.rope_sections.begin(), hparams.rope_sections.end(), sections);
+            k = ggml_rope_multi(ctx0, k,
+                inp->self_k_pos, nullptr,
+                hparams.n_rot(il), sections,
+                hparams.rope_type,
+                cparams.n_ctx_orig_yarn, cparams.rope_freq_base, cparams.rope_freq_scale,
+                cparams.yarn_ext_factor, cparams.yarn_attn_factor,
+                cparams.yarn_beta_fast, cparams.yarn_beta_slow);
+            cb(k, "k_rope_on_the_fly", il);
+        }
     }
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);

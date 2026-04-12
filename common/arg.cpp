@@ -2008,14 +2008,21 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"-ctk", "--cache-type-k"}, "TYPE",
         string_format(
-            "KV cache data type for K\n"
+            "KV cache data type for K (use type1:type2 for split K by RoPE boundary)\n"
             "allowed values: %s\n"
             "(default: %s)",
             get_all_kv_cache_types().c_str(),
             ggml_type_name(params.cache_type_k)
         ),
         [](common_params & params, const std::string & value) {
-            params.cache_type_k = kv_cache_type_from_str(value);
+            auto colon = value.find(':');
+            if (colon != std::string::npos) {
+                // Split K syntax: rope_type:static_type
+                params.cache_type_k        = kv_cache_type_from_str(value.substr(0, colon));
+                params.cache_type_k_static = kv_cache_type_from_str(value.substr(colon + 1));
+            } else {
+                params.cache_type_k = kv_cache_type_from_str(value);
+            }
         }
     ).set_env("LLAMA_ARG_CACHE_TYPE_K"));
     add_opt(common_arg(
