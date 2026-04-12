@@ -259,6 +259,12 @@ target_link_libraries(test-turbo-kv-rht PRIVATE ggml-base)
 add_executable(test-turbo-kv-vulkan test-turbo-kv-vulkan.cpp)
 target_link_libraries(test-turbo-kv-vulkan PRIVATE ggml-base ggml)
 
+add_executable(test-turbo-kv-gpu-roundtrip test-turbo-kv-gpu-roundtrip.cpp)
+target_link_libraries(test-turbo-kv-gpu-roundtrip PRIVATE ggml-base ggml)
+
+add_executable(test-turbo-kv-gpu-quantize test-turbo-kv-gpu-quantize.cpp)
+target_link_libraries(test-turbo-kv-gpu-quantize PRIVATE ggml-base ggml)
+
 add_executable(test-turbo-kv-4b-attn test-turbo-kv-4b-attn.cpp)
 target_link_libraries(test-turbo-kv-4b-attn PRIVATE ggml-base)
 
