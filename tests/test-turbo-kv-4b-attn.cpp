@@ -71,10 +71,7 @@ static bool test_attention_multi(int head_dim, int valid_count, int k_stride_blo
     // Test: batched attention_multi (rotates Q once, loops K)
     std::vector<float> test_scores(valid_count, 0.0f);
 
-    // turbo_kv_4b_attention_multi is declared in ggml-turbo-kv.h
-    // If not yet implemented, this test will fail to link — that's the point.
-    // The test fixture is written BEFORE the implementation.
-#if defined(TURBO_KV_4B_HAS_ATTENTION_MULTI)
+    // turbo_kv_4b_attention_multi is now implemented — test batched vs per-call.
     turbo_kv_4b_attention_multi(
         q.data(),
         k_cache.data(),
@@ -82,17 +79,6 @@ static bool test_attention_multi(int head_dim, int valid_count, int k_stride_blo
         valid_count,
         head_dim,
         k_stride_blocks);
-#else
-    // Fallback: use per-call as "batched" (no actual batching)
-    for (int s = 0; s < valid_count; s++) {
-        const block_turbo_kv_4b * k_blocks = k_cache.data() + s * k_stride_blocks;
-        ggml_vec_dot_turbo_kv_4b_f32(
-            head_dim, &test_scores[s], 0,
-            k_blocks, 0,
-            q.data(), 0,
-            1);
-    }
-#endif
 
     // Compare
     float max_err = 0.0f;

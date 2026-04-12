@@ -254,6 +254,57 @@ void turbo_kv_rotate_query_ggml(const float * x, void * y, int64_t k) {
     turbo_kv_rotate_query(x, (float *) y, (int) k);
 }
 
+/* Forward declare the per-block dot helper (defined below, after rotate_query). */
+static inline float turbo_kv_4b_single_block_dot(
+    const block_turbo_kv_4b * block, const float * q_rot_block, int dim_in_block);
+
+/* ============================================================
+ * Batched attention: rotate Q once, loop over all K positions.
+ *
+ * Mirrors tq_kv_1b_attention_multi (ggml-turbo-quant.c:377). The FA path
+ * in ops.cpp calls this once per thread with a slice of K. The non-FA
+ * vec_dot wrapper calls it with valid_count=1 as a single-position
+ * fallback.
+ * ============================================================ */
+void turbo_kv_4b_attention_multi(
+    const float              * query,
+    const block_turbo_kv_4b  * kv_cache,
+    float                    * scores,
+    int                        valid_count,
+    int                        head_dim,
+    int                        k_stride_blocks)
+{
+    const int n_blocks = head_dim / TURBO_KV_BLOCK_SIZE;
+    if (n_blocks * TURBO_KV_BLOCK_SIZE != head_dim || n_blocks <= 0 || n_blocks > 4) {
+        /* Unsupported head_dim; fall back to per-call vec_dot. */
+        for (int s = 0; s < valid_count; s++) {
+            const block_turbo_kv_4b * blocks = &kv_cache[s * (k_stride_blocks > 0 ? k_stride_blocks : n_blocks)];
+            ggml_vec_dot_turbo_kv_4b_f32(
+                head_dim, &scores[s], 0, blocks, 0, query, 0, 1);
+        }
+        return;
+    }
+
+    if (k_stride_blocks <= 0) k_stride_blocks = n_blocks;
+
+    /* Step 1: Pre-rotate query ONCE (per-block RHT). */
+    float q_rot[4 * TURBO_KV_BLOCK_SIZE];
+    turbo_kv_rotate_query(query, q_rot, head_dim);
+
+    /* Step 2: Loop over K positions — sum per-block dot products. */
+    for (int s = 0; s < valid_count; s++) {
+        const block_turbo_kv_4b * k_row = &kv_cache[s * k_stride_blocks];
+        float total = 0.0f;
+
+        for (int b = 0; b < n_blocks; b++) {
+            total += turbo_kv_4b_single_block_dot(
+                &k_row[b], q_rot + b * TURBO_KV_BLOCK_SIZE, TURBO_KV_BLOCK_SIZE);
+        }
+
+        scores[s] = total;
+    }
+}
+
 /* ============================================================
  * Query pre-rotation (public helper)
  *

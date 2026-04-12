@@ -257,66 +257,19 @@ static void ggml_vec_dot_turbo_kv_4b_f32_cpu(
 {
     GGML_UNUSED(bs); GGML_UNUSED(bx); GGML_UNUSED(by); GGML_UNUSED(nrc);
 
-#if defined(GGML_TURBO_KV_4B_HAVE_SSE)
-    /* Fast path: SSSE3 + SSE4.1 pshufb codebook lookup. Iterates over all
-     * blocks in the row — Qwen3.5 has head_dim=256 which is 2 blocks of
-     * 128 each. Each block is reduced independently.
-     *
-     * Since vec_dot_type is currently F32 (not TURBO_KV_Q_ROT_F32), vy is
-     * raw f32 and we rotate per call into a stack scratch. Hoisting is
-     * available (GGML_TYPE_TURBO_KV_Q_ROT_F32 is defined) but left off
-     * because it underperformed the per-call path — only 2 blocks per row
-     * parallelized across 2 threads vs per-vec_dot rotation in all 12.
-     */
-    const block_turbo_kv_4b * blocks = (const block_turbo_kv_4b *) vx;
-    int rot_n = n;
-    if (rot_n > 4 * TURBO_KV_BLOCK_SIZE) {
-        rot_n = 4 * TURBO_KV_BLOCK_SIZE;
-    }
-    float q_rot_buf[4 * TURBO_KV_BLOCK_SIZE];
-    turbo_kv_rotate_query((const float *) vy, q_rot_buf, rot_n);
-    const float * q_rot = q_rot_buf;
-
-    float total = 0.0f;
-    int d = 0;
-    int b = 0;
-    while (d + TURBO_KV_BLOCK_SIZE <= rot_n) {
-        const block_turbo_kv_4b * block = &blocks[b];
-        const float norm    = GGML_CPU_FP16_TO_FP32(*(const ggml_fp16_t *) &block->norm);
-        float       inv_std = GGML_CPU_FP16_TO_FP32(*(const ggml_fp16_t *) &block->inv_std_fp16);
-        if (inv_std < 1e-10f) inv_std = sqrtf((float) TURBO_KV_BLOCK_SIZE);
-
-        const float per_block_scale = (TURBO_KV_4B_CENT_MAX / 127.0f) / inv_std;
-        const float mse_dot = ggml_vec_dot_turbo_kv_4b_sse_inner(
-            q_rot + d, block->mse_indices, per_block_scale, TURBO_KV_BLOCK_SIZE);
-
-        total += norm * mse_dot;
-        d += TURBO_KV_BLOCK_SIZE;
-        b++;
-    }
-    /* Tail block (partial dim) — fall back to scalar for the leftover. */
-    if (d < rot_n) {
-        /* Build a single-block scalar dot without re-rotating. Build an
-         * fp16-esque bundle by reusing the scalar per-block helper from
-         * ggml-turbo-kv.c via a small C call. */
-        float tail_s = 0.0f;
-        const block_turbo_kv_4b * block = &blocks[b];
-        const float norm    = GGML_CPU_FP16_TO_FP32(*(const ggml_fp16_t *) &block->norm);
-        float       inv_std = GGML_CPU_FP16_TO_FP32(*(const ggml_fp16_t *) &block->inv_std_fp16);
-        if (inv_std < 1e-10f) inv_std = sqrtf((float) (rot_n - d));
-
-        const float per_block_scale = (TURBO_KV_4B_CENT_MAX / 127.0f) / inv_std;
-        const float mse_dot = ggml_vec_dot_turbo_kv_4b_sse_inner(
-            q_rot + d, block->mse_indices, per_block_scale, rot_n - d);
-        tail_s = norm * mse_dot;
-        total += tail_s;
-    }
-
-    *s = total;
-#else
-    /* Fallback: scalar reference from ggml-base handles per-call rotation. */
-    ggml_vec_dot_turbo_kv_4b_f32(n, s, bs, vx, bx, vy, by, nrc);
-#endif
+    /* Delegate to the batched kernel with valid_count=1. The batched kernel
+     * rotates Q once per call — for the vec_dot path this is one rotation
+     * per K position (same overhead as before). But when the FA special
+     * case in ops.cpp calls turbo_kv_4b_attention_multi directly with
+     * valid_count=N, the rotation runs once per thread per head, not once
+     * per K position. So this wrapper is a correct fallback, not the hot path. */
+    turbo_kv_4b_attention_multi(
+        (const float *) vy,
+        (const block_turbo_kv_4b *) vx,
+        s,
+        /*valid_count=*/1,
+        /*head_dim=*/n,
+        /*k_stride_blocks=*/0);
 }
 
 static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
@@ -3239,7 +3192,8 @@ struct ggml_cplan ggml_graph_plan(
                         // When split-KV is active (which now admits TQ_KV_1B),
                         // the partials buffer follows AFTER this TQ scratch —
                         // see partials_offset in the split-KV path of ops.cpp.
-                        if (node->src[1]->type == GGML_TYPE_TQ_KV_1B) {
+                        if (node->src[1]->type == GGML_TYPE_TQ_KV_1B ||
+                            node->src[1]->type == GGML_TYPE_TURBO_KV_4B) {
                             const size_t cache_line_f32 = CACHE_LINE_SIZE/sizeof(float);
                             const size_t tq_stride = ((nek1 + cache_line_f32 - 1) / cache_line_f32) * cache_line_f32;
                             cur += sizeof(float) * (size_t) n_tasks * tq_stride;

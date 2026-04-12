@@ -135,6 +135,35 @@ void turbo_kv_rotate_query(const float * q, float * out, int dim);
  * hoists the RHT out of the K loop. */
 void turbo_kv_rotate_query_ggml(const float * x, void * y, int64_t k);
 
+/* ============================================================
+ * Batched attention: compute scores for all K positions in one call.
+ *
+ * Rotates Q ONCE, then loops over valid_count K positions using the
+ * SSSE3 inner kernel. Eliminates the per-call rotation overhead that
+ * caused +52% wall-clock regression on tool-call workloads.
+ *
+ * Mirrors tq_kv_1b_attention_multi in ggml-turbo-quant.h. The FA path
+ * in ops.cpp calls this once per thread with a slice of K. The non-FA
+ * vec_dot wrapper calls it with valid_count=1 as a fallback.
+ *
+ * @param query         Raw f32 query vector (head_dim elements, NOT pre-rotated)
+ * @param kv_cache      Pointer to the first K block for position 0 in this head
+ * @param scores        Output: one f32 score per K position (valid_count elements)
+ * @param valid_count   Number of K positions to process
+ * @param head_dim      Head dimension (e.g. 256 for Qwen3.5), multiple of 128
+ * @param k_stride_blocks  Number of turbo_kv_4b blocks between consecutive K
+ *                         positions in the cache. For dense layout: head_dim/128.
+ *                         For GQA interleave: n_embd_k_gqa / 128. Pass 0 for
+ *                         the default (= head_dim / 128).
+ * ============================================================ */
+void turbo_kv_4b_attention_multi(
+    const float              * query,
+    const block_turbo_kv_4b  * kv_cache,
+    float                    * scores,
+    int                        valid_count,
+    int                        head_dim,
+    int                        k_stride_blocks);
+
 #ifdef __cplusplus
 }
 #endif
