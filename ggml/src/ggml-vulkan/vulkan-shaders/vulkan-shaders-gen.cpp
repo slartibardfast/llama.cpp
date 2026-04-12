@@ -832,8 +832,8 @@ void process_shaders() {
     string_to_spv("get_rows_turbo_kv_4b_f32",     "get_rows_turbo_kv_4b.comp",     {{"D_TYPE", "float"}});
     string_to_spv("cpy_f32_turbo_kv_4b",          "cpy_f32_turbo_kv_4b.comp",      {{"A_TYPE", "float"}});
     string_to_spv("cpy_turbo_kv_4b_f32",          "dequant_turbo_kv_4b.comp",      {{"D_TYPE", "float"}});
-    string_to_spv("set_rows_turbo_kv_4b_f32_i32", "set_rows_turbo_kv_4b.comp", {{"A_TYPE", "float"}, {"B_TYPE", "uint"},  {"B_SIZE", "32"}});
-    string_to_spv("set_rows_turbo_kv_4b_f32_i64", "set_rows_turbo_kv_4b.comp", {{"A_TYPE", "float"}, {"B_TYPE", "uvec2"}, {"B_SIZE", "64"}});
+    string_to_spv("set_rows_turbo_kv_4b_f32_i32", "set_rows_turbo_kv_4b.comp", {{"A_TYPE", "float"}, {"B_TYPE", "uint"},  {"B_SIZE", "32"}, {"D_TYPE", "uint8_t"}});
+    string_to_spv("set_rows_turbo_kv_4b_f32_i64", "set_rows_turbo_kv_4b.comp", {{"A_TYPE", "float"}, {"B_TYPE", "uvec2"}, {"B_SIZE", "64"}, {"D_TYPE", "uint8_t"}});
 
     auto get_type_str = [](bool f16) {
         return f16 ? "float16_t" : "float";

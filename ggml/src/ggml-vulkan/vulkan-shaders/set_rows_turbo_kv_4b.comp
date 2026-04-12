@@ -1,8 +1,8 @@
 #version 450
 
-// SET_ROWS: quantize input rows into TURBO_KV_4B blocks in the KV cache.
-// Uses standard vk_op_binary_push_constants layout.
-// src0 = input data (A_TYPE), src1 = row indices (int), dst = KV cache (TURBO_KV_4B)
+// SET_ROWS for TURBO_KV_4B: minimal flat addressing mirroring cpy_f32_turbo_kv_4b.
+// Uses the same forward FWHT + codebook quantize as the working CPY shader,
+// with row index lookup from the index tensor.
 
 #extension GL_EXT_control_flow_attributes : enable
 #extension GL_EXT_shader_16bit_storage : require
@@ -29,35 +29,39 @@ layout (push_constant) uniform parameter {
 
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
-layout (binding = 0) readonly buffer A {A_TYPE data_a[];};
-layout (binding = 1) readonly buffer B {B_TYPE data_b[];};
+layout (binding = 0) readonly buffer A {float data_a[];};
+#if B_SIZE == 64
+layout (binding = 1) readonly buffer B {uvec2 data_b[];};
+#else
+layout (binding = 1) readonly buffer B {uint data_b[];};
+#endif
 layout (binding = 2) writeonly buffer D {block_turbo_kv_4b data_d[];};
 
 void main() {
-    // Dispatch: one workgroup per block.
-    // For set_rows, the dispatch is typically (ne, 1, 1) where ne = total elements.
-    // We process one 128-element block per workgroup.
-    const uint block_id = gl_WorkGroupID.x;
-    const uint src_blocks_per_row = p.ne00 / QUANT_K_TURBO_KV_4B;
-    const uint row_in_src = block_id / src_blocks_per_row;
-    const uint blk_in_row = block_id % src_blocks_per_row;
+    // Flat workgroup index (same grid decomposition as ggml_vk dispatch)
+    const uint wg = gl_WorkGroupID.z * 262144 + gl_WorkGroupID.y * 512 + gl_WorkGroupID.x;
+    const uint blocks_per_row = p.ne00 / QUANT_K_TURBO_KV_4B;
+    const uint total_blocks = p.ne / QUANT_K_TURBO_KV_4B;
+
+    if (wg >= total_blocks) return;
+
+    const uint src_row = wg / blocks_per_row;
+    const uint blk_in_row = wg % blocks_per_row;
     const uint tid = gl_SubgroupInvocationID;
 
-    if (block_id >= p.ne / QUANT_K_TURBO_KV_4B) return;
-
-    // Row mapping: src1 contains destination row indices (I32 or I64)
+    // Read destination row from index tensor
 #if B_SIZE == 64
-    const uint dst_row = uint(data_b[row_in_src].x); // uvec2: low 32 bits
+    const uint dst_row = data_b[src_row].x;
 #else
-    const uint dst_row = data_b[row_in_src];
+    const uint dst_row = data_b[src_row];
 #endif
 
-    // Read input: src0 is [ne00, ne01, ...] with strides nb0x (in elements)
-    const uint src_elem = row_in_src * p.nb01 + blk_in_row * QUANT_K_TURBO_KV_4B;
-    float val0 = float(data_a[src_elem + tid]);
-    float val1 = float(data_a[src_elem + tid + 64]);
+    // Read source data: flat addressing, same as CPY
+    const uint src_base = src_row * p.ne00 + blk_in_row * QUANT_K_TURBO_KV_4B;
+    float val0 = data_a[src_base + tid];
+    float val1 = data_a[src_base + tid + 64];
 
-    // Quantize: norm → normalize → forward RHT → inv_std → nearest → pack
+    // Forward RHT + codebook quantize (identical to cpy_f32_turbo_kv_4b)
     float sum_sq = subgroupAdd(val0 * val0 + val1 * val1);
     float norm = sqrt(sum_sq);
     float rcp_norm = 1.0 / max(norm, 1e-10);
@@ -72,21 +76,20 @@ void main() {
     uint idx0 = turbo_kv_nearest(val0 * inv_std);
     uint idx1 = turbo_kv_nearest(val1 * inv_std);
 
-    // Pack indices
     uint partner0 = subgroupShuffleXor(idx0, 1);
     uint partner1 = subgroupShuffleXor(idx1, 1);
 
-    // Write to dst: src0 and dst have same number of elements per row
-    const uint dst_blk = dst_row * src_blocks_per_row + blk_in_row;
+    // Write to destination: flat block addressing with row index redirect
+    const uint dst_blk = dst_row * blocks_per_row + blk_in_row;
 
     if ((tid & 1u) == 0) {
-        data_d[dst_blk].mse_indices[tid / 2]       = uint8_t(idx0 | (partner0 << 4));
-        data_d[dst_blk].mse_indices[(tid + 64) / 2] = uint8_t(idx1 | (partner1 << 4));
+        data_d[dst_blk].mse_indices[tid / 2]        = uint8_t(idx0 | (partner0 << 4));
+        data_d[dst_blk].mse_indices[(tid + 64) / 2]  = uint8_t(idx1 | (partner1 << 4));
     }
     if (tid == 0) {
-        data_d[dst_blk].norm = turbo_kv_f32_to_fp16_bits(norm);
-        data_d[dst_blk].inv_std_fp16 = turbo_kv_f32_to_fp16_bits(inv_std);
+        data_d[dst_blk].norm          = turbo_kv_f32_to_fp16_bits(norm);
+        data_d[dst_blk].inv_std_fp16  = turbo_kv_f32_to_fp16_bits(inv_std);
         data_d[dst_blk].residual_norm = uint16_t(0);
-        data_d[dst_blk]._pad = uint16_t(0);
+        data_d[dst_blk]._pad          = uint16_t(0);
     }
 }

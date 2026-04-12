@@ -4441,8 +4441,8 @@ static void ggml_vk_load_shaders(vk_device& device) {
     // TURBO_KV_4B set_rows — uses subgroup FWHT, can't use the SET_ROWS macro
     if (device->subgroup_shuffle && device->subgroup_arithmetic) {
         const uint32_t ss = device->subgroup_size;
-        ggml_vk_create_pipeline(device, device->pipeline_set_rows_i32[GGML_TYPE_TURBO_KV_4B], "set_rows_turbo_kv_4b_f32_i32", set_rows_turbo_kv_4b_f32_i32_len, set_rows_turbo_kv_4b_f32_i32_data, "main", 3, sizeof(vk_op_binary_push_constants), {128, 1, 1}, {ss}, 1, true, true, ss);
-        ggml_vk_create_pipeline(device, device->pipeline_set_rows_i64[GGML_TYPE_TURBO_KV_4B], "set_rows_turbo_kv_4b_f32_i64", set_rows_turbo_kv_4b_f32_i64_len, set_rows_turbo_kv_4b_f32_i64_data, "main", 3, sizeof(vk_op_binary_push_constants), {128, 1, 1}, {ss}, 1, true, true, ss);
+        ggml_vk_create_pipeline(device, device->pipeline_set_rows_i32[GGML_TYPE_TURBO_KV_4B], "set_rows_turbo_kv_4b_f32_i32", set_rows_turbo_kv_4b_f32_i32_len, set_rows_turbo_kv_4b_f32_i32_data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {ss}, 1, true, true, ss);
+        ggml_vk_create_pipeline(device, device->pipeline_set_rows_i64[GGML_TYPE_TURBO_KV_4B], "set_rows_turbo_kv_4b_f32_i64", set_rows_turbo_kv_4b_f32_i64_len, set_rows_turbo_kv_4b_f32_i64_data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {ss}, 1, true, true, ss);
     }
 
     ggml_vk_create_pipeline(device, device->pipeline_cpy_quant_f32[GGML_TYPE_Q4_0], "cpy_q4_0_f32", cpy_q4_0_f32_len, cpy_q4_0_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {(uint32_t)ggml_blck_size(GGML_TYPE_Q4_0), 1, 1}, {}, 1);
@@ -10223,7 +10223,10 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
     case GGML_OP_SET_ROWS:
         {
             uint32_t ne = ggml_nelements(src0);
-            if (ggml_is_quantized(dst->type)) {
+            if (dst->type == GGML_TYPE_TURBO_KV_4B) {
+                // subgroup FWHT: one workgroup (64 threads) per 128-element block
+                ne = CEIL_DIV(ne, ggml_blck_size(dst->type));
+            } else if (ggml_is_quantized(dst->type)) {
                 // quants run 32 threads each doing QUANT_K elements
                 ne = CEIL_DIV(ne, 32 * ggml_blck_size(dst->type));
             } else {
