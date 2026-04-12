@@ -1966,7 +1966,12 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         cb(kq, "kq_soft_max", il);
 
         if (!v_trans) {
-            // note: avoid this branch
+            // Non-transposed V: transpose + contiguify for mul_mat.
+            // For block-quantized types (turbo_kv_4b), cast to f32 first —
+            // ggml_cont on a transposed quantized tensor corrupts block structure.
+            if (ggml_is_quantized(v->type)) {
+                v = ggml_cast(ctx0, v, GGML_TYPE_F32);
+            }
             v = ggml_cont(ctx0, ggml_transpose(ctx0, v));
             cb(v, "v_cont", il);
         }
