@@ -249,9 +249,15 @@ llama_build_and_test(test-backend-sampler.cpp   LABEL "model")
 llama_build_and_test(test-state-restore-fragmented.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
 set_tests_properties(test-state-restore-fragmented PROPERTIES FIXTURES_REQUIRED test-download-model)
 
-# Plan A foundation: verify recurrent snapshot/restore for hybrid DeltaNet models.
-# Not auto-registered against the downloaded model fixture — needs a hybrid model.
+# Recurrent snapshot/restore for hybrid DeltaNet models (needs a hybrid model).
 llama_build_and_test(test-mtp-snapshot.cpp LABEL "manual-hybrid")
+
+# TurboQuant KV cache correctness fixtures (no model needed — pure math / synthetic data).
+add_executable(test-turbo-kv-rht test-turbo-kv-rht.cpp)
+target_link_libraries(test-turbo-kv-rht PRIVATE ggml-base)
+
+add_executable(test-turbo-kv-4b-attn test-turbo-kv-4b-attn.cpp)
+target_link_libraries(test-turbo-kv-4b-attn PRIVATE ggml-base)
 
 if (NOT GGML_BACKEND_DL)
     # these tests use the backends directly and cannot be built with dynamic loading
