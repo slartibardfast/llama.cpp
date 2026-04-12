@@ -245,34 +245,111 @@ void dequantize_row_turbo_kv_4b(const block_turbo_kv_4b * x, float * y, int64_t 
     }
 }
 
-/* ============================================================
- * Query pre-rotation (public helper)
- *
- * Applies RHT(q) into out, zero-padded to TURBO_KV_BLOCK_SIZE. dim must
- * be <= BK. This is the expensive step at the Q boundary but it is only
- * called ONCE per attention row — the K batch shares the rotation.
- * ============================================================ */
-void turbo_kv_rotate_query(const float * q, float * out, int dim) {
-    if (dim > TURBO_KV_BLOCK_SIZE) dim = TURBO_KV_BLOCK_SIZE;
-    memcpy(out, q, (size_t) dim * sizeof(float));
-    for (int i = dim; i < TURBO_KV_BLOCK_SIZE; i++) {
-        out[i] = 0.0f;
-    }
-    turbo_kv_rht_forward(out, dim, TURBO_KV_DEFAULT_SEED);
+/* ggml_from_float_t-compatible wrapper. Used as the from_float hook on
+ * GGML_TYPE_TURBO_KV_Q_ROT_F32 so mul_mat's pre-convert step calls us
+ * when src1->type = F32 and vec_dot_type = TURBO_KV_Q_ROT_F32. That
+ * hoists the rotation out of the K loop (one call per Q row instead of
+ * one per vec_dot invocation). */
+void turbo_kv_rotate_query_ggml(const float * x, void * y, int64_t k) {
+    turbo_kv_rotate_query(x, (float *) y, (int) k);
 }
 
 /* ============================================================
- * Scalar reference vec_dot: <f32 query, turbo_kv_4b block>
+ * Query pre-rotation (public helper)
  *
- * The query MUST already be RHT-rotated and zero-padded to BK. In ggml's
- * type-traits API, kq_vec_dot passes the pre-quantized Q (already routed
- * through q_to_vec_dot) as vy. For TURBO_KV_4B, vec_dot_type = F32 and
- * q_to_vec_dot is our turbo_kv_rotate_query wrapper that runs once per
- * row and caches into the per-thread scratch buffer used by the outer FA
- * loop.
+ * Applies a per-block RHT(q) into out. dim may exceed TURBO_KV_BLOCK_SIZE
+ * (e.g. Qwen3.5 uses head_dim=256 which is 2 × 128 blocks). Each
+ * TURBO_KV_BLOCK_SIZE-aligned chunk is rotated independently with the
+ * same seed, matching how the K cache stores multi-block rows. The full
+ * dot product is then the sum of per-block dots (see vec_dot below).
  *
- * n is the head dimension (e.g. 256 for Qwen3.5 attention heads).
+ * The output buffer must have room for nb × TURBO_KV_BLOCK_SIZE floats
+ * where nb = ceil(dim / TURBO_KV_BLOCK_SIZE). Any trailing slack in the
+ * last block is zero-padded before rotation.
  * ============================================================ */
+void turbo_kv_rotate_query(const float * q, float * out, int dim) {
+    if (dim <= 0) return;
+
+    /* Whole blocks */
+    int d = 0;
+    while (d + TURBO_KV_BLOCK_SIZE <= dim) {
+        memcpy(out + d, q + d, (size_t) TURBO_KV_BLOCK_SIZE * sizeof(float));
+        turbo_kv_rht_forward(out + d, TURBO_KV_BLOCK_SIZE, TURBO_KV_DEFAULT_SEED);
+        d += TURBO_KV_BLOCK_SIZE;
+    }
+
+    /* Tail block (zero-padded) */
+    if (d < dim) {
+        memcpy(out + d, q + d, (size_t) (dim - d) * sizeof(float));
+        for (int i = dim; i < d + TURBO_KV_BLOCK_SIZE; i++) {
+            out[i] = 0.0f;
+        }
+        turbo_kv_rht_forward(out + d, TURBO_KV_BLOCK_SIZE, TURBO_KV_DEFAULT_SEED);
+    }
+}
+
+/* ============================================================
+ * Scalar reference vec_dot: <f32 query, turbo_kv_4b row of blocks>
+ *
+ * The query MUST already be RHT-rotated per-block by turbo_kv_rotate_query.
+ * The K row is n elements total; nb = ceil(n / 128) turbo_kv_4b blocks
+ * stored contiguously. Each block has its own norm and inv_std. Because
+ * the RHT is per-block AND orthogonal, the full dot product is the sum
+ * of per-block dots:
+ *
+ *     <q, k>  ==  sum_b  norm_b * <q_rot_b, dequant_rot_b(k_b)>
+ *
+ * where q_rot_b is q_rot[b*128 .. b*128+127] and k_b is block b of the
+ * K row. Mathematically correct because both RHT_b and the block-norm
+ * factoring are linear operations, and RHT preserves dot products
+ * within each block.
+ *
+ * n is the head dimension (e.g. 256 for Qwen3.5 attention heads, which
+ * maps to 2 blocks per row).
+ * ============================================================ */
+static inline float turbo_kv_4b_single_block_dot(
+    const block_turbo_kv_4b * block,
+    const float * q_rot_block,
+    int dim_in_block)
+{
+    const float norm = turbo_kv_fp16_to_fp32(block->norm);
+    float inv_std = turbo_kv_fp16_to_fp32(block->inv_std_fp16);
+    if (inv_std < 1e-10f) inv_std = sqrtf((float) dim_in_block);
+    const float scale = 1.0f / inv_std;
+
+    /* Pre-scaled 16-entry LUT (fused dequant + per-block scale) */
+    float lut[16];
+    for (int c = 0; c < 16; c++) {
+        lut[c] = turbo_kv_4b_codebook[c] * scale;
+    }
+
+    const uint8_t * mi = block->mse_indices;
+    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+    int d = 0;
+    for (; d + 7 < dim_in_block; d += 8) {
+        const uint8_t b0 = mi[(d + 0) / 2];
+        const uint8_t b1 = mi[(d + 2) / 2];
+        const uint8_t b2 = mi[(d + 4) / 2];
+        const uint8_t b3 = mi[(d + 6) / 2];
+        a0 += q_rot_block[d + 0] * lut[b0 & 0x0F];
+        a1 += q_rot_block[d + 1] * lut[b0 >> 4];
+        a2 += q_rot_block[d + 2] * lut[b1 & 0x0F];
+        a3 += q_rot_block[d + 3] * lut[b1 >> 4];
+        a0 += q_rot_block[d + 4] * lut[b2 & 0x0F];
+        a1 += q_rot_block[d + 5] * lut[b2 >> 4];
+        a2 += q_rot_block[d + 6] * lut[b3 & 0x0F];
+        a3 += q_rot_block[d + 7] * lut[b3 >> 4];
+    }
+    float mse_dot = (a0 + a1) + (a2 + a3);
+    for (; d < dim_in_block; d++) {
+        const uint8_t bv = mi[d / 2];
+        const int idx = (d & 1) ? (bv >> 4) : (bv & 0x0F);
+        mse_dot += q_rot_block[d] * lut[idx];
+    }
+
+    return norm * mse_dot;
+}
+
 void ggml_vec_dot_turbo_kv_4b_f32(
     int n, float * GGML_RESTRICT s, size_t bs,
     const void * GGML_RESTRICT vx, size_t bx,
@@ -284,51 +361,34 @@ void ggml_vec_dot_turbo_kv_4b_f32(
     GGML_UNUSED(by);
     GGML_UNUSED(nrc);
 
-    const float * q_rot = (const float *) vy;
-    const block_turbo_kv_4b * block = (const block_turbo_kv_4b *) vx;
+    /* vy is raw f32 from ggml. We rotate per call since the current
+     * TURBO_KV_4B vec_dot_type is F32 (hoisting via TURBO_KV_Q_ROT_F32
+     * was tried but regressed — see the comment in ggml-cpu.c on the
+     * CPU trait registration). */
+    const float * q_raw = (const float *) vy;
+    const block_turbo_kv_4b * blocks = (const block_turbo_kv_4b *) vx;
 
-    int dim = n;
-    if (dim > TURBO_KV_BLOCK_SIZE) dim = TURBO_KV_BLOCK_SIZE;
-
-    const float norm = turbo_kv_fp16_to_fp32(block->norm);
-    float inv_std = turbo_kv_fp16_to_fp32(block->inv_std_fp16);
-    if (inv_std < 1e-10f) inv_std = sqrtf((float) dim);
-    const float scale = 1.0f / inv_std;
-
-    /* Pre-scaled 16-entry LUT (fused dequant + per-block scale) */
-    float lut[16];
-    for (int c = 0; c < 16; c++) {
-        lut[c] = turbo_kv_4b_codebook[c] * scale;
+    float q_rot[4 * TURBO_KV_BLOCK_SIZE];
+    int rot_n = n;
+    if (rot_n > 4 * TURBO_KV_BLOCK_SIZE) {
+        rot_n = 4 * TURBO_KV_BLOCK_SIZE;
     }
+    turbo_kv_rotate_query(q_raw, q_rot, rot_n);
 
-    /* Dot product in rotated space — RHT is orthogonal so
-     * <q, k>  ==  <RHT(q), RHT(k)>.
-     */
-    const uint8_t * mi = block->mse_indices;
-    float mse_dot = 0.0f;
-    /* Unrolled by 8 elements per iteration for ILP */
-    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+    float total = 0.0f;
     int d = 0;
-    for (; d + 7 < dim; d += 8) {
-        const uint8_t b0 = mi[(d + 0) / 2];
-        const uint8_t b1 = mi[(d + 2) / 2];
-        const uint8_t b2 = mi[(d + 4) / 2];
-        const uint8_t b3 = mi[(d + 6) / 2];
-        a0 += q_rot[d + 0] * lut[b0 & 0x0F];
-        a1 += q_rot[d + 1] * lut[b0 >> 4];
-        a2 += q_rot[d + 2] * lut[b1 & 0x0F];
-        a3 += q_rot[d + 3] * lut[b1 >> 4];
-        a0 += q_rot[d + 4] * lut[b2 & 0x0F];
-        a1 += q_rot[d + 5] * lut[b2 >> 4];
-        a2 += q_rot[d + 6] * lut[b3 & 0x0F];
-        a3 += q_rot[d + 7] * lut[b3 >> 4];
+    int b = 0;
+    while (d + TURBO_KV_BLOCK_SIZE <= rot_n) {
+        total += turbo_kv_4b_single_block_dot(
+            &blocks[b], q_rot + d, TURBO_KV_BLOCK_SIZE);
+        d += TURBO_KV_BLOCK_SIZE;
+        b++;
     }
-    mse_dot = (a0 + a1) + (a2 + a3);
-    for (; d < dim; d++) {
-        const uint8_t bv = mi[d / 2];
-        const int idx = (d & 1) ? (bv >> 4) : (bv & 0x0F);
-        mse_dot += q_rot[d] * lut[idx];
+    /* Tail block (partial) */
+    if (d < rot_n) {
+        total += turbo_kv_4b_single_block_dot(
+            &blocks[b], q_rot + d, rot_n - d);
     }
 
-    *s = norm * mse_dot;
+    *s = total;
 }

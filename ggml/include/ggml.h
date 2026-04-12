@@ -435,7 +435,12 @@ extern "C" {
         // RHT + 16-entry Lloyd-Max-Gaussian codebook, 72 bytes per 128 elements, ~4.5 bpe.
         // Has a real vec_dot so it works with both FA on and FA off, unlike TQ_V_4B.
         GGML_TYPE_TURBO_KV_4B = 44,
-        GGML_TYPE_COUNT    = 45,
+        // Pseudo-type: F32 rows that have been RHT-rotated per block. Not a
+        // storage type — used only as vec_dot_type for TURBO_KV_4B so ggml's
+        // mul_mat pre-convert hoists turbo_kv_rotate_query out of the K loop.
+        // Block layout is identical to F32 (1 element/block, 4 bytes/element).
+        GGML_TYPE_TURBO_KV_Q_ROT_F32 = 45,
+        GGML_TYPE_COUNT    = 46,
     };
 
     // precision

@@ -761,6 +761,28 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = (ggml_to_float_t) dequantize_row_turbo_kv_4b,
         .from_float_ref           = (ggml_from_float_t) quantize_row_turbo_kv_4b_ref,
     },
+    [GGML_TYPE_TURBO_KV_Q_ROT_F32] = {
+        /* Pseudo-type: same byte layout as F32, semantically "RHT-rotated F32
+         * query". Used as TURBO_KV_4B's vec_dot_type so ggml_compute_forward_mul_mat
+         * pre-converts src1 (the Q tensor) by calling our from_float hook, which
+         * runs turbo_kv_rotate_query. This lifts the rotation out of the K loop.
+         *
+         * CRITICAL: blck_size = TURBO_KV_BLOCK_SIZE (128), not 1. The mul_mat
+         * pre-convert parallelizes work per block across threads — each call
+         * to from_float handles an integer number of blocks. If we set
+         * blck_size=1, the pre-convert splits a 128-element row across multiple
+         * threads, each doing a 64-element (or smaller) "rotation" which is
+         * mathematically nonsense because RHT needs all 128 elements in the
+         * butterfly at once. Setting blck_size=128 ensures every call receives
+         * a whole block. type_size = 128 * 4 bytes so the row total matches F32
+         * in byte count (ne10 * type_size / blck_size = ne10 * 4 = same as F32). */
+        .type_name                = "turbo_kv_q_rot_f32",
+        .blck_size                = TURBO_KV_BLOCK_SIZE,
+        .type_size                = TURBO_KV_BLOCK_SIZE * sizeof(float),
+        .is_quantized             = false,
+        .to_float                 = (ggml_to_float_t) NULL,
+        .from_float_ref           = (ggml_from_float_t) turbo_kv_rotate_query_ggml,
+    },
     [GGML_TYPE_Q2_K] = {
         .type_name                = "q2_K",
         .blck_size                = QK_K,

@@ -130,6 +130,11 @@ void ggml_vec_dot_turbo_kv_4b_f32(
  * ============================================================ */
 void turbo_kv_rotate_query(const float * q, float * out, int dim);
 
+/* ggml_from_float_t-compatible wrapper. Registered as the from_float
+ * hook on GGML_TYPE_TURBO_KV_Q_ROT_F32 so mul_mat's pre-convert step
+ * hoists the RHT out of the K loop. */
+void turbo_kv_rotate_query_ggml(const float * x, void * y, int64_t k);
+
 #ifdef __cplusplus
 }
 #endif

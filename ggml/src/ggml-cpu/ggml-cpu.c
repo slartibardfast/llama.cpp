@@ -258,24 +258,63 @@ static void ggml_vec_dot_turbo_kv_4b_f32_cpu(
     GGML_UNUSED(bs); GGML_UNUSED(bx); GGML_UNUSED(by); GGML_UNUSED(nrc);
 
 #if defined(GGML_TURBO_KV_4B_HAVE_SSE)
-    /* Fast path: SSSE3 + SSE4.1 pshufb codebook lookup. */
-    const float * q_rot = (const float *) vy;
-    const block_turbo_kv_4b * block = (const block_turbo_kv_4b *) vx;
+    /* Fast path: SSSE3 + SSE4.1 pshufb codebook lookup. Iterates over all
+     * blocks in the row — Qwen3.5 has head_dim=256 which is 2 blocks of
+     * 128 each. Each block is reduced independently.
+     *
+     * Since vec_dot_type is currently F32 (not TURBO_KV_Q_ROT_F32), vy is
+     * raw f32 and we rotate per call into a stack scratch. Hoisting is
+     * available (GGML_TYPE_TURBO_KV_Q_ROT_F32 is defined) but left off
+     * because it underperformed the per-call path — only 2 blocks per row
+     * parallelized across 2 threads vs per-vec_dot rotation in all 12.
+     */
+    const block_turbo_kv_4b * blocks = (const block_turbo_kv_4b *) vx;
+    int rot_n = n;
+    if (rot_n > 4 * TURBO_KV_BLOCK_SIZE) {
+        rot_n = 4 * TURBO_KV_BLOCK_SIZE;
+    }
+    float q_rot_buf[4 * TURBO_KV_BLOCK_SIZE];
+    turbo_kv_rotate_query((const float *) vy, q_rot_buf, rot_n);
+    const float * q_rot = q_rot_buf;
 
-    int dim = n;
-    if (dim > TURBO_KV_BLOCK_SIZE) dim = TURBO_KV_BLOCK_SIZE;
+    float total = 0.0f;
+    int d = 0;
+    int b = 0;
+    while (d + TURBO_KV_BLOCK_SIZE <= rot_n) {
+        const block_turbo_kv_4b * block = &blocks[b];
+        const float norm    = GGML_CPU_FP16_TO_FP32(*(const ggml_fp16_t *) &block->norm);
+        float       inv_std = GGML_CPU_FP16_TO_FP32(*(const ggml_fp16_t *) &block->inv_std_fp16);
+        if (inv_std < 1e-10f) inv_std = sqrtf((float) TURBO_KV_BLOCK_SIZE);
 
-    const float norm    = GGML_CPU_FP16_TO_FP32(*(const ggml_fp16_t *) &block->norm);
-    float       inv_std = GGML_CPU_FP16_TO_FP32(*(const ggml_fp16_t *) &block->inv_std_fp16);
-    if (inv_std < 1e-10f) inv_std = sqrtf((float) dim);
+        const float per_block_scale = (TURBO_KV_4B_CENT_MAX / 127.0f) / inv_std;
+        const float mse_dot = ggml_vec_dot_turbo_kv_4b_sse_inner(
+            q_rot + d, block->mse_indices, per_block_scale, TURBO_KV_BLOCK_SIZE);
 
-    const float per_block_scale = (TURBO_KV_4B_CENT_MAX / 127.0f) / inv_std;
-    const float mse_dot = ggml_vec_dot_turbo_kv_4b_sse_inner(
-        q_rot, block->mse_indices, per_block_scale, dim);
+        total += norm * mse_dot;
+        d += TURBO_KV_BLOCK_SIZE;
+        b++;
+    }
+    /* Tail block (partial dim) — fall back to scalar for the leftover. */
+    if (d < rot_n) {
+        /* Build a single-block scalar dot without re-rotating. Build an
+         * fp16-esque bundle by reusing the scalar per-block helper from
+         * ggml-turbo-kv.c via a small C call. */
+        float tail_s = 0.0f;
+        const block_turbo_kv_4b * block = &blocks[b];
+        const float norm    = GGML_CPU_FP16_TO_FP32(*(const ggml_fp16_t *) &block->norm);
+        float       inv_std = GGML_CPU_FP16_TO_FP32(*(const ggml_fp16_t *) &block->inv_std_fp16);
+        if (inv_std < 1e-10f) inv_std = sqrtf((float) (rot_n - d));
 
-    *s = norm * mse_dot;
+        const float per_block_scale = (TURBO_KV_4B_CENT_MAX / 127.0f) / inv_std;
+        const float mse_dot = ggml_vec_dot_turbo_kv_4b_sse_inner(
+            q_rot + d, block->mse_indices, per_block_scale, rot_n - d);
+        tail_s = norm * mse_dot;
+        total += tail_s;
+    }
+
+    *s = total;
 #else
-    /* Fallback: scalar reference from ggml-base. */
+    /* Fallback: scalar reference from ggml-base handles per-call rotation. */
     ggml_vec_dot_turbo_kv_4b_f32(n, s, bs, vx, bx, vy, by, nrc);
 #endif
 }
@@ -380,12 +419,29 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
          * flash attention kq_vec_dot path AND the explicit mul_mat fallback
          * (-fa off). The cpu wrapper dispatches to the SSSE3 pshufb kernel
          * on Westmere+ and to the scalar ggml-base reference elsewhere.
-         * vec_dot_type = F32: the query is pre-rotated by turbo_kv_rotate_query
-         * once per row, and the "quantize Q" hook here is the RHT rotation,
-         * not a type conversion. */
+         *
+         * vec_dot_type = TURBO_KV_Q_ROT_F32: the Q row (src1) is pre-rotated
+         * once by turbo_kv_rotate_query_ggml in mul_mat's pre-convert step,
+         * not per vec_dot call. The vec_dot therefore receives a ready
+         * rotated query and skips rotation entirely. */
         .from_float               = (ggml_from_float_t) quantize_row_turbo_kv_4b_ref,
         .vec_dot                  = ggml_vec_dot_turbo_kv_4b_f32_cpu,
+        /* Temporarily disabled: vec_dot_type = GGML_TYPE_TURBO_KV_Q_ROT_F32
+         * pending investigation into why the hoisted-rotation path regresses
+         * vs per-call rotation. Suspected causes: serialized single-thread
+         * rotation (only 2 blocks per row, only 2 of 12 threads participate)
+         * vs. fully-parallel vec_dot with in-kernel rotation. */
         .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_TURBO_KV_Q_ROT_F32] = {
+        /* Pseudo-type: from_float runs turbo_kv_rotate_query_ggml which
+         * RHT-rotates the input f32 row. Used only as TURBO_KV_4B's
+         * vec_dot_type. Never backs a real tensor, so vec_dot is NULL.
+         * row_size = n_elements * 4 bytes (same as F32). */
+        .from_float               = (ggml_from_float_t) turbo_kv_rotate_query_ggml,
+        .vec_dot                  = NULL,
+        .vec_dot_type             = GGML_TYPE_TURBO_KV_Q_ROT_F32,
         .nrows                    = 1,
     },
     [GGML_TYPE_Q2_K] = {
