@@ -456,6 +456,10 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     if (self_v_rot) {
         mctx->set_input_v_rot(self_v_rot);
     }
+
+    if (self_k_pos) {
+        mctx->set_input_k_pos(self_k_pos);
+    }
 }
 
 bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
@@ -2080,6 +2084,10 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
     inp->self_k_rot = mctx_cur->build_input_k_rot(ctx0);
     inp->self_v_rot = mctx_cur->build_input_v_rot(ctx0);
 
+    // Pre-RoPE K: position tensor for on-the-fly RoPE at attention time.
+    // Non-null only for turbo_kv_4b (the builder checks type_k internally).
+    inp->self_k_pos = mctx_cur->build_input_k_pos(ctx0);
+
     return inp;
 }
 
@@ -2137,6 +2145,30 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * q = q_cur;
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
+
+    // Pre-RoPE K storage: K was stored without RoPE. Apply it now on the
+    // dequantized f32 K using the per-cell position indices. This is the
+    // standard KVQuant approach — quantization quality improves because K's
+    // channel-wise outlier structure is preserved (not scrambled by RoPE).
+    if (inp->self_k_pos) {
+        // Dequant quantized K to f32 (via ggml_cast which calls to_float)
+        k = ggml_cast(ctx0, k, GGML_TYPE_F32);
+
+        // Apply RoPE using per-cell positions from the KV cache.
+        // Use ggml_rope_multi for M-RoPE support (Qwen3.5 sections [11,11,10,0]).
+        // The position tensor is [n_kv * 4] for M-RoPE, matching the model's
+        // inp_pos layout used during the original Q RoPE in the model file.
+        int sections[4];
+        std::copy(hparams.rope_sections.begin(), hparams.rope_sections.end(), sections);
+        k = ggml_rope_multi(ctx0, k,
+            inp->self_k_pos, nullptr,
+            hparams.n_rot(il), sections,
+            hparams.rope_type,
+            cparams.n_ctx_orig_yarn, cparams.rope_freq_base, cparams.rope_freq_scale,
+            cparams.yarn_ext_factor, cparams.yarn_attn_factor,
+            cparams.yarn_beta_fast, cparams.yarn_beta_slow);
+        cb(k, "k_rope_on_the_fly", il);
+    }
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
     cb(cur, "kqv_out", il);

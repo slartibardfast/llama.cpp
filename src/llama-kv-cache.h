@@ -208,6 +208,9 @@ public:
     void set_input_k_rot(ggml_tensor * dst) const;
     void set_input_v_rot(ggml_tensor * dst) const;
 
+    // Pre-RoPE K: populate per-cell absolute positions for on-the-fly RoPE
+    void set_input_k_pos(ggml_tensor * dst, const slot_info & sinfo) const;
+
 private:
     const llama_model & model;
     const llama_hparams & hparams;
@@ -375,6 +378,10 @@ public:
     ggml_tensor * build_input_k_rot(ggml_context * ctx) const;
     ggml_tensor * build_input_v_rot(ggml_context * ctx) const;
 
+    // Pre-RoPE K storage: per-cell absolute position indices for on-the-fly RoPE.
+    // Returns a [n_kv] I32 tensor, or nullptr if K type is not pre-RoPE.
+    ggml_tensor * build_input_k_pos(ggml_context * ctx) const;
+
     void set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
     void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
@@ -384,6 +391,8 @@ public:
 
     void set_input_k_rot(ggml_tensor * dst) const;
     void set_input_v_rot(ggml_tensor * dst) const;
+
+    void set_input_k_pos(ggml_tensor * dst) const;
 
 private:
     llama_memory_status status;

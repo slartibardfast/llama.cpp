@@ -301,6 +301,7 @@ llama_kv_cache::llama_kv_cache(
         !attn_rot_disable &&
         n_embd_head_k_all > 0 &&
         ggml_is_quantized(type_k) &&
+        type_k != GGML_TYPE_TURBO_KV_4B && // turbo_kv_4b has its own RHT rotation internally
         hparams.n_embd_head_k() % 64 == 0;
 
     attn_rot_v =
@@ -1705,6 +1706,26 @@ void llama_kv_cache::set_input_v_rot(ggml_tensor * dst) const {
     memcpy(dst->data, attn_rot_hadamard.at(n_rot).data(), ggml_nbytes(dst));
 }
 
+void llama_kv_cache::set_input_k_pos(ggml_tensor * dst, const slot_info & sinfo) const {
+    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+
+    int32_t * data = (int32_t *) dst->data;
+    const auto & cells = v_cells[sinfo.s0];
+    // dst shape is [n_kv * 4] for M-RoPE. Each token gets 4 identical
+    // position indices (all sections use the same position for text-only
+    // models; vision models would differ). This matches the inp_pos layout
+    // used by ggml_rope_multi in the model's forward pass.
+    const uint32_t n_kv = (uint32_t) (dst->ne[0] / 4);
+
+    for (uint32_t i = 0; i < n_kv; ++i) {
+        const int32_t pos = cells.is_empty(i) ? 0 : (int32_t) cells.pos_get(i);
+        data[i*4 + 0] = pos;
+        data[i*4 + 1] = pos;
+        data[i*4 + 2] = pos;
+        data[i*4 + 3] = pos;
+    }
+}
+
 size_t llama_kv_cache::total_size() const {
     size_t size = 0;
 
@@ -2519,4 +2540,26 @@ void llama_kv_cache_context::set_input_k_rot(ggml_tensor * dst) const {
 
 void llama_kv_cache_context::set_input_v_rot(ggml_tensor * dst) const {
     kv->set_input_v_rot(dst);
+}
+
+ggml_tensor * llama_kv_cache_context::build_input_k_pos(ggml_context * ctx) const {
+    // Only for pre-RoPE K types (turbo_kv_4b). Returns nullptr otherwise.
+    if (type_k() != GGML_TYPE_TURBO_KV_4B) {
+        return nullptr;
+    }
+    const uint32_t n_kv = get_n_kv();
+    // For M-RoPE (Qwen3.5): positions are [n_kv * 4] because each token
+    // has 4 section-specific position indices (sections [11,11,10,0]).
+    // For standard RoPE: positions are [n_kv].
+    // We always allocate [n_kv * 4] and set_input fills accordingly.
+    ggml_tensor * res = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_kv * 4);
+    ggml_set_input(res);
+    ggml_set_name(res, "k_pos");
+    return res;
+}
+
+void llama_kv_cache_context::set_input_k_pos(ggml_tensor * dst) const {
+    // Delegate to the kv cache's set_input_k_shift-style pattern.
+    // We use the same cell iteration but read absolute positions, not shifts.
+    kv->set_input_k_pos(dst, sinfos[i_cur]);
 }

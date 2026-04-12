@@ -179,18 +179,25 @@ ggml_tensor * llm_build_qwen35moe ::build_layer_attn(
 
     Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
 
-    // Apply IMRoPE
+    // Apply IMRoPE to Q (always)
     Qcur = ggml_rope_multi(
             ctx0, Qcur, inp_pos, nullptr,
             n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
             ext_factor, attn_factor, beta_fast, beta_slow
             );
 
-    Kcur = ggml_rope_multi(
-            ctx0, Kcur, inp_pos, nullptr,
-            n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
-            ext_factor, attn_factor, beta_fast, beta_slow
-            );
+    // Apply IMRoPE to K — SKIP for pre-RoPE K cache types (turbo_kv_4b).
+    // Pre-RoPE stores K without position encoding; RoPE is applied on-the-fly
+    // at attention time using per-cell positions from the KV cache. This
+    // preserves channel-wise outlier structure for better quantization
+    // (KVQuant NeurIPS 2024 finding).
+    if (!inp->self_k_pos) {
+        Kcur = ggml_rope_multi(
+                ctx0, Kcur, inp_pos, nullptr,
+                n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
+                ext_factor, attn_factor, beta_fast, beta_slow
+                );
+    }
 
     cb(Qcur, "Qcur", il);
     cb(Kcur, "Kcur", il);
