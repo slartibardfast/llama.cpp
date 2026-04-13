@@ -1,8 +1,8 @@
 #version 450
 
-// SET_ROWS for TURBO_KV_4B: minimal flat addressing mirroring cpy_f32_turbo_kv_4b.
-// Uses the same forward FWHT + codebook quantize as the working CPY shader,
-// with row index lookup from the index tensor.
+// SET_ROWS for TURBO_KV_4B: stride-based 4D addressing with subgroup-cooperative
+// forward FWHT + codebook quantize. Uses the same push_constant layout as
+// vk_op_binary_push_constants for full stride and offset support.
 
 #extension GL_EXT_control_flow_attributes : enable
 #extension GL_EXT_shader_16bit_storage : require
@@ -37,27 +37,47 @@ layout (binding = 1) readonly buffer B {uint data_b[];};
 #endif
 layout (binding = 2) writeonly buffer D {block_turbo_kv_4b data_d[];};
 
+uint get_aoffset() { return p.misalign_offsets >> 16; }
+uint get_boffset() { return (p.misalign_offsets >> 8) & 0xFF; }
+uint get_doffset() { return p.misalign_offsets & 0xFF; }
+
 void main() {
-    // Flat workgroup index (same grid decomposition as ggml_vk dispatch)
+    // One workgroup per 128-element TURBO_KV_4B block
     const uint wg = gl_WorkGroupID.z * 262144 + gl_WorkGroupID.y * 512 + gl_WorkGroupID.x;
-    const uint blocks_per_row = p.ne00 / QUANT_K_TURBO_KV_4B;
-    const uint total_blocks = p.ne / QUANT_K_TURBO_KV_4B;
+    const uint flat_elem = wg * QUANT_K_TURBO_KV_4B;
+    if (flat_elem >= p.ne) return;
 
-    if (wg >= total_blocks) return;
+    // Decompose flat element index into 4D source indices
+    uint i03 = flat_elem / (p.ne02 * p.ne01 * p.ne00);
+    uint rem = flat_elem - i03 * (p.ne02 * p.ne01 * p.ne00);
+    uint i02 = rem / (p.ne01 * p.ne00);
+    rem -= i02 * (p.ne01 * p.ne00);
+    uint i01 = rem / p.ne00;
+    uint i00 = rem - i01 * p.ne00;
 
-    const uint src_row = wg / blocks_per_row;
-    const uint blk_in_row = wg % blocks_per_row;
-    const uint tid = gl_SubgroupInvocationID;
+    // Map source dims to index tensor dims (with repeat/broadcast)
+    uint i10 = i01;
+    uint i11 = i02 % p.ne11;
+    uint i12 = i03 % p.ne12;
 
-    // Read destination row from index tensor
+    // Look up destination row from index tensor (stride-based + buffer offset)
+    uint b_idx = i12 * p.nb12 + i11 * p.nb11 + i10 * p.nb10 + get_boffset();
 #if B_SIZE == 64
-    const uint dst_row = data_b[src_row].x;
+    uint dst_row = data_b[b_idx].x;
 #else
-    const uint dst_row = data_b[src_row];
+    uint dst_row = data_b[b_idx];
 #endif
 
-    // Read source data: use nb01 stride (handles non-contiguous views)
-    const uint src_base = src_row * p.nb01 + blk_in_row * QUANT_K_TURBO_KV_4B;
+    // Source address using strides (+ buffer offset)
+    uint src_base = i03 * p.nb03 + i02 * p.nb02 + i01 * p.nb01 + i00 * p.nb00 + get_aoffset();
+
+    // Destination block address using strides (+ buffer offset)
+    uint dst_blk = i03 * p.nb23 + i02 * p.nb22 + dst_row * p.nb21
+                 + (i00 / QUANT_K_TURBO_KV_4B) * p.nb20 + get_doffset();
+
+    uint tid = gl_SubgroupInvocationID;
+
+    // Read source data (64 threads x 2 elements = 128-element block)
     float val0 = data_a[src_base + tid];
     float val1 = data_a[src_base + tid + 64];
 
@@ -76,20 +96,17 @@ void main() {
     uint idx0 = turbo_kv_nearest(val0 * inv_std);
     uint idx1 = turbo_kv_nearest(val1 * inv_std);
 
-    uint partner0 = subgroupShuffleXor(idx0, 1);
-    uint partner1 = subgroupShuffleXor(idx1, 1);
-
-    // Write to destination: flat block addressing with row index redirect
-    const uint dst_blk = dst_row * blocks_per_row + blk_in_row;
+    uint p0 = subgroupShuffleXor(idx0, 1);
+    uint p1 = subgroupShuffleXor(idx1, 1);
 
     if ((tid & 1u) == 0) {
-        data_d[dst_blk].mse_indices[tid / 2]        = uint8_t(idx0 | (partner0 << 4));
-        data_d[dst_blk].mse_indices[(tid + 64) / 2]  = uint8_t(idx1 | (partner1 << 4));
+        data_d[dst_blk].mse_indices[tid / 2]       = uint8_t(idx0 | (p0 << 4));
+        data_d[dst_blk].mse_indices[(tid + 64) / 2] = uint8_t(idx1 | (p1 << 4));
     }
     if (tid == 0) {
-        data_d[dst_blk].norm          = turbo_kv_f32_to_fp16_bits(norm);
-        data_d[dst_blk].inv_std_fp16  = turbo_kv_f32_to_fp16_bits(inv_std);
+        data_d[dst_blk].norm = turbo_kv_f32_to_fp16_bits(norm);
+        data_d[dst_blk].inv_std_fp16 = turbo_kv_f32_to_fp16_bits(inv_std);
         data_d[dst_blk].residual_norm = uint16_t(0);
-        data_d[dst_blk]._pad          = uint16_t(0);
+        data_d[dst_blk]._pad = uint16_t(0);
     }
 }
