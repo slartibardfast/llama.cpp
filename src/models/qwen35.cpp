@@ -48,7 +48,7 @@ llm_build_qwen35::llm_build_qwen35(const llama_model & model, const llm_graph_pa
         // - Unfiltered: saved for MTP head (needs all batch tokens for attention KV cache)
         // - Filtered: used for main model logits (only output tokens)
         if (il == n_transformer_layers - 1 && inp_out_ids) {
-            // First: compute full layer output without filtering (for MTP)
+            // Compute full layer output (unfiltered for MTP head)
             ggml_tensor * full_residual = ggml_add(ctx0, cur, inpSA);
             ggml_tensor * full_ffn_res = full_residual;
             ggml_tensor * full_post_norm = build_norm(full_residual, model.layers[il].attn_post_norm, nullptr, LLM_NORM_RMS, il);
@@ -57,7 +57,7 @@ llm_build_qwen35::llm_build_qwen35(const llama_model & model, const llm_graph_pa
             mtp_inp_hidden = build_cvec(mtp_inp_hidden, il);
             cb(mtp_inp_hidden, "mtp_inp_hidden", il);
 
-            // Second: filter for main model logits
+            // Filter for main model logits (output tokens only)
             cur   = ggml_get_rows(ctx0, mtp_inp_hidden, inp_out_ids);
             inpL = cur;
         } else {
