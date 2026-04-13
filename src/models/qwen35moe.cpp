@@ -499,6 +499,8 @@ void llm_build_qwen35moe::build_mtp_head(
 
     greedy_logits = ggml_clamp(ctx0, greedy_logits, -1e4f, 1e4f);
     ggml_tensor * greedy_tokens = ggml_argmax(ctx0, greedy_logits);
+    ggml_set_input(greedy_tokens);
+    ggml_set_output(greedy_tokens);
     cb(greedy_tokens, "mtp_greedy_tokens", -1);
 
     ggml_tensor * mtp_hidden = hidden_state;
@@ -599,6 +601,8 @@ void llm_build_qwen35moe::build_mtp_head(
         // next iteration's greedy-token input.
         if (k + 1 < n_draft_rollout) {
             greedy_tokens = ggml_argmax(ctx0, mtp_logits);
+            ggml_set_input(greedy_tokens);
+            ggml_set_output(greedy_tokens);
             cb(greedy_tokens, "mtp_greedy_next", il);
         }
 
