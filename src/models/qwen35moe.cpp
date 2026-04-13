@@ -497,6 +497,7 @@ void llm_build_qwen35moe::build_mtp_head(
         greedy_logits = build_lora_mm(model.output, full_normed);
     }
 
+    greedy_logits = ggml_clamp(ctx0, greedy_logits, -1e4f, 1e4f);
     ggml_tensor * greedy_tokens = ggml_argmax(ctx0, greedy_logits);
     cb(greedy_tokens, "mtp_greedy_tokens", -1);
 
