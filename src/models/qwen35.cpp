@@ -434,14 +434,10 @@ void llm_build_qwen35::build_mtp_head(
     GGML_ASSERT(hidden_state != nullptr);
 
     // Get logits for greedy token selection.
-    // If no filtering occurred (generation), reuse main logits to avoid expensive lm_head recomputation.
-    // If filtering occurred (prompt processing), recompute from unfiltered hidden state.
     ggml_tensor * greedy_logits;
     if (!mtp_inp_hidden || mtp_inp_hidden == res->t_embd) {
-        // No filtering — main logits already cover all tokens
         greedy_logits = res->t_logits;
     } else {
-        // Filtered — recompute logits from unfiltered hidden state
         ggml_tensor * full_normed = build_norm(hidden_state, model.output_norm, nullptr, LLM_NORM_RMS, -1);
         greedy_logits = build_lora_mm(model.output, full_normed);
     }
