@@ -264,6 +264,9 @@ add_executable(test-split-k-attention test-split-k-attention.cpp)
 add_executable(test-split-k-graph test-split-k-graph.cpp)
 target_link_libraries(test-split-k-graph PRIVATE ggml-base ggml-cpu)
 
+add_executable(test-split-k-cache-ops test-split-k-cache-ops.cpp)
+target_link_libraries(test-split-k-cache-ops PRIVATE ggml-base ggml-cpu)
+
 if (NOT GGML_BACKEND_DL)
     # these tests use the backends directly and cannot be built with dynamic loading
     llama_build_and_test(test-barrier.cpp)
