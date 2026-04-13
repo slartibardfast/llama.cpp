@@ -181,11 +181,13 @@ ggml_tensor * llm_build_qwen35::build_layer_attn(
             ext_factor, attn_factor, beta_fast, beta_slow
             );
 
-    Kcur = ggml_rope_multi(
-            ctx0, Kcur, inp_pos, nullptr,
-            n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
-            ext_factor, attn_factor, beta_fast, beta_slow
-            );
+    if (!inp->self_k_pos) {
+        Kcur = ggml_rope_multi(
+                ctx0, Kcur, inp_pos, nullptr,
+                n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
+                ext_factor, attn_factor, beta_fast, beta_slow
+                );
+    }
 
     cb(Qcur, "Qcur", il);
     cb(Kcur, "Kcur", il);
