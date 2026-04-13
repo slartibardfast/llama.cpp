@@ -69,6 +69,62 @@ struct block_q4_0_packed16
 #define DATA_A_QUANT_LEGACY
 #endif
 
+// TurboQuant V 4-bit: q4_0-semantic scheme with a 128-element block.
+// Layout matches q4_0 exactly (nibble pairs; low nibbles address the first
+// QUANT_K/2 elements, high nibbles the second half), just with 4x more
+// elements per scale. See ggml/include/ggml-turbo-quant.h for the C layout
+// and ggml/src/ggml-turbo-quant.c for the reference dequant/mad kernels.
+#define QUANT_K_TQ_V_4B 128
+#define QUANT_R_TQ_V_4B 2
+
+struct block_tq_v_4b
+{
+    float16_t d;
+    uint8_t qs[64];
+};
+struct block_tq_v_4b_packed16
+{
+    float16_t d;
+    uint16_t qs[64/2];
+};
+
+#if defined(DATA_A_TQ_V_4B)
+#define QUANT_K QUANT_K_TQ_V_4B
+#define QUANT_R QUANT_R_TQ_V_4B
+#define QUANT_AUXF 1
+#define A_TYPE block_tq_v_4b
+#define A_TYPE_PACKED16 block_tq_v_4b_packed16
+#define DATA_A_QUANT_LEGACY
+#endif
+
+#define QUANT_K_TURBO_KV_4B 128
+#define QUANT_R_TURBO_KV_4B 2
+
+struct block_turbo_kv_4b
+{
+    uint16_t norm;
+    uint16_t residual_norm;
+    uint16_t inv_std_fp16;
+    uint16_t _pad;
+    uint8_t mse_indices[64];
+};
+struct block_turbo_kv_4b_packed16
+{
+    uint16_t norm;
+    uint16_t residual_norm;
+    uint16_t inv_std_fp16;
+    uint16_t _pad;
+    uint16_t mse_indices[32];
+};
+
+#if defined(DATA_A_TURBO_KV_4B)
+#define QUANT_K QUANT_K_TURBO_KV_4B
+#define QUANT_R QUANT_R_TURBO_KV_4B
+#define QUANT_AUXF 1
+#define A_TYPE block_turbo_kv_4b
+#define A_TYPE_PACKED16 block_turbo_kv_4b_packed16
+#endif
+
 #define QUANT_K_Q4_1 32
 #define QUANT_R_Q4_1 2
 
@@ -1696,7 +1752,7 @@ struct block_mxfp4
 #define A_TYPE block_mxfp4
 #endif
 
-#if defined(DATA_A_IQ4_NL) || defined(DATA_A_IQ4_XS)
+#if defined(DATA_A_IQ4_NL) || defined(DATA_A_IQ4_XS) || defined(DATA_K_IQ4_NL) || defined(DATA_V_IQ4_NL)
 const int8_t kvalues_iq4nl_const[16] = {
     int8_t(-127), int8_t(-104), int8_t(-83), int8_t(-65), int8_t(-49), int8_t(-35), int8_t(-22), int8_t(-10),
     int8_t(1), int8_t(13), int8_t(25), int8_t(38), int8_t(53), int8_t(69), int8_t(89), int8_t(113)

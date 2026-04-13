@@ -673,10 +673,40 @@ void process_shaders() {
                         merge_maps(fa_base_dict, {{data_a_key, "1"}, {"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}, {"BLOCK_SIZE", "QUANT_K_"+to_uppercase(tname) }}), fp16, false, false, f16acc);
                 }
             }
+
+            // Scalar flash-attention variant for TurboQuant V 4-bit. Not in type_names because
+            // we don't need the mul_mat / mmq / dequant-loop companions — only the scalar
+            // flash_attn variant (TQ_V_4B is intended strictly as a V-cache quant type).
+            string_to_spv("flash_attn_f32_f16_tq_v_4b", "flash_attn.comp",
+                merge_maps(fa_base_dict, {{"DATA_A_TQ_V_4B", "1"}, {"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}, {"BLOCK_SIZE", "QUANT_K_TQ_V_4B"}}), fp16, false, false, f16acc);
+
+            // Mixed K=F16 / V=quant flash-attention variants. These cover the runtime
+            // configurations used by --flash-attn on --cache-type-v <quant>, where K stays
+            // F16 but V is one of the supported quantised types. The shaders follow the
+            // independent-K/V-type path in flash_attn_base.glsl via DATA_K_F16 + DATA_V_<quant>,
+            // and the legacy single-type DATA_A_<quant> path is untouched — this is an
+            // additive set of shader variants.
+            {
+                const std::vector<std::pair<std::string, std::string>> mixed_v_types = {
+                    {"q4_0",    "DATA_V_Q4_0"},
+                    {"q4_1",    "DATA_V_Q4_1"},
+                    {"q5_0",    "DATA_V_Q5_0"},
+                    {"q5_1",    "DATA_V_Q5_1"},
+                    {"q8_0",    "DATA_V_Q8_0"},
+                    {"iq4_nl",  "DATA_V_IQ4_NL"},
+                    {"tq_v_4b", "DATA_V_TQ_V_4B"},
+                };
+                for (const auto& vt : mixed_v_types) {
+                    string_to_spv("flash_attn_f32_f16_k_f16_v_" + vt.first, "flash_attn.comp",
+                        merge_maps(fa_base_dict, {{"DATA_K_F16", "1"}, {vt.second, "1"}, {"Q_TYPE", "float"}, {"D_TYPE", "float"}, {"D_TYPEV4", "vec4"}}),
+                        fp16, false, false, f16acc);
+                }
+            }
         }
     }
 
-    std::map<std::string, std::string> base_dict = {{"FLOAT_TYPE", "float"}, {"FLOAT_TYPEV2", "vec2"}};
+    std::map<std::string, std::string> base_dict = {{"FLOAT_TYPE", "float"}, {"FLOAT_TYPEV2", "vec2"}, {"FLOAT_TYPEV4", "vec4"}};
+    std::map<std::string, std::string> base_dict_f16acc = {{"FLOAT_TYPE", "float16_t"}, {"FLOAT_TYPEV2", "f16vec2"}, {"FLOAT_TYPEV4", "f16vec4"}, {"FLOAT16", "1"}, {"ACC_TYPE", "float"}};
 
     for (const auto& tname : type_names) {
         // mul mat vec
@@ -691,6 +721,21 @@ void process_shaders() {
 
         string_to_spv("mul_mat_vec_" + tname + "_f32_f32_subgroup_no_shmem", shader, merge_maps(base_dict, {{data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPEV2", "vec2"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD_NO_SHMEM", "1"}}));
         string_to_spv("mul_mat_vec_" + tname + "_f16_f32_subgroup_no_shmem", shader, merge_maps(base_dict, {{data_a_key, "1"}, {"B_TYPE", "float16_t"}, {"B_TYPEV2", "f16vec2"}, {"B_TYPEV4", "f16vec4"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD_NO_SHMEM", "1"}}));
+
+        // f16acc mul_mat_vec: FP16 accumulation via RPM (v_pk_fma_f16 on GCN Vega).
+        // B stays F32 to match what the scheduler provides; accumulation is FP16.
+        // D_TYPE stays float — only the intermediate accumulation is packed FP16.
+        // Gated at runtime on fp16 && !integer_dot_product (fires on GCN, not RDNA2).
+        if (tname == "q4_k" || tname == "q5_k") {
+            // B=F32 + acc=F16 (the common case: activations are F32, accumulate in packed FP16)
+            string_to_spv("mul_mat_vec_" + tname + "_f32_f16acc", shader, merge_maps(base_dict_f16acc, {{data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPEV2", "vec2"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}}));
+            string_to_spv("mul_mat_vec_" + tname + "_f32_f16acc_subgroup", shader, merge_maps(base_dict_f16acc, {{data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPEV2", "vec2"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}}));
+            string_to_spv("mul_mat_vec_" + tname + "_f32_f16acc_subgroup_no_shmem", shader, merge_maps(base_dict_f16acc, {{data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPEV2", "vec2"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD_NO_SHMEM", "1"}}));
+            // B=F16 + acc=F16 (when the scheduler narrows B to F16)
+            string_to_spv("mul_mat_vec_" + tname + "_f16_f16", shader, merge_maps(base_dict_f16acc, {{data_a_key, "1"}, {"B_TYPE", "float16_t"}, {"B_TYPEV2", "f16vec2"}, {"B_TYPEV4", "f16vec4"}, {"D_TYPE", "float"}}));
+            string_to_spv("mul_mat_vec_" + tname + "_f16_f16_subgroup", shader, merge_maps(base_dict_f16acc, {{data_a_key, "1"}, {"B_TYPE", "float16_t"}, {"B_TYPEV2", "f16vec2"}, {"B_TYPEV4", "f16vec4"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}}));
+            string_to_spv("mul_mat_vec_" + tname + "_f16_f16_subgroup_no_shmem", shader, merge_maps(base_dict_f16acc, {{data_a_key, "1"}, {"B_TYPE", "float16_t"}, {"B_TYPEV2", "f16vec2"}, {"B_TYPEV4", "f16vec4"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD_NO_SHMEM", "1"}}));
+        }
 
         string_to_spv("mul_mat_vec_id_" + tname + "_f32_f32", shader, merge_maps(base_dict, {{"MUL_MAT_ID", "1"}, {data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPEV2", "vec2"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}}));
         string_to_spv("mul_mat_vec_id_" + tname + "_f32_f32_subgroup", shader, merge_maps(base_dict, {{"MUL_MAT_ID", "1"}, {data_a_key, "1"}, {"B_TYPE", "float"}, {"B_TYPEV2", "vec2"}, {"B_TYPEV4", "vec4"}, {"D_TYPE", "float"}, {"USE_SUBGROUP_ADD", "1"}}));
@@ -758,18 +803,37 @@ void process_shaders() {
     string_to_spv("cpy_transpose_16", "copy_transpose.comp", {{"A_TYPE", "uint16_t"}, {"D_TYPE", "uint16_t"}});
     string_to_spv("cpy_transpose_32", "copy_transpose.comp", {{"A_TYPE", "uint"}, {"D_TYPE", "uint"}});
 
-    for (std::string t : {"q4_0", "q4_1", "q5_0", "q5_1", "q8_0", "iq4_nl"}) {
+    for (std::string t : {"q4_0", "q4_1", "q5_0", "q5_1", "q8_0", "iq4_nl", "tq_v_4b"}) {
         string_to_spv("cpy_f32_" + t, "copy_to_quant.comp", {{"DATA_A_" + to_uppercase(t), "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
         string_to_spv("cpy_f32_" + t + "_rte", "copy_to_quant.comp", {{"DATA_A_" + to_uppercase(t), "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"RTE16", "1"}});
         string_to_spv("cpy_" + t + "_f32", "copy_from_quant.comp", {{"DATA_A_" + to_uppercase(t), "1"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
     }
 
-    for (std::string t : {"f32", "f16", "bf16", "q4_0", "q4_1", "q5_0", "q5_1", "q8_0", "iq4_nl"}) {
+    for (std::string t : {"f32", "f16", "bf16", "q4_0", "q4_1", "q5_0", "q5_1", "q8_0", "iq4_nl", "tq_v_4b"}) {
         string_to_spv("set_rows_" + t + "_i32",     "copy_to_quant.comp", {{"SET_ROWS", "1"}, {"DATA_A_" + to_uppercase(t), "1"}, {"B_TYPE", "uint"}, {"B_SIZE", "32"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
         string_to_spv("set_rows_" + t + "_i32_rte", "copy_to_quant.comp", {{"SET_ROWS", "1"}, {"DATA_A_" + to_uppercase(t), "1"}, {"B_TYPE", "uint"}, {"B_SIZE", "32"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"RTE16", "1"}});
         string_to_spv("set_rows_" + t + "_i64",     "copy_to_quant.comp", {{"SET_ROWS", "1"}, {"DATA_A_" + to_uppercase(t), "1"}, {"B_TYPE", "uvec2"}, {"B_SIZE", "64"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}});
         string_to_spv("set_rows_" + t + "_i64_rte", "copy_to_quant.comp", {{"SET_ROWS", "1"}, {"DATA_A_" + to_uppercase(t), "1"}, {"B_TYPE", "uvec2"}, {"B_SIZE", "64"}, {"D_TYPE", "float"}, {"FLOAT_TYPE", "float"}, {"RTE16", "1"}});
     }
+
+    // TurboQuant V 4-bit standalone shaders (dequant + get_rows).
+    // Not added to the main per-type `type_names` loop to avoid pulling in
+    // mul_mat / mul_mat_id / mmq / flash_attn variants we don't yet support.
+    // These three shaders are sufficient to make --cache-type-v tq_v_4b
+    // round-trip through Vulkan memory for the KV cache.
+    string_to_spv("dequant_tq_v_4b",           "dequant_tq_v_4b.comp", {{"DATA_A_TQ_V_4B", "1"}, {"D_TYPE", "float16_t"}});
+    string_to_spv("get_rows_tq_v_4b",          "get_rows_quant.comp",  {{"TEMP_TYPE", "FLOAT_TYPE"}, {"DATA_A_TQ_V_4B", "1"}, {"B_TYPE", "int"}, {"D_TYPE", "float16_t"}, {"FLOAT_TYPE", "float"}});
+    string_to_spv("get_rows_tq_v_4b_f32",      "get_rows_quant.comp",  {{"TEMP_TYPE", "FLOAT_TYPE"}, {"DATA_A_TQ_V_4B", "1"}, {"B_TYPE", "int"}, {"D_TYPE", "float"},      {"FLOAT_TYPE", "float"}});
+
+    // TURBO_KV_4B: RHT + Lloyd-Max codebook. All shaders use subgroup-cooperative
+    // inverse/forward Walsh-Hadamard Transform via subgroupShuffleXor.
+    string_to_spv("dequant_turbo_kv_4b",          "dequant_turbo_kv_4b.comp",      {{"D_TYPE", "float16_t"}});
+    string_to_spv("get_rows_turbo_kv_4b",         "get_rows_turbo_kv_4b.comp",     {{"D_TYPE", "float16_t"}});
+    string_to_spv("get_rows_turbo_kv_4b_f32",     "get_rows_turbo_kv_4b.comp",     {{"D_TYPE", "float"}});
+    string_to_spv("cpy_f32_turbo_kv_4b",          "cpy_f32_turbo_kv_4b.comp",      {{"A_TYPE", "float"}});
+    string_to_spv("cpy_turbo_kv_4b_f32",          "dequant_turbo_kv_4b.comp",      {{"D_TYPE", "float"}});
+    string_to_spv("set_rows_turbo_kv_4b_f32_i32", "set_rows_turbo_kv_4b.comp", {{"A_TYPE", "float"}, {"B_TYPE", "uint"},  {"B_SIZE", "32"}, {"D_TYPE", "uint8_t"}});
+    string_to_spv("set_rows_turbo_kv_4b_f32_i64", "set_rows_turbo_kv_4b.comp", {{"A_TYPE", "float"}, {"B_TYPE", "uvec2"}, {"B_SIZE", "64"}, {"D_TYPE", "uint8_t"}});
 
     auto get_type_str = [](bool f16) {
         return f16 ? "float16_t" : "float";
@@ -917,6 +981,12 @@ void process_shaders() {
 
     string_to_spv("leaky_relu_f32", "leaky_relu.comp",  {{"A_TYPE", "float"}, {"D_TYPE", "float"}});
     string_to_spv("silu_back_f32",  "silu_back.comp",   {{"A_TYPE", "float"}, {"B_TYPE", "float"}, {"D_TYPE", "float"}});
+
+    // ggml-fusion (GGML_OP_FUSED dispatch — single enum value per fusion id).
+    // All three fusions are F32-only on the CPU reference, so we only ship f32 shaders.
+    string_to_spv("fused_silu_mul_f32",    "fused_silu_mul.comp",    {});
+    string_to_spv("fused_sigmoid_mul_f32", "fused_sigmoid_mul.comp", {});
+    string_to_spv("fused_gate_prep_f32",   "fused_gate_prep.comp",   {});
 
     string_to_spv("diag_mask_inf_f32", "diag_mask_inf.comp", {{"A_TYPE", "float"}, {"D_TYPE", "float"}});
 
@@ -1168,6 +1238,21 @@ void write_output_files() {
             src << "const uint64_t arr_dmmv_id_" << tname << "_" << btype << "_f32_len[3] =  {mul_mat_vec_id_" << tname << "_" << btype << "_f32_len,  mul_mat_vec_id_" << tname << "_" << btype << "_f32_subgroup_len, mul_mat_vec_id_"  << tname << "_" << btype << "_f32_subgroup_no_shmem_len};\n";
         }
     }
+    }
+
+    // f16acc (RPM) arrays for K-quants with phased sub-block shaders.
+    // Two variants per type:
+    //   _f32_f16acc: B=F32 + accumulate in FP16 (the common case)
+    //   _f16_f16:    B=F16 + accumulate in FP16 (when scheduler narrows B)
+    for (const std::string& tname : {"q4_k", "q5_k"}) {
+        for (const std::string& variant : {"f32_f16acc", "f16_f16"}) {
+            hdr << "extern const void * arr_dmmv_"   << tname << "_" << variant << "_data[3];\n";
+            hdr << "extern const uint64_t arr_dmmv_" << tname << "_" << variant << "_len[3];\n";
+            if (basename(input_filepath) == "mul_mat_vec_" + tname + ".comp") {
+                src << "const void * arr_dmmv_"   << tname << "_" << variant << "_data[3] = {mul_mat_vec_" << tname << "_" << variant << "_data, mul_mat_vec_" << tname << "_" << variant << "_subgroup_data, mul_mat_vec_" << tname << "_" << variant << "_subgroup_no_shmem_data};\n";
+                src << "const uint64_t arr_dmmv_" << tname << "_" << variant << "_len[3] =  {mul_mat_vec_" << tname << "_" << variant << "_len,  mul_mat_vec_" << tname << "_" << variant << "_subgroup_len, mul_mat_vec_"  << tname << "_" << variant << "_subgroup_no_shmem_len};\n";
+            }
+        }
     }
 
     if (input_filepath == "") {
