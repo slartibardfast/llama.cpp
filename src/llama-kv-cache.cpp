@@ -2159,12 +2159,11 @@ void llama_kv_cache::state_write_meta(llama_io_write_i & io, const cell_ranges_t
 }
 
 void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t & cr) const {
-    GGML_ASSERT(!is_split_k() && "state save/load not yet implemented for split K cache");
-
     const auto & cells = v_cells[cr.strm];
 
     const uint32_t v_trans = this->v_trans ? 1 : 0;
     const uint32_t n_layer = layers.size();
+    const uint32_t split_k = is_split_k() ? 1 : 0;
 
     io.write(&v_trans, sizeof(v_trans));
     io.write(&n_layer, sizeof(n_layer));
@@ -2174,23 +2173,41 @@ void llama_kv_cache::state_write_data(llama_io_write_i & io, const cell_ranges_t
     for (const auto & layer : layers) {
         const uint32_t il = layer.il;
 
-        const uint32_t n_embd_k_gqa = hparams.n_embd_k_gqa(il);
+        if (split_k && layer.k_rope && layer.k_static) {
+            // Split K: write rope portion then static portion
+            for (auto * kt : { layer.k_rope, layer.k_static }) {
+                const int32_t k_type_i = (int32_t) kt->type;
+                io.write(&k_type_i, sizeof(k_type_i));
 
-        auto * k = layer.k_stream[cr.strm];
+                // Row size from tensor ne[0] (already accounts for split dims)
+                const uint64_t k_size_row = ggml_row_size(kt->type, kt->ne[0]);
+                io.write(&k_size_row, sizeof(k_size_row));
 
-        // Write key type
-        const int32_t k_type_i = (int32_t) k->type;
-        io.write(&k_type_i, sizeof(k_type_i));
+                for (const auto & range : cr.data) {
+                    const size_t range_size = range.second - range.first;
+                    const size_t buf_size = range_size * k_size_row;
+                    io.write_tensor(kt, range.first * k_size_row, buf_size);
+                }
+            }
+        } else {
+            const uint32_t n_embd_k_gqa = hparams.n_embd_k_gqa(il);
 
-        // Write row size of key
-        const uint64_t k_size_row = ggml_row_size(k->type, n_embd_k_gqa);
-        io.write(&k_size_row, sizeof(k_size_row));
+            auto * k = layer.k_stream[cr.strm];
 
-        // Read each range of cells of k_size length and write out
-        for (const auto & range : cr.data) {
-            const size_t range_size = range.second - range.first;
-            const size_t buf_size = range_size * k_size_row;
-            io.write_tensor(k, range.first * k_size_row, buf_size);
+            // Write key type
+            const int32_t k_type_i = (int32_t) k->type;
+            io.write(&k_type_i, sizeof(k_type_i));
+
+            // Write row size of key
+            const uint64_t k_size_row = ggml_row_size(k->type, n_embd_k_gqa);
+            io.write(&k_size_row, sizeof(k_size_row));
+
+            // Read each range of cells of k_size length and write out
+            for (const auto & range : cr.data) {
+                const size_t range_size = range.second - range.first;
+                const size_t buf_size = range_size * k_size_row;
+                io.write_tensor(k, range.first * k_size_row, buf_size);
+            }
         }
     }
 
@@ -2406,38 +2423,42 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
     for (const auto & layer : layers) {
         const uint32_t il = layer.il;
 
-        const uint32_t n_embd_k_gqa = hparams.n_embd_k_gqa(il);
-
-        auto * k = layer.k_stream[strm];
-
-        // Read type of key
-        int32_t k_type_i_ref;
-        io.read_to(&k_type_i_ref, sizeof(k_type_i_ref));
-        const int32_t k_type_i = (int32_t) k->type;
-        if (k_type_i != k_type_i_ref) {
-            LLAMA_LOG_ERROR("%s: mismatched key type (%d != %d, layer %d)\n", __func__, k_type_i, k_type_i_ref, il);
-            return false;
+        // Determine which tensors to read into
+        std::vector<ggml_tensor *> k_tensors;
+        if (is_split_k() && layer.k_rope && layer.k_static) {
+            k_tensors = { layer.k_rope, layer.k_static };
+        } else {
+            k_tensors = { layer.k_stream[strm] };
         }
 
-        // Read row size of key
-        uint64_t k_size_row_ref;
-        io.read_to(&k_size_row_ref, sizeof(k_size_row_ref));
-        const size_t k_size_row = ggml_row_size(k->type, n_embd_k_gqa);
-        if (k_size_row != k_size_row_ref) {
-            LLAMA_LOG_ERROR("%s: mismatched key row size (%zu != %zu, layer %d)\n", __func__, k_size_row, (size_t) k_size_row_ref, il);
-            return false;
-        }
+        for (auto * kt : k_tensors) {
+            // Read type of key
+            int32_t k_type_i_ref;
+            io.read_to(&k_type_i_ref, sizeof(k_type_i_ref));
+            const int32_t k_type_i = (int32_t) kt->type;
+            if (k_type_i != k_type_i_ref) {
+                LLAMA_LOG_ERROR("%s: mismatched key type (%d != %d, layer %d)\n", __func__, k_type_i, k_type_i_ref, il);
+                return false;
+            }
 
-        if (cell_count) {
-            if (sinfo.is_contiguous()) {
-                // Fast path: contiguous cells, single memcpy
-                ggml_backend_tensor_set(k, io.read(cell_count * k_size_row), sinfo.head() * k_size_row, cell_count * k_size_row);
-            } else {
-                // Slow path: scatter to non-contiguous positions
-                const void * src = io.read(cell_count * k_size_row);
-                for (uint32_t i = 0; i < cell_count; ++i) {
-                    const size_t dst_offset = sinfo.idxs[0][i] * k_size_row;
-                    ggml_backend_tensor_set(k, (const char*)src + i * k_size_row, dst_offset, k_size_row);
+            // Read row size of key
+            uint64_t k_size_row_ref;
+            io.read_to(&k_size_row_ref, sizeof(k_size_row_ref));
+            const size_t k_size_row = ggml_row_size(kt->type, kt->ne[0]);
+            if (k_size_row != k_size_row_ref) {
+                LLAMA_LOG_ERROR("%s: mismatched key row size (%zu != %zu, layer %d)\n", __func__, k_size_row, (size_t) k_size_row_ref, il);
+                return false;
+            }
+
+            if (cell_count) {
+                if (sinfo.is_contiguous()) {
+                    ggml_backend_tensor_set(kt, io.read(cell_count * k_size_row), sinfo.head() * k_size_row, cell_count * k_size_row);
+                } else {
+                    const void * src = io.read(cell_count * k_size_row);
+                    for (uint32_t i = 0; i < cell_count; ++i) {
+                        const size_t dst_offset = sinfo.idxs[0][i] * k_size_row;
+                        ggml_backend_tensor_set(kt, (const char*)src + i * k_size_row, dst_offset, k_size_row);
+                    }
                 }
             }
         }
