@@ -8,6 +8,7 @@
 #include "ggml-impl.h"
 #include "quants.h"
 #include "ggml-threading.h"
+#include "numa-mirror.h"
 #include "unary-ops.h"
 #include "binary-ops.h"
 #include "vec.h"
@@ -36,6 +37,7 @@
 #include <signal.h>
 #if defined(__gnu_linux__)
 #include <syscall.h>
+#include <sys/mman.h>
 #endif
 
 #ifdef GGML_USE_OPENMP
@@ -204,6 +206,72 @@ typedef pthread_t ggml_thread_t;
 #include <TargetConditionals.h>
 #endif
 
+#include "ggml-turbo-quant.h"
+#include "ggml-turbo-kv.h"
+
+/* Layer 1 of the systematic shimming architecture: hand-rolled SSE4.1
+ * implementations of AVX / AVX2 / F16C intrinsics for Westmere-class
+ * x86 (SSE4.1 + POPCNT, no F16C, no AVX). See
+ *   ggml/src/ggml-cpu/arch/x86/downlevel.h
+ * for the API and the systematic plan in serene-bubbling-orbit.md
+ * for the full shimming architecture. */
+#if defined(__SSE4_1__) && !defined(__ARM_NEON)
+#include "arch/x86/downlevel.h"
+#define GGML_CPU_HAVE_DOWNLEVEL_X86 1
+#endif
+
+// Reference vec_dot for TQ_KV_1B used by ggml's generic compute paths
+// (anything that is not the specialised flash attention loop in
+// ggml_compute_forward_flash_attn_ext_f16_one_chunk, which dispatches
+// directly to tq_kv_1b_attention_multi for the entire K chunk).
+//
+// This must produce a score that is consistent with the Hamming-attention
+// fast path so that any code path which happens to call vec_dot for this
+// type observes the same score function. We delegate to the multi-block
+// Hamming attention with seq_len=1; the per-call query rotation cost is
+// acceptable here because this entry point is not the hot loop.
+//
+// vy holds an FP32 query (vec_dot_type = GGML_TYPE_F32).
+static void ggml_vec_dot_tq_kv_1b_f32(int n, float * GGML_RESTRICT s, size_t bs,
+                                       const void * GGML_RESTRICT vx, size_t bx,
+                                       const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    GGML_UNUSED(bs); GGML_UNUSED(bx); GGML_UNUSED(by); GGML_UNUSED(nrc);
+    tq_kv_1b_attention_multi((const float *) vy,
+                             (const block_tq_kv_1b *) vx,
+                             s, /*seq_len=*/1, /*head_dim=*/n,
+                             /*k_stride_blocks=*/0);
+}
+
+/* SSSE3 turbo_kv_4b inner kernel. Header is self-contained and guarded by
+ * __SSE4_1__/__SSSE3__; on Westmere or newer x86 with -march=native we get
+ * the fast path, otherwise this file's cpu trait for TURBO_KV_4B falls back
+ * to the scalar ggml_vec_dot_turbo_kv_4b_f32 from ggml-base. */
+#if defined(GGML_CPU_HAVE_DOWNLEVEL_X86)
+#include "arch/x86/turbo_kv_4b_sse.h"
+#endif
+
+static void ggml_vec_dot_turbo_kv_4b_f32_cpu(
+    int n, float * GGML_RESTRICT s, size_t bs,
+    const void * GGML_RESTRICT vx, size_t bx,
+    const void * GGML_RESTRICT vy, size_t by, int nrc)
+{
+    GGML_UNUSED(bs); GGML_UNUSED(bx); GGML_UNUSED(by); GGML_UNUSED(nrc);
+
+    /* Delegate to the batched kernel with valid_count=1. The batched kernel
+     * rotates Q once per call — for the vec_dot path this is one rotation
+     * per K position (same overhead as before). But when the FA special
+     * case in ops.cpp calls turbo_kv_4b_attention_multi directly with
+     * valid_count=N, the rotation runs once per thread per head, not once
+     * per K position. So this wrapper is a correct fallback, not the hot path. */
+    turbo_kv_4b_attention_multi(
+        (const float *) vy,
+        (const block_turbo_kv_4b *) vx,
+        s,
+        /*valid_count=*/1,
+        /*head_dim=*/n,
+        /*k_stride_blocks=*/0);
+}
+
 static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
     [GGML_TYPE_F32] = {
         .from_float               = (ggml_from_float_t) ggml_cpu_fp32_to_fp32,
@@ -280,6 +348,35 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .from_float               = quantize_row_nvfp4,
         .vec_dot                  = ggml_vec_dot_nvfp4_q8_0,
         .vec_dot_type             = GGML_TYPE_Q8_0,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_TQ_KV_1B] = {
+        .from_float               = (ggml_from_float_t) quantize_row_tq_kv_1b_ref,
+        .vec_dot                  = ggml_vec_dot_tq_kv_1b_f32,
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_TQ_V_4B] = {
+        /* TQ_V_4B is only used as a V cache type; flash attention's V
+         * loop calls tq_v_4b_vec_mad_f32 directly. vec_dot is never
+         * invoked for this type but we register from_float so ggml_set_rows
+         * can write into the cache during prompt processing. */
+        .from_float               = (ggml_from_float_t) quantize_row_tq_v_4b_ref,
+        .vec_dot                  = NULL,
+        .vec_dot_type             = GGML_TYPE_F32,
+        .nrows                    = 1,
+    },
+    [GGML_TYPE_TURBO_KV_4B] = {
+        /* Real TurboQuant (quantumaikr/quant.cpp v0.8.0 port). Unlike TQ_V_4B,
+         * turbo_kv_4b registers a real vec_dot so it works with both the
+         * flash attention kq_vec_dot path AND the explicit mul_mat fallback
+         * (-fa off). The cpu wrapper dispatches to the SSSE3 pshufb kernel
+         * on Westmere+ and to the scalar ggml-base reference elsewhere.
+         *
+         * turbo_kv_4b_attention_multi handles Q rotation internally. */
+        .from_float               = (ggml_from_float_t) quantize_row_turbo_kv_4b_ref,
+        .vec_dot                  = ggml_vec_dot_turbo_kv_4b_f32_cpu,
+        .vec_dot_type             = GGML_TYPE_F32,
         .nrows                    = 1,
     },
     [GGML_TYPE_Q2_K] = {
@@ -558,6 +655,21 @@ struct ggml_state {
 };
 
 static struct ggml_state g_state = {0};
+
+// Thread-local NUMA node id, set by set_numa_thread_affinity for the
+// MIRROR strategy and read by the CPU compute kernels and the buffer
+// abstraction to pick the local copy of replicated buffers. Defaults to
+// 0 so non-MIRROR runs naturally select the primary copy. Exposed to
+// other ggml-cpu translation units via ggml_cpu_get_numa_node().
+__thread int ggml_tls_numa_node = 0;
+
+int ggml_cpu_get_numa_node(void) {
+    return ggml_tls_numa_node;
+}
+
+enum ggml_numa_strategy ggml_cpu_get_numa_strategy(void) {
+    return g_state.numa.numa_strategy;
+}
 
 void ggml_barrier(struct ggml_threadpool * tp) {
     int n_threads = atomic_load_explicit(&tp->n_graph, memory_order_relaxed) & GGML_THREADPOOL_N_THREADS_MASK;
@@ -1185,6 +1297,10 @@ static void ggml_compute_forward_mul_mat_one_chunk(
     assert(ne12 % ne02 == 0);
     assert(ne13 % ne03 == 0);
 
+    // NUMA mirror: read src0 weights from the calling thread's local copy.
+    // For non-mirrored tensors this is identical to src0->data.
+    const char * src0_data_local = ggml_tensor_data_numa_local(src0);
+
     // block-tiling attempt
     const int64_t blck_0 = 16;
     const int64_t blck_1 = 16;
@@ -1210,7 +1326,7 @@ static void ggml_compute_forward_mul_mat_one_chunk(
                 const int64_t i2 = i12;
                 const int64_t i3 = i13;
 
-                const char * src0_row = (const char*)src0->data + (0 + i02 * nb02 + i03 * nb03);
+                const char * src0_row = src0_data_local + (0 + i02 * nb02 + i03 * nb03);
 
                 // desc: when src1 is not a contiguous memory block we have to calculate the offset using the strides
                 //       if it is, then we have either copied the data to params->wdata and made it contiguous or we are using
@@ -1274,6 +1390,11 @@ void ggml_compute_forward_mul_mat(
 
     // TODO: extract to "extra_op"
 #if GGML_USE_LLAMAFILE
+    // NUMA mirror: read src0 weights from the calling thread's local copy.
+    // Hoisted here for both LLAMAFILE early-outs. The main compute path
+    // hoists its own copy inside ggml_compute_forward_mul_mat_one_chunk.
+    const char * const src0_data_local = ggml_tensor_data_numa_local(src0);
+
     // broadcast factors
     const int64_t r2 = ne12 / ne02;
     const int64_t r3 = ne13 / ne03;
@@ -1285,7 +1406,7 @@ void ggml_compute_forward_mul_mat(
             for (int64_t i12 = 0; i12 < ne12; i12++)
                 if (!llamafile_sgemm(params,
                                      ne01, ne11, ne00/ggml_blck_size(src0->type),
-                                     (const char *)src0->data + i12/r2*nb02 + i13/r3*nb03,
+                                     src0_data_local + i12/r2*nb02 + i13/r3*nb03,
                                      nb01/ggml_type_size(src0->type),
                                      (const char *)src1->data + i12*nb12 + i13*nb13,
                                      nb11/ggml_type_size(src1->type),
@@ -1353,7 +1474,7 @@ UseGgmlGemm1:;
             for (int64_t i12 = 0; i12 < ne12; i12++)
                 if (!llamafile_sgemm(params,
                                      ne01, ne11, ne00/ggml_blck_size(src0->type),
-                                     (const char *)src0->data + i12/r2*nb02 + i13/r3*nb03,
+                                     src0_data_local + i12/r2*nb02 + i13/r3*nb03,
                                      nb01/ggml_type_size(src0->type),
                                      (const char *)wdata + (i12*ne11 + i13*ne12*ne11)*row_size,
                                      row_size/ggml_type_size(vec_dot_type),
@@ -1615,6 +1736,49 @@ static void ggml_compute_forward_mul_mat_id(
                 matrix_row_counts[i02] += 1;
             }
         }
+
+        // Expert reuse instrumentation (env GGML_MOE_EXPERT_LOG=1).
+        // Tracks how many of the current call's active experts were also
+        // active in the previous call. High reuse = expert caching is worth it.
+        {
+            static int  expert_log_checked = 0;
+            static int  expert_log_enabled = 0;
+            static uint8_t prev_active[512]; // bitmask: prev_active[i] = was expert i active last call
+            static int64_t total_selected = 0;
+            static int64_t total_reused   = 0;
+            static int64_t total_calls    = 0;
+
+            if (!expert_log_checked) {
+                expert_log_enabled = (getenv("GGML_MOE_EXPERT_LOG") != NULL);
+                memset(prev_active, 0, sizeof(prev_active));
+                expert_log_checked = 1;
+            }
+
+            if (expert_log_enabled && n_as <= 512) {
+                int n_active = 0, n_reused = 0;
+                uint8_t cur_active[512];
+                memset(cur_active, 0, (size_t)n_as);
+
+                for (int a = 0; a < n_as; a++) {
+                    if (matrix_row_counts[a] > 0) {
+                        cur_active[a] = 1;
+                        n_active++;
+                        if (prev_active[a]) n_reused++;
+                    }
+                }
+                total_selected += n_active;
+                total_reused   += n_reused;
+                total_calls++;
+
+                memcpy(prev_active, cur_active, (size_t)n_as);
+
+                if ((total_calls % 1000) == 0) {
+                    fprintf(stderr, "[expert-reuse] calls=%lld selected=%lld reused=%lld rate=%.1f%%\n",
+                            (long long)total_calls, (long long)total_selected, (long long)total_reused,
+                            total_selected > 0 ? 100.0 * (double)total_reused / (double)total_selected : 0.0);
+                }
+            }
+        }
     }
 
     // reset current_chunk
@@ -1625,6 +1789,45 @@ static void ggml_compute_forward_mul_mat_id(
 
     ggml_barrier(params->threadpool);
 
+    // NUMA mirror: base pointer for the calling thread's local copy of
+    // the expert weight tensor. For non-mirrored tensors this is just
+    // src0->data; for the MIRROR strategy each socket reads its own
+    // physical copy.
+    const char * src0_base = ggml_tensor_data_numa_local(src0);
+
+    // Pin the shared expert (expert 0) via madvise(MADV_WILLNEED) on
+    // the first call. The shared expert is always active (every token
+    // routes to it), so telling the kernel to page it in eagerly and
+    // keep it resident improves cold-start and reduces page faults.
+    // Subsequent calls are no-ops (the flag persists).
+#if defined(__gnu_linux__)
+    {
+        static int shared_expert_pinned = 0;
+        if (!shared_expert_pinned && nb02 > 0 && ith == 0) {
+            madvise((void *) src0_base, nb02, MADV_WILLNEED);
+            shared_expert_pinned = 1;
+        }
+    }
+#endif
+
+    // Prefetch active expert weight tiles into L2 before the matmul loop.
+    // At this point the router decision is known (matrix_row_counts is
+    // populated) but the matmuls haven't started. Issuing prefetch hints
+    // here overlaps the DRAM-to-L2 fetch with the loop setup overhead.
+    // With ~80% expert reuse across tokens, most tiles are already in L3
+    // from the previous token — the prefetch pulls the ~20% cold tiles
+    // into L2 where the matmul will find them.
+#if defined(__SSE__) || defined(__x86_64__)
+    for (int a = 0; a < n_as; a++) {
+        if (matrix_row_counts[a] > 0) {
+            const char * tile = src0_base + a * nb02;
+            for (size_t off = 0; off < 512 && off < nb02; off += 64) {
+                _mm_prefetch(tile + off, _MM_HINT_T1);
+            }
+        }
+    }
+#endif
+
     for (int cur_a = 0; cur_a < n_as; ++cur_a) {
         const int64_t cne1 = matrix_row_counts[cur_a];
 
@@ -1632,9 +1835,24 @@ static void ggml_compute_forward_mul_mat_id(
             continue;
         }
 
-        const char * src0_cur = (const char *) src0->data + cur_a * nb02;
+        const char * src0_cur = src0_base + cur_a * nb02;
         const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
         const size_t row_size = ggml_row_size(vec_dot_type, ne10);
+
+        // Look-ahead: prefetch the NEXT active expert's tile into L1
+        // while this expert's matmul is running. Pipelines the DRAM
+        // fetch behind the current compute.
+#if defined(__SSE__) || defined(__x86_64__)
+        for (int next_a = cur_a + 1; next_a < n_as; next_a++) {
+            if (matrix_row_counts[next_a] > 0) {
+                const char * next_tile = src0_base + next_a * nb02;
+                for (size_t off = 0; off < 512 && off < nb02; off += 64) {
+                    _mm_prefetch(next_tile + off, _MM_HINT_T0);
+                }
+                break;
+            }
+        }
+#endif
 
         const int64_t nr0 = ne01;
         const int64_t nr1 = cne1;
@@ -2077,6 +2295,11 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
                 ggml_compute_forward_opt_step_sgd(params, tensor);
             }
             break;
+        case GGML_OP_FUSED:
+            {
+                ggml_compute_forward_fused(params, tensor);
+            }
+            break;
         case GGML_OP_NONE:
             {
                 // nop
@@ -2101,6 +2324,31 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 GGML_ABORT("fatal error");
             }
+    }
+
+    // NUMA mirror: replicate per-op writes from the primary copy of the
+    // dst tensor to the secondary. Most ops in a graph (matmul, softmax,
+    // norms, activations, attention) write to compute scratch (regular
+    // CPU buft) and don't need the hook — gating on tensor->op here
+    // skips the function call entirely for those, which matters because
+    // ggml_compute_forward is on the per-op-per-thread hot path. Only
+    // ops whose dst can land on a mirror buffer (KV cache writes,
+    // recurrent state writes, in-place SCALE on a mirrored tensor) reach
+    // the helper, where it does the buft check and decides whether to
+    // sync. The set here MUST stay in sync with the dispatch switch in
+    // ggml_backend_cpu_numa_mirror_after_op_sync.
+    switch (tensor->op) {
+        case GGML_OP_SET_ROWS:
+        case GGML_OP_CPY:
+        case GGML_OP_DUP:
+        case GGML_OP_SCALE:
+        case GGML_OP_SSM_CONV:
+        case GGML_OP_SSM_SCAN:
+        case GGML_OP_GATED_DELTA_NET:
+            ggml_backend_cpu_numa_mirror_after_op_sync(params, tensor);
+            break;
+        default:
+            break;
     }
 }
 
@@ -2131,6 +2379,14 @@ static void set_numa_thread_affinity(int thread_n) {
                 fprintf(stderr, "warning: pthread_setaffinity_np() failed: %s\n",strerror(rv));
             }
             return;
+        case GGML_NUMA_STRATEGY_MIRROR:
+            // Each thread is assigned to one NUMA node (round-robin), and the
+            // model weights / KV cache buffers are replicated per node so each
+            // thread reads its local copy. The thread-local node id is read by
+            // the buffer abstraction at access time to pick the right copy.
+            node_num = thread_n % g_state.numa.n_nodes;
+            ggml_tls_numa_node = node_num;
+            break;
         default:
             return;
     }
@@ -2416,6 +2672,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
         case GGML_OP_OPT_STEP_ADAMW:
         case GGML_OP_OPT_STEP_SGD:
+        case GGML_OP_FUSED:
             {
                 n_tasks = n_threads;
             } break;
@@ -2895,6 +3152,7 @@ struct ggml_cplan ggml_graph_plan(
                 case GGML_OP_FLASH_ATTN_EXT:
                     {
                         const int64_t neq2 = node->src[0]->ne[2]; // number of query heads
+                        const int64_t nek1 = node->src[1]->ne[1]; // K sequence length
                         const int64_t DK = node->src[1]->ne[0];
                         const int64_t DV = node->src[2]->ne[0];
 
@@ -2908,6 +3166,20 @@ struct ggml_cplan ggml_graph_plan(
                         size_t decode   = sizeof(float)*(neq2*n_chunks*(2+DV) + n_tasks*(DK + 2*DV));
 
                         cur += MAX(prefill, decode);
+
+                        // Reserve per-thread cache-line-aligned scores buffer for
+                        // TQ_KV_1B Hamming attention. Lives at offset
+                        //   nth * (DK + 2*DV + CACHE_LINE_SIZE_F32) floats
+                        // from the start of wdata, after the per-thread scratch.
+                        // When split-KV is active (which now admits TQ_KV_1B),
+                        // the partials buffer follows AFTER this TQ scratch —
+                        // see partials_offset in the split-KV path of ops.cpp.
+                        if (node->src[1]->type == GGML_TYPE_TQ_KV_1B ||
+                            node->src[1]->type == GGML_TYPE_TURBO_KV_4B) {
+                            const size_t cache_line_f32 = CACHE_LINE_SIZE/sizeof(float);
+                            const size_t tq_stride = ((nek1 + cache_line_f32 - 1) / cache_line_f32) * cache_line_f32;
+                            cur += sizeof(float) * (size_t) n_tasks * tq_stride;
+                        }
                     } break;
                 case GGML_OP_FLASH_ATTN_BACK:
                     {
@@ -3377,6 +3649,20 @@ void ggml_cpu_fp16_to_fp32(const ggml_fp16_t * x, float * y, int64_t n) {
         _mm_storeu_ps(y + i, y_vec);
     }
 
+#elif defined(GGML_CPU_HAVE_DOWNLEVEL_X86)
+    /* Westmere class (SSE4.1 + POPCNT, no F16C, no AVX) via Layer 1 shim.
+     * ggml_x86_cvtph_ps_8 vendors Giesen's half_to_float_SSE2 algorithm
+     * (public domain) and stays register-resident: ~19 SSE2 instructions
+     * per 4 fp16 values, no stack spills. Correct on denormals, ±inf,
+     * NaN, ±zero. See ggml-cpu/arch/x86/downlevel.h. */
+    for (; i + 7 < n; i += 8) {
+        ggml_x86_cvtph_ps_8(x + i, y + i);
+    }
+    for (; i + 3 < n; i += 4) {
+        __m128i h = _mm_loadl_epi64((const __m128i *)(x + i));
+        _mm_storeu_ps(y + i, ggml_x86_cvtph_ps(h));
+    }
+
 #elif defined(__riscv_v_intrinsic) && defined(__riscv_zvfhmin)
     // calculate step size
     const int epr = __riscv_vsetvlmax_e16m2();
@@ -3409,6 +3695,33 @@ void ggml_cpu_fp16_to_fp32(const ggml_fp16_t * x, float * y, int64_t n) {
         y[i] = GGML_CPU_FP16_TO_FP32(x[i]);
     }
 }
+
+#if defined(GGML_CPU_HAVE_DOWNLEVEL_X86) || defined(__AVX__) || defined(__AVX2__) || defined(__AVX512F__)
+/* SSE4.1 vectorised q4_0 dequantize via the Layer 1 shim helper.
+ *
+ * ggml-base's `dequantize_row_q4_0` is a scalar loop. On Westmere the V
+ * cache with -ctv q4_0 passes its dequant through that scalar path in
+ * the flash attention loop where it dominates per-K iteration cost.
+ * This is a drop-in faster version that ops.cpp's flash attention
+ * dispatches to via a v_to_float override.
+ *
+ * The per-block SSE4.1 body lives in
+ * ggml-cpu/arch/x86/downlevel.h:ggml_x86_q4_0_unpack_32; this function
+ * just unwraps the block header (fp16 scale) and calls the helper per
+ * block. */
+void ggml_cpu_dequantize_row_q4_0(const void * GGML_RESTRICT vx,
+                                   float * GGML_RESTRICT y, int64_t k) {
+    const block_q4_0 * GGML_RESTRICT x = (const block_q4_0 *) vx;
+    const int qk = QK4_0;
+    assert(k % qk == 0);
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        const float d = GGML_CPU_FP16_TO_FP32(x[i].d);
+        ggml_x86_q4_0_unpack_32(x[i].qs, d, y + i*qk);
+    }
+}
+#endif /* GGML_CPU_HAVE_DOWNLEVEL_X86 || AVX / AVX2 / AVX512F */
 
 void ggml_cpu_fp32_to_bf16(const float * x, ggml_bf16_t * y, int64_t n) {
     int64_t i = 0;

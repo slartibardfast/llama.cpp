@@ -37,6 +37,23 @@ extern "C" {
     GGML_BACKEND_API void    ggml_numa_init(enum ggml_numa_strategy numa); // call once for better performance on NUMA systems
     GGML_BACKEND_API bool    ggml_is_numa(void); // true if init detected that system has >1 NUMA node
 
+    // For the NUMA mirror buffer type only: replicate the primary copy
+    // (whatever was written into the buffer via direct ptr access bypassing
+    // set_tensor) into the secondary copy. Called by the model loader after
+    // file->read_raw populates the weight tensors via direct cur->data
+    // writes — those direct writes don't go through the buffer's set_tensor
+    // hook so the alt copy stays empty without this call. No-op for any
+    // other buffer type.
+    GGML_BACKEND_API void    ggml_backend_cpu_buffer_finalize_load(ggml_backend_buffer_t buffer);
+
+    // Returns the NUMA-mirror CPU buffer type when GGML_NUMA_STRATEGY_MIRROR
+    // is active, otherwise returns the regular CPU buffer type. Callers
+    // (e.g. KV cache and recurrent state allocation) use this so the same
+    // call site routes to the mirror buft on dual-socket runs without
+    // hard-wiring the mirror dependency. Equivalent to ggml_backend_cpu_buffer_type()
+    // when --numa mirror is not in effect.
+    GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cpu_buffer_type_for_runtime(void);
+
     GGML_BACKEND_API struct ggml_tensor * ggml_new_i32(struct ggml_context * ctx, int32_t value);
     GGML_BACKEND_API struct ggml_tensor * ggml_new_f32(struct ggml_context * ctx, float value);
 
@@ -145,6 +162,15 @@ extern "C" {
     GGML_BACKEND_API void ggml_cpu_fp16_to_fp32(const ggml_fp16_t *, float *, int64_t);
     GGML_BACKEND_API void ggml_cpu_fp32_to_bf16(const float *, ggml_bf16_t *, int64_t);
     GGML_BACKEND_API void ggml_cpu_bf16_to_fp32(const ggml_bf16_t *, float *, int64_t);
+
+    /* ggml-base's dequantize_row_q4_0 is a scalar loop compiled without
+     * -march=native. This is the ggml-cpu override that ops.cpp's flash
+     * attention dispatches to when v->type == GGML_TYPE_Q4_0, providing
+     * an SSE4.1 vectorised body via simde/native AVX intrinsics.
+     * block_q4_0 is a typedef in ggml-common.h; we opaque-pointer it
+     * through void* and let the caller/callee cast — keeping ggml-common.h
+     * out of the public ggml-cpu.h include chain. */
+    GGML_BACKEND_API void ggml_cpu_dequantize_row_q4_0(const void *, float *, int64_t);
 
 #ifdef __cplusplus
 }

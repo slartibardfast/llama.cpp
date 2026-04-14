@@ -2,6 +2,7 @@
 #define _USE_MATH_DEFINES // For M_PI on MSVC
 
 #include "ggml-backend.h"
+#include "ggml-fusion.h"
 #include "ggml-impl.h"
 #include "ggml-threading.h"
 #include "ggml-cpu.h"
@@ -9,6 +10,8 @@
 
 // FIXME: required here for quantization functions
 #include "ggml-quants.h"
+#include "ggml-turbo-quant.h"
+#include "ggml-turbo-kv.h"
 
 #ifdef GGML_USE_CPU_HBM
 #include <hbwmalloc.h>
@@ -734,6 +737,31 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = (ggml_to_float_t) dequantize_row_nvfp4,
         .from_float_ref           = (ggml_from_float_t)quantize_row_nvfp4_ref,
     },
+    [GGML_TYPE_TQ_KV_1B] = {
+        .type_name                = "tq_kv_1b",
+        .blck_size                = 128,
+        .type_size                = sizeof(block_tq_kv_1b),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_tq_kv_1b,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_tq_kv_1b_ref,
+    },
+    [GGML_TYPE_TQ_V_4B] = {
+        .type_name                = "tq_v_4b",
+        .blck_size                = 128,
+        .type_size                = sizeof(block_tq_v_4b),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_tq_v_4b,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_tq_v_4b_ref,
+    },
+    [GGML_TYPE_TURBO_KV_4B] = {
+        .type_name                = "turbo_kv_4b",
+        .blck_size                = 128,
+        .type_size                = sizeof(block_turbo_kv_4b),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_turbo_kv_4b,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_turbo_kv_4b_ref,
+    },
+    // GGML_TYPE_TURBO_KV_Q_ROT_F32 (45) removed — superseded by split K cache
     [GGML_TYPE_Q2_K] = {
         .type_name                = "q2_K",
         .blck_size                = QK_K,
@@ -1063,9 +1091,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+
+    "FUSED",
 };
 
-static_assert(GGML_OP_COUNT == 96, "GGML_OP_COUNT != 96");
+static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 97");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1173,9 +1203,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+
+    "fused(x)",
 };
 
-static_assert(GGML_OP_COUNT == 96, "GGML_OP_COUNT != 96");
+static_assert(GGML_OP_COUNT == 97, "GGML_OP_COUNT != 97");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6030,6 +6062,71 @@ struct ggml_tensor * ggml_custom_inplace(
 
     return result;
 }
+// ggml_fused_gate_prep
+
+struct ggml_tensor * ggml_fused_gate_prep(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * alpha,
+        struct ggml_tensor  * dt_bias,
+        struct ggml_tensor  * ssm_a) {
+    // Output shape matches alpha: [num_v_heads, n_seq_tokens, n_seqs]
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, alpha->ne);
+
+    int32_t fusion_params[2];
+    fusion_params[0] = GGML_FUSION_GATE_PREP;
+    fusion_params[1] = (int32_t) dt_bias->ne[0];  // num_v_heads for modular indexing
+    ggml_set_op_params(result, fusion_params, sizeof(fusion_params));
+
+    result->op     = GGML_OP_FUSED;
+    result->src[0] = alpha;
+    result->src[1] = dt_bias;
+    result->src[2] = ssm_a;
+
+    return result;
+}
+
+// ggml_fused_silu_mul
+
+struct ggml_tensor * ggml_fused_silu_mul(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * y) {
+    GGML_ASSERT(ggml_are_same_shape(x, y));
+
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, x->ne);
+
+    int32_t fusion_params[1];
+    fusion_params[0] = GGML_FUSION_SILU_MUL;
+    ggml_set_op_params(result, fusion_params, sizeof(fusion_params));
+
+    result->op     = GGML_OP_FUSED;
+    result->src[0] = x;
+    result->src[1] = y;
+
+    return result;
+}
+
+// ggml_fused_sigmoid_mul
+
+struct ggml_tensor * ggml_fused_sigmoid_mul(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * y) {
+    GGML_ASSERT(ggml_are_same_shape(x, y));
+
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, GGML_MAX_DIMS, x->ne);
+
+    int32_t fusion_params[1];
+    fusion_params[0] = GGML_FUSION_SIGMOID_MUL;
+    ggml_set_op_params(result, fusion_params, sizeof(fusion_params));
+
+    result->op     = GGML_OP_FUSED;
+    result->src[0] = x;
+    result->src[1] = y;
+
+    return result;
+}
+
 // ggml_cross_entropy_loss
 
 struct ggml_tensor * ggml_cross_entropy_loss(

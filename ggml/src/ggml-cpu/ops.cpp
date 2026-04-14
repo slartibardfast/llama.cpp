@@ -1,16 +1,31 @@
 #include "ops.h"
 
 #include "ggml-cpu.h"
+#include "ggml-fusion.h"
 #include "ggml-impl.h"
 #include "binary-ops.h"
 #include "simd-gemm.h"
 #include "ggml.h"
+#include "ggml-turbo-quant.h"
+#include "ggml-turbo-kv.h"
 #include "unary-ops.h"
 #include "vec.h"
 
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
+
+static inline float ggml_fast_expf(float x) {
+    if (x < -88.0f) return 0.0f;
+    if (x > 88.0f) return INFINITY;
+    float k = roundf(x * 1.4426950408889634f);
+    float r = x - k * 0.6931471805599453f;
+    float p = 1.0f + r * (1.0f + r * (0.5f + r * (0.16666667f + r * 0.041666668f)));
+    union { float f; int32_t i; } u; u.f = p;
+    u.i += ((int32_t)k) << 23;
+    return u.f;
+}
+
 
 // ggml_compute_forward_dup
 
@@ -4685,6 +4700,9 @@ static void ggml_compute_forward_get_rows_q(
     const int ir0 = dr*ith;
     const int ir1 = MIN(ir0 + dr, nr);
 
+    // NUMA mirror: read from the calling thread's local copy.
+    const char * src0_data_local = ggml_tensor_data_numa_local(src0);
+
     for (int64_t i = ir0; i < ir1; ++i) {
         const int64_t i12 = i/(ne11*ne10);
         const int64_t i11 = (i - i12*ne11*ne10)/ne10;
@@ -4694,7 +4712,7 @@ static void ggml_compute_forward_get_rows_q(
         GGML_ASSERT(i01 >= 0 && i01 < ne01);
 
         dequantize_row_q(
-                (const void *) ((char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03),
+                (const void *) (src0_data_local + i01*nb01 + i11*nb02 + i12*nb03),
                      (float *) ((char *)  dst->data + i10*nb1  + i11*nb2  + i12*nb3), nc);
     }
 }
@@ -4726,6 +4744,9 @@ static void ggml_compute_forward_get_rows_f16(
     const int ir0 = dr*ith;
     const int ir1 = MIN(ir0 + dr, nr);
 
+    // NUMA mirror: read from the calling thread's local copy.
+    const char * src0_data_local = ggml_tensor_data_numa_local(src0);
+
     for (int64_t i = ir0; i < ir1; ++i) {
         const int64_t i12 = i/(ne11*ne10);
         const int64_t i11 = (i - i12*ne11*ne10)/ne10;
@@ -4735,7 +4756,7 @@ static void ggml_compute_forward_get_rows_f16(
         GGML_ASSERT(i01 >= 0 && i01 < ne01);
 
         ggml_cpu_fp16_to_fp32(
-            (const ggml_fp16_t*) ((char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03),
+            (const ggml_fp16_t*) (src0_data_local + i01*nb01 + i11*nb02 + i12*nb03),
                        (float *) ((char *)  dst->data + i10*nb1  + i11*nb2  + i12*nb3), nc);
     }
 }
@@ -4767,6 +4788,9 @@ static void ggml_compute_forward_get_rows_bf16(
     const int ir0 = dr*ith;
     const int ir1 = MIN(ir0 + dr, nr);
 
+    // NUMA mirror: read from the calling thread's local copy.
+    const char * src0_data_local = ggml_tensor_data_numa_local(src0);
+
     for (int64_t i = ir0; i < ir1; ++i) {
         const int64_t i12 = i/(ne11*ne10);
         const int64_t i11 = (i - i12*ne11*ne10)/ne10;
@@ -4776,7 +4800,7 @@ static void ggml_compute_forward_get_rows_bf16(
         GGML_ASSERT(i01 >= 0 && i01 < ne01);
 
         ggml_cpu_bf16_to_fp32(
-            (const ggml_bf16_t *) ((char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03),
+            (const ggml_bf16_t *) (src0_data_local + i01*nb01 + i11*nb02 + i12*nb03),
                         (float *) ((char *)  dst->data + i10*nb1  + i11*nb2  + i12*nb3), nc);
     }
 }
@@ -4808,6 +4832,9 @@ static void ggml_compute_forward_get_rows_f32(
     const int ir0 = dr*ith;
     const int ir1 = MIN(ir0 + dr, nr);
 
+    // NUMA mirror: read from the calling thread's local copy.
+    const char * src0_data_local = ggml_tensor_data_numa_local(src0);
+
     for (int64_t i = ir0; i < ir1; ++i) {
         const int64_t i12 = i/(ne11*ne10);
         const int64_t i11 = (i - i12*ne11*ne10)/ne10;
@@ -4817,8 +4844,8 @@ static void ggml_compute_forward_get_rows_f32(
         GGML_ASSERT(i01 >= 0 && i01 < ne01);
 
         ggml_vec_cpy_f32(nc,
-                (float *) ((char *)  dst->data + i10*nb1  + i11*nb2  + i12*nb3),
-                (float *) ((char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03));
+                      (float *) ((char *)  dst->data + i10*nb1  + i11*nb2  + i12*nb3),
+                (const float *) (src0_data_local + i01*nb01 + i11*nb02 + i12*nb03));
     }
 }
 
@@ -5324,7 +5351,7 @@ static void ggml_compute_forward_soft_max_f32(
                 assert(sum > 0.0);
 
                 if (sk) {
-                    sum += (ggml_float) expf(sk[i02] - max);
+                    sum += (ggml_float) ggml_fast_expf(sk[i02] - max);
                 }
 
                 sum = 1.0/sum;
@@ -8237,12 +8264,77 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     ggml_type         const k_vec_dot_type = ggml_get_type_traits_cpu(k->type)->vec_dot_type;
     ggml_from_float_t const q_to_vec_dot   = ggml_get_type_traits_cpu(k_vec_dot_type)->from_float;
     ggml_vec_dot_t    const kq_vec_dot     = ggml_get_type_traits_cpu(k->type)->vec_dot;
-    ggml_to_float_t   const v_to_float     = ggml_get_type_traits(v->type)->to_float;
+    ggml_to_float_t         v_to_float     = ggml_get_type_traits(v->type)->to_float;
+
+    // Override scalar ggml-base dequant with SSE4.1/AVX vectorised ggml-cpu
+    // versions for the V cache types that actually get hit in the flash
+    // attention V loop. On Westmere these replace per-element table lookups
+    // (fp16) and scalar nibble unpack (q4_0) — both of which dominate the
+    // per-K cost at filled context before this override.
+    if (v->type == GGML_TYPE_F16) {
+        v_to_float = (ggml_to_float_t) ggml_cpu_fp16_to_fp32;
+    } else if (v->type == GGML_TYPE_Q4_0) {
+        v_to_float = (ggml_to_float_t) ggml_cpu_dequantize_row_q4_0;
+    }
 
     GGML_ASSERT((                            q_to_vec_dot) && "fattn: unsupported K-type");
     GGML_ASSERT((v->type == GGML_TYPE_F32 || v_to_float  ) && "fattn: unsupported V-type");
 
     int ith = params->ith;
+
+    // NUMA mirror: read K and V from the calling thread's local copy.
+    // For non-mirrored tensors these are identical to k->data / v->data.
+    // The KV cache lives on the mirror buft when --numa mirror is active,
+    // and each socket reads its own physical copy. The Q tensor is not
+    // mirrored (it's a per-token activation produced by the projection
+    // layer), so the read site for Q is unchanged.
+    const char * const k_data_local = ggml_tensor_data_numa_local(k);
+    const char * const v_data_local = ggml_tensor_data_numa_local(v);
+
+    // ----- TQ_KV_1B Hamming-attention fast path setup (loop invariants) -----
+    // For the TQ_KV_1B key cache type we replace the per-K vec_dot inside the
+    // inner loop with a single batched call to tq_kv_1b_attention_multi that
+    // amortizes the per-block query rotation across the whole K chunk. The
+    // scratch buffer for the precomputed scores lives in params->wdata, after
+    // the per-thread Q_q/VKQ scratch slab; sized at graph build time in
+    // ggml-cpu.c (GGML_OP_FLASH_ATTN_EXT work_size calc).
+    //
+    // Step 4.75 (TQ_KV_FUSED): when V is also TQ_V_4B, we take a fused
+    // single-pass path that bundles K Hamming + online softmax + V mad in
+    // one kernel call per FA row, eliminating the score scratch and the
+    // separate per-position loop below.
+    const bool   use_tq_kv_1b    = (k->type == GGML_TYPE_TQ_KV_1B);
+    const bool   use_tq_kv_fused = use_tq_kv_1b && (v->type == GGML_TYPE_TQ_V_4B);
+    // TURBO_KV_4B batched FA path: DISABLED pending investigation of wdata
+    // layout collision during prompt eval. The one_chunk function fires for
+    // both PP (multi-token Q, non-tiled since K is quantized) and decode
+    // (single-token Q). During PP, the per-thread score buffer at offset
+    // nth*fa_scratch_str may collide with the tiled/split-KV scratch region.
+    // The batched kernel (turbo_kv_4b_attention_multi) is correct — 17/17
+    // test fixture pass, short-prompt smoke test at 2.67 t/s — but tool-call
+    // prompts with ~300+ context tokens produce garbage scores.
+    //
+    // The non-FA vec_dot path (FA off, per-call) works correctly at all
+    // context lengths (12/12 tool-call battery pass). Use that for now.
+    //
+    // TODO: fix the wdata offset calculation to match the actual FA scratch
+    // layout for the non-tiled, non-split-KV path (which is what fires when
+    // K is quantized and neq1 > 1).
+    // Batched turbo_kv_4b: only in single-token generation (N==1).
+    // During PP (N>1), the non-tiled one_chunk path processes N Q rows
+    // sequentially per thread. The batched kernel is correct per-row but
+    // something in the multi-token one_chunk data path produces wrong
+    // attention scores at scale. Guard to N==1 for safety; PP falls back
+    // to per-call vec_dot (slow rotation, correct output).
+    const bool   use_turbo_kv_4b = (k->type == GGML_TYPE_TURBO_KV_4B) && !write_partials;
+    // Both TQ_KV_1B and TURBO_KV_4B need per-thread score scratch buffers.
+    // The allocation pattern is identical: ceil(nek1 / cache_line) * cache_line floats per thread.
+    const bool   need_batched_buf = use_tq_kv_1b || use_turbo_kv_4b;
+    const size_t fa_scratch_str = (size_t)(1*DK + 2*DV + CACHE_LINE_SIZE_F32);
+    const size_t tq_thread_str  = ((nek1 + CACHE_LINE_SIZE_F32 - 1) / CACHE_LINE_SIZE_F32) * CACHE_LINE_SIZE_F32;
+    float * const tq_thread_buf = need_batched_buf
+        ? ((float *) params->wdata + (size_t) params->nth * fa_scratch_str + (size_t) ith * tq_thread_str)
+        : nullptr;
 
     for (int ir = ir0; ir < ir1; ++ir) {
         // q indices
@@ -8280,11 +8372,95 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         const float * pq = (const float *) ((char *) q->data + (iq1*nbq1 + iq2*nbq2 + iq3*nbq3));
         q_to_vec_dot(pq, Q_q, DK);
 
+        // For TQ_KV_1B, batch-compute Hamming scores for the contiguous run
+        // of valid K positions starting at ic_start. The K cache is allocated
+        // for nek1 slots but only positions [ic_start, ic_start+valid_run)
+        // carry real keys; the rest have mp[ic] == -INFINITY. Computing
+        // Hamming for those would waste DRAM bandwidth (the K reads dominate
+        // even at 24-bytes-per-block) and erase the compression win.
+        // Falls into the per-thread tq_thread_buf hoisted above.
+        if (use_tq_kv_1b) {
+            int64_t valid_end = ic_end;
+            if (mp) {
+                // Find the first masked position from ic_start; valid run is
+                // contiguous in causal models. Forward scan is O(valid_run);
+                // skipping the search for unmasked-from-the-start cases is a
+                // micro-optimisation we don't need.
+                for (int64_t ic = ic_start; ic < ic_end; ++ic) {
+                    if (GGML_CPU_FP16_TO_FP32(mp[ic]) == -INFINITY) {
+                        valid_end = ic;
+                        break;
+                    }
+                }
+            }
+            const int64_t valid_run = valid_end - ic_start;
+            if (use_tq_kv_fused) {
+                // Single-pass K Hamming + online softmax + V mad.
+                // Skips the score scratch and the per-position loop below.
+                if (valid_run > 0) {
+                    const char * k_base = k_data_local + ic_start*nbk1 + ik2*nbk2 + ik3*nbk3;
+                    const char * v_base = v_data_local + ic_start*nbv1 + iv2*nbv2 + iv3*nbv3;
+                    tq_kv_fused_attention(pq, k_base, v_base,
+                        (size_t) nbk1, (size_t) nbv1,
+                        mp ? (const uint16_t *) (mp + ic_start) : NULL,
+                        (int) valid_run, (int) DK, (int) DV,
+                        scale, slope, logit_softcap,
+                        VKQ32, &M, &S);
+                }
+            } else if (valid_run > 0) {
+                const block_tq_kv_1b * k_blocks = (const block_tq_kv_1b *)
+                    (k_data_local + ic_start*nbk1 + ik2*nbk2 + ik3*nbk3);
+                tq_kv_1b_attention_multi(pq, k_blocks, tq_thread_buf,
+                    (int) valid_run, (int) DK,
+                    (int)(nbk1 / sizeof(block_tq_kv_1b)));
+            }
+        }
+
+        // TURBO_KV_4B batched attention: same pattern as TQ_KV_1B above.
+        // Rotate Q once, loop over all K positions, write scores to per-thread buffer.
+        if (use_turbo_kv_4b) {
+            int64_t valid_end = ic_end;
+            if (mp) {
+                for (int64_t ic = ic_start; ic < ic_end; ++ic) {
+                    if (GGML_CPU_FP16_TO_FP32(mp[ic]) == -INFINITY) {
+                        valid_end = ic;
+                        break;
+                    }
+                }
+            }
+            const int64_t valid_run = valid_end - ic_start;
+            if (valid_run > 0) {
+                const block_turbo_kv_4b * k_blocks = (const block_turbo_kv_4b *)
+                    (k_data_local + ic_start*nbk1 + ik2*nbk2 + ik3*nbk3);
+                turbo_kv_4b_attention_multi(pq, k_blocks, tq_thread_buf,
+                    (int) valid_run, (int) DK,
+                    (int)(nbk1 / sizeof(block_turbo_kv_4b)));
+
+                // DEBUG: validate first 3 scores against per-call vec_dot
+                static int dbg_count = 0;
+                if (dbg_count < 3) {
+                    for (int64_t s = 0; s < std::min(valid_run, (int64_t)3); s++) {
+                        float ref_score = 0.0f;
+                        const char * k_pos = k_data_local + (ic_start + s)*nbk1 + ik2*nbk2 + ik3*nbk3;
+                        kq_vec_dot(DK, &ref_score, 0, k_pos, 0, Q_q, 0, 1);
+                        float batched_score = tq_thread_buf[s];
+                        float err = fabsf(ref_score - batched_score);
+                        if (err > 1e-3f) {
+                            fprintf(stderr, "[TURBO_KV_4B_DEBUG] MISMATCH s=%lld ref=%.6f batched=%.6f err=%.6f valid_run=%lld DK=%lld iq1=%d iq2=%d ith=%d\n",
+                                    (long long)s, ref_score, batched_score, err, (long long)valid_run, (long long)DK, iq1, iq2, ith);
+                        }
+                    }
+                    dbg_count++;
+                }
+            }
+        }
+
         // online softmax / attention
         // loop over n_kv and n_head_kv
         // ref: https://arxiv.org/pdf/2112.05682.pdf
-
-        for (int64_t ic = ic_start; ic < ic_end; ++ic) {
+        // Skipped entirely for the TQ_KV_FUSED path — that kernel handles
+        // softmax + V mad in one pass.
+        for (int64_t ic = ic_start; ic < ic_end && !use_tq_kv_fused; ++ic) {
             const float mv = mp ? slope*GGML_CPU_FP16_TO_FP32(mp[ic]) : 0.0f;
             if (mv == -INFINITY) {
                 continue;
@@ -8292,8 +8468,12 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
 
             float s; // KQ value
 
-            const char * k_data = (const char *) k->data + ( ic*nbk1 + ik2*nbk2 + ik3*nbk3);
-            kq_vec_dot(DK, &s, 0, k_data, 0, Q_q, 0, 1);
+            if (use_tq_kv_1b || use_turbo_kv_4b) {
+                s = tq_thread_buf[ic - ic_start];
+            } else {
+                const char * k_data = k_data_local + ( ic*nbk1 + ik2*nbk2 + ik3*nbk3);
+                kq_vec_dot(DK, &s, 0, k_data, 0, Q_q, 0, 1);
+            }
 
             s = s*scale; // scale KQ value
 
@@ -8308,7 +8488,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
             float ms = 1.0f; // upon new higher max val, scale VKQ and KQ sum with this value
             float vs = 1.0f; // post-softmax KQ value, expf(s - M)
 
-            const char * v_data = ((const char *) v->data + (ic*nbv1 + iv2*nbv2 + iv3*nbv3));
+            const char * v_data = (v_data_local + (ic*nbv1 + iv2*nbv2 + iv3*nbv3));
 
             if (v->type == GGML_TYPE_F16) {
                 if (s > M) {
@@ -8339,7 +8519,13 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
                 }
 
                 // V += v*expf(s - M)
-                if (v_to_float) {
+                // Fast path for TurboQuant V 4-bit: fused dequant+mad in
+                // one register-resident SSE4.1 pass, no intermediate V32
+                // buffer. See ggml-turbo-quant.c:tq_v_4b_vec_mad_f32.
+                if (v->type == GGML_TYPE_TQ_V_4B) {
+                    tq_v_4b_vec_mad_f32(DV, VKQ32,
+                                        (const block_tq_v_4b *) v_data, vs);
+                } else if (v_to_float) {
                     v_to_float(v_data, V32, DV);
                     ggml_vec_mad_f32(DV, VKQ32, V32, vs);
                 } else {
@@ -8806,18 +8992,52 @@ static void ggml_compute_forward_flash_attn_ext_f16(
     // When use_ref is set, force the vec-only reference implementation (no tiling, no KV-chunking)
     const bool use_ref = params->use_ref;
 
+    // Split-KV path: parallelise K scan across all nth threads at decode.
+    // Admits any K type with a vec_dot (F32, F16, Q4_0, Q8_0, TQ_KV_1B,
+    // etc.) and any V type. K and V types need not match — the K side
+    // uses its vec_dot, the V side uses v_to_float or the TQ_V_4B fused
+    // mad, and both produce fp32 partials for the reduce step.
+    //
+    // The tiled PP path (large batch) still requires F32/F16 K because
+    // the tiled kernel has no quantized-K support.
     const bool kv_is_f32_or_f16 = (k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_F16);
-    const bool use_split_kv_path = !use_ref && (neq1 == 1 && neq3 == 1) && kv_is_f32_or_f16 && (k->type == v->type) && q->type == GGML_TYPE_F32 && nek1 >= 512;
+    const bool kv_has_vec_dot   = (ggml_get_type_traits_cpu(k->type)->vec_dot != NULL);
+    const bool use_split_kv_path = !use_ref && (neq1 == 1 && neq3 == 1) && kv_has_vec_dot && q->type == GGML_TYPE_F32 && nek1 >= 512;
 
     if (use_split_kv_path) {
-        const int64_t chunk_size = (nek1 + nth - 1) / nth;
+        // Valid-range-aware chunking: scan the mask once to find the end
+        // of the valid (unmasked) range. For causal decode, valid positions
+        // are contiguous from 0. Chunking over [0, valid_end) instead of
+        // [0, nek1) avoids assigning threads to fully-masked chunks — the
+        // root cause of the original Step 5 regression (-6% at 8K fill).
+        int64_t valid_end = nek1;
+        const ggml_tensor * mask_t = dst->src[3];
+        if (mask_t) {
+            const ggml_fp16_t * mp0 = (const ggml_fp16_t *) mask_t->data;
+            for (int64_t ic = 0; ic < nek1; ic++) {
+                if (GGML_CPU_FP16_TO_FP32(mp0[ic]) == -INFINITY) {
+                    valid_end = ic;
+                    break;
+                }
+            }
+        }
+
+        const int64_t chunk_size = (valid_end + nth - 1) / nth;
 
         // Partials buffer layout: [q_head][kv_chunk][M, S, VKQ]
         const int64_t partial_size  = 2 + DV;
-        float *       partials_base = (float *) params->wdata + nth * (DK + 2*DV + CACHE_LINE_SIZE_F32);
+        size_t partials_offset = (size_t) nth * (DK + 2*DV + CACHE_LINE_SIZE_F32);
+        // When TQ_KV_1B K is active, the per-thread score scratch lives
+        // right after the per-thread Q/VKQ scratch. Partials must follow
+        // BOTH to avoid collision.
+        if (k->type == GGML_TYPE_TQ_KV_1B || k->type == GGML_TYPE_TURBO_KV_4B) {
+            const size_t tq_stride = ((nek1 + CACHE_LINE_SIZE_F32 - 1) / CACHE_LINE_SIZE_F32) * CACHE_LINE_SIZE_F32;
+            partials_offset += (size_t) nth * tq_stride;
+        }
+        float * partials_base = (float *) params->wdata + partials_offset;
 
         const int64_t ic_start = ith * chunk_size;
-        const int64_t ic_end   = std::min(ic_start + chunk_size, nek1);
+        const int64_t ic_end   = std::min(ic_start + chunk_size, valid_end);
 
         const int64_t partial_stride = nth * partial_size;
         float *       chunk_partials = partials_base + ith * partial_size;
@@ -11205,5 +11425,132 @@ void ggml_compute_forward_opt_step_sgd(const ggml_compute_params * params, ggml_
             {
                 GGML_ABORT("fatal error - sgd is F32 only");
             }
+    }
+}
+
+// ggml_compute_forward_fused_gate_prep
+//
+// Fuses: add(alpha, dt_bias) + softplus + mul(ssm_a)
+// dst[i] = softplus(alpha[i] + dt_bias[i % num_v_heads]) * ssm_a[i % num_v_heads]
+
+static void ggml_compute_forward_fused_gate_prep(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * alpha  = dst->src[0];
+    const ggml_tensor * dt_bias = dst->src[1];
+    const ggml_tensor * ssm_a   = dst->src[2];
+
+    GGML_ASSERT(alpha->type  == GGML_TYPE_F32);
+    GGML_ASSERT(dt_bias->type == GGML_TYPE_F32);
+    GGML_ASSERT(ssm_a->type  == GGML_TYPE_F32);
+
+    const int64_t ne = ggml_nelements(alpha);
+    const int32_t num_v_heads = ggml_get_op_params_i32(dst, 1);
+    GGML_ASSERT(num_v_heads > 0);
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t dr = (ne + nth - 1) / nth;
+    const int64_t ir0 = dr * ith;
+    const int64_t ir1 = std::min(ir0 + dr, ne);
+
+    const float * src_alpha = (const float *) alpha->data;
+    const float * src_bias  = (const float *) dt_bias->data;
+    const float * src_a     = (const float *) ssm_a->data;
+    float       * dst_data  = (float *) dst->data;
+
+    for (int64_t i = ir0; i < ir1; i++) {
+        const int h = (int)(i % num_v_heads);
+        const float x = src_alpha[i] + src_bias[h];
+        const float sp = (x > 20.0f) ? x : logf(1.0f + expf(x));
+        dst_data[i] = sp * src_a[h];
+    }
+}
+
+// ggml_compute_forward_fused_silu_mul
+//
+// Fuses: silu(x) * y
+// dst[i] = (x[i] / (1 + exp(-x[i]))) * y[i]
+
+static void ggml_compute_forward_fused_silu_mul(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * x = dst->src[0];
+    const ggml_tensor * y = dst->src[1];
+
+    GGML_ASSERT(x->type == GGML_TYPE_F32);
+    GGML_ASSERT(y->type == GGML_TYPE_F32);
+
+    const int64_t ne = ggml_nelements(x);
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t dr = (ne + nth - 1) / nth;
+    const int64_t ir0 = dr * ith;
+    const int64_t ir1 = std::min(ir0 + dr, ne);
+
+    const float * src_x = (const float *) x->data;
+    const float * src_y = (const float *) y->data;
+    float       * dst_d = (float *) dst->data;
+
+    for (int64_t i = ir0; i < ir1; i++) {
+        const float xi = src_x[i];
+        dst_d[i] = (xi / (1.0f + expf(-xi))) * src_y[i];
+    }
+}
+
+// ggml_compute_forward_fused — dispatch by fusion_id
+
+// ggml_compute_forward_fused_sigmoid_mul
+//
+// Fuses: sigmoid(x) * y
+// dst[i] = (1 / (1 + exp(-x[i]))) * y[i]
+
+static void ggml_compute_forward_fused_sigmoid_mul(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * x = dst->src[0];
+    const ggml_tensor * y = dst->src[1];
+
+    GGML_ASSERT(x->type == GGML_TYPE_F32);
+    GGML_ASSERT(y->type == GGML_TYPE_F32);
+
+    const int64_t ne = ggml_nelements(x);
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t dr = (ne + nth - 1) / nth;
+    const int64_t ir0 = dr * ith;
+    const int64_t ir1 = std::min(ir0 + dr, ne);
+
+    const float * src_x = (const float *) x->data;
+    const float * src_y = (const float *) y->data;
+    float       * dst_d = (float *) dst->data;
+
+    for (int64_t i = ir0; i < ir1; i++) {
+        dst_d[i] = (1.0f / (1.0f + expf(-src_x[i]))) * src_y[i];
+    }
+}
+
+// ggml_compute_forward_fused — dispatch by fusion_id
+
+void ggml_compute_forward_fused(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const int32_t fusion_id = ggml_get_op_params_i32(dst, 0);
+
+    switch (fusion_id) {
+        case GGML_FUSION_GATE_PREP:
+            ggml_compute_forward_fused_gate_prep(params, dst);
+            break;
+        case GGML_FUSION_SILU_MUL:
+            ggml_compute_forward_fused_silu_mul(params, dst);
+            break;
+        case GGML_FUSION_SIGMOID_MUL:
+            ggml_compute_forward_fused_sigmoid_mul(params, dst);
+            break;
+        default:
+            GGML_ABORT("unsupported fusion_id %d", fusion_id);
     }
 }

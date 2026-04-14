@@ -22,6 +22,7 @@ public:
         const llama_model & model,
                             /* attn */
                 ggml_type   type_k,
+                ggml_type   type_k_static,
                 ggml_type   type_v,
                      bool   v_trans,
                  uint32_t   kv_size,

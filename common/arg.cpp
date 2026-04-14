@@ -387,6 +387,9 @@ const std::vector<ggml_type> kv_cache_types = {
     GGML_TYPE_IQ4_NL,
     GGML_TYPE_Q5_0,
     GGML_TYPE_Q5_1,
+    GGML_TYPE_TQ_KV_1B,
+    GGML_TYPE_TQ_V_4B,
+    GGML_TYPE_TURBO_KV_4B,
 };
 
 static ggml_type kv_cache_type_from_str(const std::string & s) {
@@ -2005,14 +2008,21 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"-ctk", "--cache-type-k"}, "TYPE",
         string_format(
-            "KV cache data type for K\n"
+            "KV cache data type for K (use type1:type2 for split K by RoPE boundary)\n"
             "allowed values: %s\n"
             "(default: %s)",
             get_all_kv_cache_types().c_str(),
             ggml_type_name(params.cache_type_k)
         ),
         [](common_params & params, const std::string & value) {
-            params.cache_type_k = kv_cache_type_from_str(value);
+            auto colon = value.find(':');
+            if (colon != std::string::npos) {
+                // Split K syntax: rope_type:static_type
+                params.cache_type_k        = kv_cache_type_from_str(value.substr(0, colon));
+                params.cache_type_k_static = kv_cache_type_from_str(value.substr(colon + 1));
+            } else {
+                params.cache_type_k = kv_cache_type_from_str(value);
+            }
         }
     ).set_env("LLAMA_ARG_CACHE_TYPE_K"));
     add_opt(common_arg(
@@ -2236,12 +2246,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "- distribute: spread execution evenly over all nodes\n"
         "- isolate: only spawn threads on CPUs on the node that execution started on\n"
         "- numactl: use the CPU map provided by numactl\n"
+        "- mirror: replicate model weights and KV cache across NUMA nodes;\n"
+        "    each thread reads its local copy. Doubles memory cost; halves\n"
+        "    cross-socket DRAM bandwidth contention on multi-socket hosts.\n"
         "if run without this previously, it is recommended to drop the system page cache before using this\n"
         "see https://github.com/ggml-org/llama.cpp/issues/1437",
         [](common_params & params, const std::string & value) {
             /**/ if (value == "distribute" || value == "") { params.numa = GGML_NUMA_STRATEGY_DISTRIBUTE; }
             else if (value == "isolate") { params.numa = GGML_NUMA_STRATEGY_ISOLATE; }
             else if (value == "numactl") { params.numa = GGML_NUMA_STRATEGY_NUMACTL; }
+            else if (value == "mirror")  { params.numa = GGML_NUMA_STRATEGY_MIRROR;  }
             else { throw std::invalid_argument("invalid value"); }
         }
     ).set_env("LLAMA_ARG_NUMA"));
@@ -3499,8 +3513,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
-        {"--spec-type"}, "[none|ngram-cache|ngram-simple|ngram-map-k|ngram-map-k4v|ngram-mod]",
-        string_format("type of speculative decoding to use when no draft model is provided (default: %s)\n",
+        {"--spec-type"}, "[none|mtp|ngram-cache|ngram-simple|ngram-map-k|ngram-map-k4v|ngram-mod]",
+        string_format("type of speculative decoding to use when no draft model is provided (default: %s)\n"
+            "  mtp: use model's built-in Multi-Token Prediction head (requires MTP-capable model)\n",
             common_speculative_type_to_str(params.speculative.type).c_str()),
         [](common_params & params, const std::string & value) {
             if (value == "none") {
@@ -3515,6 +3530,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 params.speculative.type = COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V;
             } else if (value == "ngram-mod") {
                 params.speculative.type = COMMON_SPECULATIVE_TYPE_NGRAM_MOD;
+            } else if (value == "mtp") {
+                params.speculative.type = COMMON_SPECULATIVE_TYPE_MTP;
             } else {
                 throw std::invalid_argument("unknown speculative decoding type without draft model");
             }

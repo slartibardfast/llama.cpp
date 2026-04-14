@@ -428,8 +428,14 @@ extern "C" {
         // GGML_TYPE_IQ4_NL_8_8 = 38,
         GGML_TYPE_MXFP4   = 39, // MXFP4 (1 block)
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
-        GGML_TYPE_Q1_0    = 41,
-        GGML_TYPE_COUNT   = 42,
+        GGML_TYPE_Q1_0     = 41,
+        GGML_TYPE_TQ_KV_1B = 42, // quant.cpp 1-bit sign-LSH KV (24 bytes per 128 elements, legacy)
+        GGML_TYPE_TQ_V_4B  = 43, // Simple symmetric 4-bit V cache (66 bytes per 128 elements, legacy)
+        // Real TurboQuant, ported from quantumaikr/quant.cpp v0.8.0 (ICLR 2026 algorithm):
+        // RHT + 16-entry Lloyd-Max-Gaussian codebook, 72 bytes per 128 elements, ~4.5 bpe.
+        // Has a real vec_dot so it works with both FA on and FA off, unlike TQ_V_4B.
+        GGML_TYPE_TURBO_KV_4B = 44,
+        GGML_TYPE_COUNT    = 45,
     };
 
     // precision
@@ -576,6 +582,8 @@ extern "C" {
         GGML_OP_OPT_STEP_SGD,
 
         GGML_OP_GLU,
+
+        GGML_OP_FUSED,
 
         GGML_OP_COUNT,
     };

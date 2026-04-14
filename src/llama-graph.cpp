@@ -181,17 +181,31 @@ void llm_graph_input_out_ids::set_input(const llama_ubatch * ubatch) {
             data[i] = i;
         }
 
+        // Zero remaining entries when out_ids was allocated larger than
+        // n_tokens (graph reservation uses max batch size). Prevents
+        // get_rows from reading stale OOB indices.
+        for (int64_t i = n_tokens; i < out_ids->ne[0]; ++i) {
+            data[i] = 0;
+        }
+
         return;
     }
 
     GGML_ASSERT(ubatch->output);
 
-    int n_outputs = 0;
+    int n_outputs_actual = 0;
 
     for (int i = 0; i < n_tokens; ++i) {
         if (ubatch->output[i]) {
-            data[n_outputs++] = i;
+            data[n_outputs_actual++] = i;
         }
+    }
+
+    // Zero remaining entries to prevent stale OOB indices from
+    // previous graph evaluations (out_ids->ne[0] may exceed
+    // n_outputs_actual when graph was reserved with larger batch)
+    for (int64_t i = n_outputs_actual; i < out_ids->ne[0]; ++i) {
+        data[i] = 0;
     }
 }
 
@@ -456,6 +470,10 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     if (self_v_rot) {
         mctx->set_input_v_rot(self_v_rot);
     }
+
+    if (self_k_pos) {
+        mctx->set_input_k_pos(self_k_pos);
+    }
 }
 
 bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
@@ -581,6 +599,10 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
 
     if (inp_attn->self_v_rot) {
         mctx->get_attn()->set_input_v_rot(inp_attn->self_v_rot);
+    }
+
+    if (inp_attn->self_k_pos) {
+        mctx->get_attn()->set_input_k_pos(inp_attn->self_k_pos);
     }
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
@@ -1859,7 +1881,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * sinks,
          ggml_tensor * v_mla,
                float   kq_scale,
-                 int   il) const {
+                 int   il,
+         ggml_tensor * kq_pre) const {
     const bool v_trans = v->nb[1] > v->nb[2];
 
     // split the batch into streams if needed
@@ -1873,7 +1896,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
     ggml_tensor * cur;
 
-    const bool use_flash_attn = cparams.flash_attn && kq_b == nullptr;
+    const bool use_flash_attn = cparams.flash_attn && kq_b == nullptr && kq_pre == nullptr;
     if (use_flash_attn) {
         GGML_ASSERT(kq_b == nullptr && "Flash attention does not support KQ bias yet");
 
@@ -1916,12 +1939,14 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
         cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
     } else {
-        ggml_tensor * kq = ggml_mul_mat(ctx0, k, q);
-        cb(kq, "kq", il);
-
-        // note: this op tends to require high floating point range
-        //       while for some models F16 is enough, for others it is not, so we default to F32 here
-        ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
+        ggml_tensor * kq;
+        if (kq_pre) {
+            kq = kq_pre;
+        } else {
+            kq = ggml_mul_mat(ctx0, k, q);
+            cb(kq, "kq", il);
+            ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
+        }
 
         if (arch == LLM_ARCH_GROK) {
             // need to do the following:
@@ -1955,7 +1980,12 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         cb(kq, "kq_soft_max", il);
 
         if (!v_trans) {
-            // note: avoid this branch
+            // Non-transposed V: transpose + contiguify for mul_mat.
+            // For block-quantized types (turbo_kv_4b), cast to f32 first —
+            // ggml_cont on a transposed quantized tensor corrupts block structure.
+            if (ggml_is_quantized(v->type)) {
+                v = ggml_cast(ctx0, v, GGML_TYPE_F32);
+            }
             v = ggml_cont(ctx0, ggml_transpose(ctx0, v));
             cb(v, "v_cont", il);
         }
@@ -2080,6 +2110,10 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
     inp->self_k_rot = mctx_cur->build_input_k_rot(ctx0);
     inp->self_v_rot = mctx_cur->build_input_v_rot(ctx0);
 
+    // Pre-RoPE K: position tensor for on-the-fly RoPE at attention time.
+    // Non-null only for turbo_kv_4b (the builder checks type_k internally).
+    inp->self_k_pos = mctx_cur->build_input_k_pos(ctx0);
+
     return inp;
 }
 
@@ -2128,15 +2162,90 @@ ggml_tensor * llm_graph_context::build_attn(
         const auto & k_idxs = inp->get_k_idxs();
         const auto & v_idxs = inp->get_v_idxs();
 
-        ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
+        if (mctx_cur->is_split_k()) {
+            // Split k_cur at n_rot boundary into rope and static portions.
+            // k_cur shape: [n_embd_head, n_head_kv, n_tokens]
+            const int64_t n_rot  = hparams.n_rot(il);
+            const int64_t n_head = k_cur->ne[1];
+            const int64_t n_tok  = k_cur->ne[2];
+            const int64_t n_stat = k_cur->ne[0] - n_rot;
+
+            // Extract rope dims [0..n_rot) — strided view then contiguous copy
+            ggml_tensor * k_rope_cur = ggml_view_3d(ctx0, k_cur,
+                    n_rot, n_head, n_tok,
+                    k_cur->nb[1], k_cur->nb[2], 0);
+            k_rope_cur = ggml_cont(ctx0, k_rope_cur);
+            cb(k_rope_cur, "k_rope_cur", il);
+
+            // Extract static dims [n_rot..head_dim)
+            ggml_tensor * k_stat_cur = ggml_view_3d(ctx0, k_cur,
+                    n_stat, n_head, n_tok,
+                    k_cur->nb[1], k_cur->nb[2],
+                    n_rot * ggml_element_size(k_cur));
+            k_stat_cur = ggml_cont(ctx0, k_stat_cur);
+            cb(k_stat_cur, "k_stat_cur", il);
+
+            ggml_build_forward_expand(gf, mctx_cur->cpy_k_rope  (ctx0, k_rope_cur, k_idxs, il));
+            ggml_build_forward_expand(gf, mctx_cur->cpy_k_static(ctx0, k_stat_cur, k_idxs, il));
+        } else {
+            ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
+        }
         ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
     }
 
     const auto & kq_mask = inp->get_kq_mask();
 
     ggml_tensor * q = q_cur;
-    ggml_tensor * k = mctx_cur->get_k(ctx0, il);
+    ggml_tensor * k = nullptr;
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
+
+    if (mctx_cur->is_split_k()) {
+        // Split K read: get both portions, dequant to f32, apply RoPE to rope, concat.
+        const int64_t n_rot     = hparams.n_rot(il);
+        const int64_t n_stat    = hparams.n_embd_head_k(il) - n_rot;
+        const int64_t n_head_kv = hparams.n_head_kv(il);
+        const uint32_t n_kv     = mctx_cur->get_n_kv();
+
+        ggml_tensor * k_rope = mctx_cur->get_k_rope(ctx0, il);
+        ggml_tensor * k_stat = mctx_cur->get_k_static(ctx0, il);
+
+        k_rope = ggml_cast(ctx0, k_rope, GGML_TYPE_F32);
+        k_stat = ggml_cast(ctx0, k_stat, GGML_TYPE_F32);
+        k_rope = ggml_reshape_4d(ctx0, k_rope, n_rot, n_head_kv, n_kv, k_rope->ne[2]);
+        k_stat = ggml_reshape_4d(ctx0, k_stat, n_stat, n_head_kv, n_kv, k_stat->ne[2]);
+
+        int sections[4];
+        std::copy(hparams.rope_sections.begin(), hparams.rope_sections.end(), sections);
+        k_rope = ggml_rope_multi(ctx0, k_rope,
+            inp->self_k_pos, nullptr,
+            n_rot, sections,
+            hparams.rope_type,
+            cparams.n_ctx_orig_yarn, cparams.rope_freq_base, cparams.rope_freq_scale,
+            cparams.yarn_ext_factor, cparams.yarn_attn_factor,
+            cparams.yarn_beta_fast, cparams.yarn_beta_slow);
+        cb(k_rope, "k_rope_on_the_fly", il);
+
+        k = ggml_concat(ctx0, k_rope, k_stat, 0);
+        cb(k, "k_split_concat", il);
+    } else {
+        k = mctx_cur->get_k(ctx0, il);
+
+        // Pre-RoPE K storage (single-tensor, e.g. turbo_kv_4b)
+        if (inp->self_k_pos) {
+            k = ggml_cast(ctx0, k, GGML_TYPE_F32);
+
+            int sections[4];
+            std::copy(hparams.rope_sections.begin(), hparams.rope_sections.end(), sections);
+            k = ggml_rope_multi(ctx0, k,
+                inp->self_k_pos, nullptr,
+                hparams.n_rot(il), sections,
+                hparams.rope_type,
+                cparams.n_ctx_orig_yarn, cparams.rope_freq_base, cparams.rope_freq_scale,
+                cparams.yarn_ext_factor, cparams.yarn_attn_factor,
+                cparams.yarn_beta_fast, cparams.yarn_beta_slow);
+            cb(k, "k_rope_on_the_fly", il);
+        }
+    }
 
     ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
     cb(cur, "kqv_out", il);

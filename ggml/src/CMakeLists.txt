@@ -206,7 +206,27 @@ add_library(ggml-base
             ggml-threading.h
             ggml-quants.c
             ggml-quants.h
+            ggml-turbo-quant.c
+            ggml-turbo-kv.c
             gguf.cpp)
+
+# ggml-turbo-quant.c hosts the Hamming-attention inner loop for the
+# TQ_KV_1B KV cache. The hot path uses _mm_xor_si128 + _mm_popcnt_u64
+# (SSE4.1 + POPCNT, both available since Westmere/Nehalem). Without these
+# flags the preprocessor selects the byte-by-byte scalar fallback which
+# is roughly 16x slower per K block. ggml-base does not pass -march=native
+# to keep its other translation units portable, so we apply targeted ISA
+# flags to this file alone.
+#
+# ggml-turbo-kv.c is the real TurboQuant port (RHT + Lloyd-Max codebook),
+# vendored from quantumaikr/quant.cpp v0.8.0. Same ISA story, same flags.
+if (GGML_NATIVE)
+    set_source_files_properties(ggml-turbo-quant.c ggml-turbo-kv.c PROPERTIES
+        COMPILE_OPTIONS "-march=native")
+else()
+    set_source_files_properties(ggml-turbo-quant.c ggml-turbo-kv.c PROPERTIES
+        COMPILE_OPTIONS "-msse4.1;-mssse3;-msse4.2;-mpopcnt")
+endif()
 
 set_target_properties(ggml-base PROPERTIES
     VERSION ${GGML_VERSION}

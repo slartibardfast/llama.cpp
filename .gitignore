@@ -145,3 +145,9 @@ poetry.toml
 /.windsurf/
 # emscripten
 a.out.*
+
+# polaris build dirs
+build-tq/
+build-pgo*/
+pgo-data/
+.git.broken-*

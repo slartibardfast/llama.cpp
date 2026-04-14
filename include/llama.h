@@ -354,8 +354,9 @@ extern "C" {
         ggml_backend_sched_eval_callback cb_eval;
         void * cb_eval_user_data;
 
-        enum ggml_type type_k; // data type for K cache [EXPERIMENTAL]
-        enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]
+        enum ggml_type type_k;        // data type for K cache (or rope dims if split) [EXPERIMENTAL]
+        enum ggml_type type_k_static; // split K: type for static (non-RoPE) dims. GGML_TYPE_COUNT = no split [EXPERIMENTAL]
+        enum ggml_type type_v;        // data type for V cache [EXPERIMENTAL]
 
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted
@@ -574,6 +575,9 @@ extern "C" {
     LLAMA_API int32_t llama_model_n_head     (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_head_kv  (const struct llama_model * model);
     LLAMA_API int32_t llama_model_n_swa      (const struct llama_model * model);
+
+    // Returns the number of Multi-Token Prediction layers (0 if MTP is not available)
+    LLAMA_API int32_t llama_model_n_mtp_layers(const struct llama_model * model);
 
     // Get the model's RoPE frequency scaling factor
     LLAMA_API float llama_model_rope_freq_scale_train(const struct llama_model * model);
@@ -1005,6 +1009,15 @@ extern "C" {
     // Negative indices can be used to access logits in reverse order, -1 is the last logit.
     // returns NULL for invalid ids.
     LLAMA_API float * llama_get_logits_ith(struct llama_context * ctx, int32_t i);
+
+    // Get MTP (Multi-Token Prediction) draft logits for the last output position.
+    // With FastMTP, returns mtp_n_vocab floats per draft (reduced vocabulary).
+    // With chained rollout (LLAMA_MTP_ROLLOUT or runtime n_draft_rollout > 1),
+    // returns mtp_n_drafts * mtp_n_vocab floats arranged as a row-major
+    // [mtp_n_drafts][mtp_n_vocab] stack. Draft j starts at offset j*mtp_n_vocab.
+    LLAMA_API float * llama_get_mtp_logits(struct llama_context * ctx);
+    LLAMA_API int64_t llama_get_mtp_n_vocab(struct llama_context * ctx);
+    LLAMA_API int64_t llama_get_mtp_n_drafts(struct llama_context * ctx);
 
     // Get all output token embeddings.
     // when pooling_type == LLAMA_POOLING_TYPE_NONE or when using a generative model,

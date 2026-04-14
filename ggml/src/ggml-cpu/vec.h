@@ -1564,7 +1564,24 @@ inline static void ggml_vec_sum_bf16_ggf(const int n, float * s, const ggml_bf16
 }
 
 inline static void ggml_vec_max_f32(const int n, float * s, const float * x) {
-#ifndef GGML_USE_ACCELERATE
+#if defined(__SSE__)
+    __m128 vmax = _mm_set1_ps(-INFINITY);
+    int i = 0;
+    for (; i + 15 < n; i += 16) {
+        vmax = _mm_max_ps(vmax, _mm_loadu_ps(x + i));
+        vmax = _mm_max_ps(vmax, _mm_loadu_ps(x + i + 4));
+        vmax = _mm_max_ps(vmax, _mm_loadu_ps(x + i + 8));
+        vmax = _mm_max_ps(vmax, _mm_loadu_ps(x + i + 12));
+    }
+    for (; i + 3 < n; i += 4) {
+        vmax = _mm_max_ps(vmax, _mm_loadu_ps(x + i));
+    }
+    vmax = _mm_max_ps(vmax, _mm_shuffle_ps(vmax, vmax, _MM_SHUFFLE(2,3,0,1)));
+    vmax = _mm_max_ps(vmax, _mm_movehl_ps(vmax, vmax));
+    float max = _mm_cvtss_f32(vmax);
+    for (; i < n; ++i) { if (x[i] > max) max = x[i]; }
+    *s = max;
+#elif !defined(GGML_USE_ACCELERATE)
     float max = -INFINITY;
     for (int i = 0; i < n; ++i) {
         max = MAX(max, x[i]);
@@ -1581,6 +1598,27 @@ inline static void ggml_vec_norm_inv_f32(const int n, float * s, const float * x
 }
 
 inline static void ggml_vec_argmax_f32(const int n, int * s, const float * x) {
+#if defined(__SSE4_1__)
+    __m128 vmax = _mm_set1_ps(-INFINITY);
+    __m128i vidx = _mm_setzero_si128();
+    __m128i vcur = _mm_setr_epi32(0, 1, 2, 3);
+    const __m128i vstep = _mm_set1_epi32(4);
+    int i = 0;
+    for (; i + 3 < n; i += 4) {
+        __m128 v = _mm_loadu_ps(x + i);
+        __m128 mask = _mm_cmpgt_ps(v, vmax);
+        vmax = _mm_blendv_ps(vmax, v, mask);
+        vidx = (__m128i)_mm_blendv_ps((__m128)vidx, (__m128)vcur, mask);
+        vcur = _mm_add_epi32(vcur, vstep);
+    }
+    float tmp[4]; int tmpi[4];
+    _mm_storeu_ps(tmp, vmax);
+    _mm_storeu_si128((__m128i*)tmpi, vidx);
+    float max = tmp[0]; int idx = tmpi[0];
+    for (int j = 1; j < 4; j++) { if (tmp[j] > max) { max = tmp[j]; idx = tmpi[j]; } }
+    for (; i < n; ++i) { if (x[i] > max) { max = x[i]; idx = i; } }
+    *s = idx;
+#else
     float max = -INFINITY;
     int idx = 0;
     for (int i = 0; i < n; ++i) {
@@ -1588,6 +1626,7 @@ inline static void ggml_vec_argmax_f32(const int n, int * s, const float * x) {
         if (max == x[i]) { idx = i; }
     }
     *s = idx;
+#endif
 }
 
 #ifdef __cplusplus

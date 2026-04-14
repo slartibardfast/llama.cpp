@@ -1,6 +1,8 @@
 #include "ggml-backend.h"
 #include "ggml-backend-impl.h"
 #include "ggml-cpu.h"
+#include "ggml-cpu-impl.h"
+#include "numa-mirror.h"
 #include "repack.h"
 #include "traits.h"
 #include "ggml-impl.h"
@@ -42,6 +44,15 @@
 std::vector<ggml_backend_buffer_type_t> & ggml_backend_cpu_get_extra_buffer_types() {
     static std::vector<ggml_backend_buffer_type_t> bufts = []() {
         std::vector<ggml_backend_buffer_type_t> bufts;
+
+        // NUMA mirror buffer type — registered first when MIRROR strategy
+        // is active so model weight tensors land on it. The lazy static
+        // initializer runs on the first call to this function, which is
+        // during model load (after llama_backend_init has called
+        // ggml_numa_init), so the strategy is known by the time we read it.
+        if (ggml_cpu_get_numa_strategy() == GGML_NUMA_STRATEGY_MIRROR) {
+            bufts.push_back(ggml_backend_cpu_numa_mirror_buffer_type());
+        }
 
 #if defined(__AMX_INT8__) && defined(__AVX512VNNI__)
         if (ggml_backend_amx_buffer_type()) {
@@ -434,7 +445,14 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
         if (op->src[i] && op->src[i]->buffer &&
             ggml_backend_cpu_is_extra_buffer_type(op->src[i]->buffer->buft)) {
             auto * buf_extra = (ggml::cpu::extra_buffer_type *) op->src[i]->buffer->buft->context;
-            return buf_extra->supports_op(dev, op);
+            // A null context means the extra buft has no op-level constraints
+            // (e.g. NUMA mirror buft holds plain CPU bytes in two physical
+            // copies; it doesn't change which ops are supported). Fall through
+            // to the generic CPU op check below. This matches the guard
+            // pattern in traits.cpp ggml_cpu_extra_compute_forward.
+            if (buf_extra) {
+                return buf_extra->supports_op(dev, op);
+            }
         }
     }
 

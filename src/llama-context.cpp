@@ -275,9 +275,10 @@ llama_context::llama_context(
     // init the memory module
     if (!hparams.vocab_only) {
         llama_memory_params params_mem = {
-            /*.type_k   =*/ params.type_k,
-            /*.type_v   =*/ params.type_v,
-            /*.swa_full =*/ params.swa_full,
+            /*.type_k        =*/ params.type_k,
+            /*.type_k_static =*/ params.type_k_static,
+            /*.type_v        =*/ params.type_v,
+            /*.swa_full      =*/ params.swa_full,
         };
 
         memory.reset(model.create_memory(params_mem, cparams));
@@ -769,6 +770,13 @@ float * llama_context::get_logits() {
     output_reorder();
 
     return logits.data;
+}
+
+float * llama_context::get_mtp_logits() {
+    if (!mtp_logits_valid || mtp_logits_buf.empty()) {
+        return nullptr;
+    }
+    return mtp_logits_buf.data();
 }
 
 int64_t llama_context::output_resolve_row(int32_t i) const {
@@ -1807,6 +1815,65 @@ int llama_context::decode(const llama_batch & batch_inp) {
                         GGML_ABORT("unknown pooling type");
                     }
             }
+        }
+
+        // Extract MTP logits if available.
+        //
+        // The stacked tensor produced by build_mtp_head has shape
+        //   [mtp_n_vocab, ubatch.n_tokens * n_draft_rollout]
+        // laid out iteration-major by ggml_concat along dim 1:
+        //   rows 0..n_pos-1                        = iter 0, positions 0..n_pos-1
+        //   rows n_pos..2*n_pos-1                  = iter 1, positions 0..n_pos-1
+        //   ...
+        //   rows (k-1)*n_pos..k*n_pos-1            = iter k-1, positions 0..n_pos-1
+        //
+        // Note: build_mtp_head does NOT apply inp_out_ids filtering — it
+        // operates on the full unfiltered mtp_inp_hidden, so the row count
+        // per iteration is ubatch.n_tokens (not n_outputs). For prompt eval
+        // with n_outputs=1 and ubatch.n_tokens=12, mtp_n_tokens = 12*k, and
+        // we must divide by 12, not 1.
+        //
+        // Consumers of llama_get_mtp_logits always want forward drafts from
+        // the LAST batch position — for Plan A's spec batch [T, D1..Dk] that's
+        // position k (the final draft slot), predicting tokens beyond the
+        // committed bonus. Extract only the last-position's k rows into a
+        // contiguous [mtp_n_vocab * k] buffer.
+        if (res->t_logits_mtp != nullptr && ubatch.n_tokens > 0) {
+            ggml_backend_t backend_mtp = ggml_backend_sched_get_tensor_backend(sched.get(), res->t_logits_mtp);
+            if (backend_mtp != nullptr) {
+                const int64_t mtp_n_vocab  = res->t_logits_mtp->ne[0];
+                const int64_t mtp_n_tokens = res->t_logits_mtp->ne[1];
+                const int64_t n_pos        = (int64_t) ubatch.n_tokens;
+
+                int64_t n_rollout = n_pos > 0 ? (mtp_n_tokens / n_pos) : 0;
+                if (n_rollout * n_pos != mtp_n_tokens || n_rollout <= 0) {
+                    // Shape doesn't factor cleanly — fall back to treating
+                    // the whole tensor as 1 iteration (old behaviour).
+                    n_rollout = 1;
+                }
+
+                // First copy the full stacked tensor to a temporary host buffer.
+                std::vector<float> full_buf((size_t)(mtp_n_vocab * mtp_n_tokens));
+                ggml_backend_tensor_get_async(backend_mtp, res->t_logits_mtp,
+                    full_buf.data(), 0, mtp_n_vocab * mtp_n_tokens * sizeof(float));
+                ggml_backend_sched_synchronize(sched.get());
+
+                // Gather the last batch position's rows across all iterations.
+                mtp_logits_buf.resize((size_t)(mtp_n_vocab * n_rollout));
+                const int64_t last_pos = n_pos - 1;
+                for (int64_t k = 0; k < n_rollout; k++) {
+                    const int64_t src_row = k * n_pos + last_pos;
+                    std::memcpy(
+                        mtp_logits_buf.data() + (size_t)(k * mtp_n_vocab),
+                        full_buf.data() + (size_t)(src_row * mtp_n_vocab),
+                        (size_t)(mtp_n_vocab * sizeof(float)));
+                }
+                mtp_logits_valid = true;
+                this->mtp_n_vocab  = mtp_n_vocab;
+                this->mtp_n_drafts = n_rollout;
+            }
+        } else {
+            mtp_logits_valid = false;
         }
 
         // Copy backend sampling output if this ubatch produced any sampling tensors.
@@ -2907,6 +2974,7 @@ llama_context_params llama_context_default_params() {
         /*.cb_eval                     =*/ nullptr,
         /*.cb_eval_user_data           =*/ nullptr,
         /*.type_k                      =*/ GGML_TYPE_F16,
+        /*.type_k_static               =*/ GGML_TYPE_COUNT,
         /*.type_v                      =*/ GGML_TYPE_F16,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
@@ -3105,6 +3173,20 @@ float * llama_get_logits_ith(llama_context * ctx, int32_t i) {
     }
 
     return res;
+}
+
+float * llama_get_mtp_logits(llama_context * ctx) {
+    ctx->synchronize();
+
+    return ctx->get_mtp_logits();
+}
+
+int64_t llama_get_mtp_n_vocab(llama_context * ctx) {
+    return ctx->get_mtp_n_vocab();
+}
+
+int64_t llama_get_mtp_n_drafts(llama_context * ctx) {
+    return ctx->get_mtp_n_drafts();
 }
 
 float * llama_get_embeddings(llama_context * ctx) {

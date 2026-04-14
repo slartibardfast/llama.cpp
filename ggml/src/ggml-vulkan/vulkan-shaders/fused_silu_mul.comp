@@ -1,0 +1,32 @@
+#version 450
+
+// ggml-fusion: GGML_FUSION_SILU_MUL
+// dst[i] = (x[i] / (1 + exp(-x[i]))) * y[i]
+// CPU reference: ggml-cpu/ops.cpp ggml_compute_forward_fused_silu_mul.
+
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(local_size_x = 512, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer A {float data_a[];};
+layout (binding = 1) readonly buffer B {float data_b[];};
+layout (binding = 2) writeonly buffer D {float data_d[];};
+
+layout (push_constant) uniform parameter {
+    uint KX;
+    uint KY;
+    float param1;
+    float param2;
+    float param3;
+    float param4;
+} p;
+
+void main() {
+    const uint i = gl_GlobalInvocationID.z * 262144 + gl_GlobalInvocationID.y * 512 + gl_GlobalInvocationID.x;
+    if (i >= p.KX) {
+        return;
+    }
+    const float x = data_a[i];
+    const float y = data_b[i];
+    data_d[i] = (x / (1.0f + exp(-x))) * y;
+}

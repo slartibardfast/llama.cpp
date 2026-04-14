@@ -2,6 +2,7 @@
 
 #include "ggml-alloc.h"
 #include "ggml.h"
+#include "ggml-cpu.h"
 #include "gguf.h"
 #include "llama-hparams.h"
 
@@ -1670,6 +1671,16 @@ bool llama_model_loader::load_all_data(
                 }
             }
         }
+
+        // Finalize NUMA mirror buffers: the non-mmap path writes weights
+        // directly to cur->data via file->read_raw, bypassing the buffer's
+        // set_tensor hook so the alt copy stays empty. Walk the buffer map
+        // and replicate copy 0 -> copy 1 once per buffer. No-op for
+        // non-mirror bufts.
+        for (auto & buf_entry : bufs) {
+            ggml_backend_cpu_buffer_finalize_load(buf_entry.second);
+        }
+
         if (progress_callback) {
             // Even though the model is done loading, we still honor
             // cancellation since we need to free allocations.

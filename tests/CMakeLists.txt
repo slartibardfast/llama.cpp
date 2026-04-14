@@ -249,6 +249,39 @@ llama_build_and_test(test-backend-sampler.cpp   LABEL "model")
 llama_build_and_test(test-state-restore-fragmented.cpp LABEL "model" ARGS -m "${MODEL_DEST}")
 set_tests_properties(test-state-restore-fragmented PROPERTIES FIXTURES_REQUIRED test-download-model)
 
+# Recurrent snapshot/restore for hybrid DeltaNet models (needs a hybrid model).
+llama_build_and_test(test-mtp-snapshot.cpp LABEL "manual-hybrid")
+
+# TurboQuant KV cache correctness fixtures (no model needed — pure math / synthetic data).
+add_executable(test-turbo-kv-rht test-turbo-kv-rht.cpp)
+target_link_libraries(test-turbo-kv-rht PRIVATE ggml-base)
+
+add_executable(test-turbo-kv-vulkan test-turbo-kv-vulkan.cpp)
+target_link_libraries(test-turbo-kv-vulkan PRIVATE ggml-base ggml)
+
+add_executable(test-turbo-kv-gpu-roundtrip test-turbo-kv-gpu-roundtrip.cpp)
+target_link_libraries(test-turbo-kv-gpu-roundtrip PRIVATE ggml-base ggml)
+
+add_executable(test-turbo-kv-gpu-quantize test-turbo-kv-gpu-quantize.cpp)
+target_link_libraries(test-turbo-kv-gpu-quantize PRIVATE ggml-base ggml)
+
+add_executable(test-turbo-kv-set-rows test-turbo-kv-set-rows.cpp)
+target_link_libraries(test-turbo-kv-set-rows PRIVATE ggml-base ggml)
+
+add_executable(test-turbo-kv-4b-attn test-turbo-kv-4b-attn.cpp)
+target_link_libraries(test-turbo-kv-4b-attn PRIVATE ggml-base)
+
+add_executable(test-split-k-attention test-split-k-attention.cpp)
+
+add_executable(test-split-k-graph test-split-k-graph.cpp)
+target_link_libraries(test-split-k-graph PRIVATE ggml-base ggml-cpu)
+
+add_executable(test-split-k-cache-ops test-split-k-cache-ops.cpp)
+target_link_libraries(test-split-k-cache-ops PRIVATE ggml-base ggml-cpu)
+
+add_executable(test-mtp-greedy-tokens test-mtp-greedy-tokens.cpp)
+target_link_libraries(test-mtp-greedy-tokens PRIVATE ggml-base ggml-cpu)
+
 if (NOT GGML_BACKEND_DL)
     # these tests use the backends directly and cannot be built with dynamic loading
     llama_build_and_test(test-barrier.cpp)

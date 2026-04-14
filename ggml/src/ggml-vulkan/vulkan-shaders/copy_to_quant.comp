@@ -60,6 +60,39 @@ void quantize(uint dst_idx, uint src_idx)
 }
 #endif
 
+#if defined(DATA_A_TQ_V_4B)
+// Matches ggml/src/ggml-turbo-quant.c quantize_row_tq_v_4b_ref: per-block scale
+// d = vmax / -8 (q4_0 convention, negative), zero-point 8, 128-element block.
+void quantize(uint dst_idx, uint src_idx)
+{
+    float amax = 0.0;
+    float vmax = 0.0;
+
+    [[unroll]] for (int j = 0; j < QUANT_K_TQ_V_4B; ++j) {
+        const float v = data_s[src_idx + j];
+        if (amax < abs(v)) {
+            amax = abs(v);
+            vmax = v;
+        }
+    }
+
+    const float d  = vmax / -8;
+    const float id = (d != 0.0) ? 1.0/d : 0.0;
+
+    data_q[dst_idx].d = float16_t(d);
+
+    [[unroll]] for (int j = 0; j < QUANT_K_TQ_V_4B/2; ++j) {
+        const float x0 = data_s[src_idx + 0                  + j]*id;
+        const float x1 = data_s[src_idx + QUANT_K_TQ_V_4B/2  + j]*id;
+
+        const uint xi0 = min(15, int(x0 + 8.5));
+        const uint xi1 = min(15, int(x1 + 8.5));
+
+        data_q[dst_idx].qs[j] = uint8_t(xi0 | (xi1 << 4));
+    }
+}
+#endif
+
 #if defined(DATA_A_Q4_1)
 void quantize(uint dst_idx, uint src_idx)
 {

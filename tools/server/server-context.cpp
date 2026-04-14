@@ -149,6 +149,25 @@ struct server_slot {
     llama_token  sampled; // in speculative mode, this is the last accepted token
     llama_tokens drafted;
 
+    // Inline MTP (Multi-Token Prediction) state.
+    // Instead of using the speculative framework (which has M-RoPE and SSM
+    // rollback issues), we propose one draft token from MTP logits and verify
+    // it in the next decode step. No seq_rm or rollback needed.
+    llama_token  mtp_draft_token = -1;  // proposed draft token (-1 = none)
+    int          mtp_i_batch     = -1;  // batch index of the draft token
+    bool         mtp_pending     = false; // true when draft is in the batch awaiting verification
+    bool         mtp_cooldown    = false; // skip MTP proposal for one iteration after draft processing
+
+    // Plan A 1-phase batched spec decode state (gated by LLAMA_MTP_PLAN_A=1).
+    // When active, the producer fills spec_drafts with up to k drafts from
+    // chained-rollout MTP output, the batching loop snapshots the recurrent
+    // state and emits [T_prev, D1..Dk] into the main batch, and the verifier
+    // samples verified[0..k], finds the first mismatch, commits accepted
+    // tokens + correction/bonus, and restores the snapshot on partial reject.
+    llama_tokens          spec_drafts;          // proposed drafts for this iter
+    std::vector<uint8_t>  spec_snap;            // recurrent-only state snapshot
+    int                   spec_n_past_before = 0; // seq position before the spec batch
+
     // stats
     size_t n_sent_text = 0; // number of sent text character
 
@@ -179,6 +198,13 @@ struct server_slot {
 
         drafted.clear();
         i_batch_dft.clear();
+        mtp_draft_token = -1;
+        mtp_i_batch     = -1;
+        mtp_pending     = false;
+        mtp_cooldown    = false;
+        spec_drafts.clear();
+        spec_snap.clear();
+        spec_n_past_before = 0;
         generated_tokens.clear();
         generated_token_probs.clear();
         json_schema = json();
@@ -588,6 +614,14 @@ private:
 
     bool sleeping = false;
 
+    // Plan A 1-phase batched spec decode knobs. Gated by LLAMA_MTP_PLAN_A=1 so
+    // the existing inline 2-phase path remains the default until Plan A proves
+    // its throughput win on the byte-identical regression gate. plan_a_k_max
+    // is the upper bound on drafts per iteration (the actual draft count is
+    // min(k_max, n_drafts_available_from_mtp_rollout)).
+    bool plan_a_enabled = false;
+    int  plan_a_k_max   = 1;
+
     void destroy() {
         llama_init.reset();
         ctx = nullptr;
@@ -767,9 +801,44 @@ private:
 
         slots.clear();
 
-        const bool can_spec = common_speculative_is_compat(ctx);
+        bool can_spec = common_speculative_is_compat(ctx);
         if (!can_spec) {
             SRV_WRN("%s", "speculative decoding not supported by this context\n");
+        }
+
+        // Auto-detect MTP: if model has MTP layers and no speculative type
+        // is explicitly set, auto-enable MTP speculative decoding.
+        // Set LLAMA_NO_MTP_AUTO=1 to bypass auto-enable (for baseline capture).
+        if (params_base.speculative.type == COMMON_SPECULATIVE_TYPE_NONE &&
+            getenv("LLAMA_NO_MTP_AUTO") == nullptr) {
+            const int32_t n_mtp = llama_model_n_mtp_layers(llama_get_model(ctx));
+            if (n_mtp > 0 && can_spec) {
+                SRV_INF("model has %d MTP layer(s) — auto-enabling MTP speculative decoding\n", n_mtp);
+                params_base.speculative.type = COMMON_SPECULATIVE_TYPE_MTP;
+                params_base.speculative.n_max = 1;  // MTP-1: one draft token per step
+            } else if (n_mtp > 0) {
+                SRV_INF("model has %d MTP layer(s) but speculative context not compatible\n", n_mtp);
+            }
+        }
+
+        // Plan A 1-phase batched spec decode opt-in.
+        //   LLAMA_MTP_PLAN_A=1   → activate 1-phase batched spec decode
+        //   LLAMA_MTP_PLAN_A_K=N → max drafts per iteration (defaults to the
+        //                         graph's n_draft_rollout or 3 if unset)
+        // When plan_a_enabled is false, the inline 2-phase MTP path remains
+        // active and behavior matches pre-Phase-4 exactly.
+        if (const char * e = getenv("LLAMA_MTP_PLAN_A")) {
+            plan_a_enabled = (std::atoi(e) != 0);
+        }
+        if (plan_a_enabled) {
+            plan_a_k_max = 3;
+            if (const char * e = getenv("LLAMA_MTP_PLAN_A_K")) {
+                const int v = std::atoi(e);
+                if (v > 0) {
+                    plan_a_k_max = v;
+                }
+            }
+            SRV_INF("Plan A 1-phase spec decode ENABLED, k_max=%d\n", plan_a_k_max);
         }
 
         // initialize slots
@@ -1223,6 +1292,42 @@ private:
 
         SLT_INF(slot, "processing task, is_child = %d\n", slot.task->is_child());
         return true;
+    }
+
+    // MTP draft producer: reads chained-rollout MTP logits from the target
+    // context's most recent decode and stores drafts on the slot for the
+    // next iteration's spec batch.
+    //
+    //   plan_a_enabled = false (legacy 2-phase):
+    //     stores a single scalar draft in slot.mtp_draft_token; the 2-phase
+    //     verifier below consumes it via common_sampler_sample equality.
+    //
+    //   plan_a_enabled = true (Plan A 1-phase):
+    //     stores up to plan_a_k_max drafts in slot.spec_drafts; the batching
+    //     loop snapshots state and emits [T_prev, D1..Dk] into the main batch,
+    //     and the 1-phase verifier below samples verified[0..k], finds the
+    //     first mismatch, commits the accepted prefix + correction or bonus,
+    //     and restores the snapshot on partial reject.
+    void try_set_mtp_draft(server_slot & slot) {
+        slot.mtp_pending     = false;
+        slot.mtp_draft_token = -1;
+        slot.mtp_i_batch     = -1;
+        slot.spec_drafts.clear();
+        slot.spec_snap.clear();
+
+        const int k_max = plan_a_enabled ? plan_a_k_max : 1;
+        llama_tokens drafts = common_mtp_read_drafts(ctx, k_max);
+        if (drafts.empty()) {
+            return;
+        }
+
+        if (plan_a_enabled) {
+            slot.spec_drafts = std::move(drafts);
+            slot.mtp_pending = true;
+        } else {
+            slot.mtp_draft_token = drafts.front();
+            slot.mtp_pending     = true;
+        }
     }
 
     bool process_token(completion_token_output & result, server_slot & slot) {
@@ -2099,42 +2204,87 @@ private:
             }
 
             // generate draft tokens in speculative decoding mode
-            // TODO: rework to have a single draft llama_context shared across all slots [TAG_SERVER_SPEC_REWORK]
-            //       perform the speculative drafting for all sequences at the same time in a single batch
             const int n_draft_max = slot.get_n_draft_max();
-            if (n_draft_max > 0) {
+
+            // Inline MTP path: model has MTP layers AND spec type is MTP.
+            // We do NOT stuff drafts into the main batch — the verifier block
+            // in the sampling loop handles the two-phase decode. Fall through
+            // to the "no speculative" branch which just adds slot.sampled.
+            const bool use_inline_mtp =
+                (params_base.speculative.type == COMMON_SPECULATIVE_TYPE_MTP) &&
+                (llama_model_n_mtp_layers(model) > 0);
+
+            // Plan A 1-phase spec decode path: snapshot recurrent state, then
+            // emit [T_prev, D_1, ..., D_k] into the main batch as a single
+            // chunk. Only taken when plan_a_enabled, use_inline_mtp, and the
+            // producer filled slot.spec_drafts in the prior iteration.
+            bool plan_a_batch_built = false;
+            if (plan_a_enabled && use_inline_mtp && !slot.spec_drafts.empty()) {
+                const size_t snap_size = llama_state_seq_get_size_ext(
+                    ctx, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                if (snap_size > 0) {
+                    slot.spec_snap.resize(snap_size);
+                    const size_t got = llama_state_seq_get_data_ext(
+                        ctx, slot.spec_snap.data(), slot.spec_snap.size(),
+                        slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                    if (got == snap_size) {
+                        slot.spec_n_past_before = slot.prompt.n_tokens();
+                        slot.i_batch = batch.n_tokens;
+
+                        common_batch_add(batch, slot.sampled,
+                            slot.prompt.tokens.pos_next(), { slot.id }, true);
+                        slot.prompt.tokens.push_back(slot.sampled);
+
+                        for (llama_token d : slot.spec_drafts) {
+                            common_batch_add(batch, d,
+                                slot.prompt.tokens.pos_next(), { slot.id }, true);
+                            slot.prompt.tokens.push_back(d);
+                        }
+                        slot.n_draft_total += (int32_t) slot.spec_drafts.size();
+
+                        plan_a_batch_built = true;
+                        SLT_DBG(slot, "Plan A: spec batch [T_prev + %zu drafts] built at i_batch=%d\n",
+                                slot.spec_drafts.size(), slot.i_batch);
+                    } else {
+                        // Snapshot write didn't fully populate the buffer — bail
+                        // out of Plan A for this iteration and fall through to
+                        // the single-token path below.
+                        slot.spec_snap.clear();
+                        slot.spec_drafts.clear();
+                    }
+                } else {
+                    // Snapshot sizing failed — fall back to single-token path.
+                    slot.spec_drafts.clear();
+                }
+            }
+
+            if (plan_a_batch_built) {
+                // batch already populated above
+            } else if (n_draft_max > 0 && !use_inline_mtp) {
+                // Standard speculative decoding for non-MTP models
                 if (mctx) {
-                    // we should never reach this, as speculative is automatically disabled if mmproj is loaded
                     GGML_ABORT("not supported by multimodal");
                 }
 
                 const llama_tokens & cached_text_tokens = slot.prompt.tokens.get_text_tokens();
-
                 const auto & params_spec = slot.task->params.speculative;
 
                 llama_tokens draft = common_speculative_draft(slot.spec, params_spec, cached_text_tokens, slot.sampled);
 
                 if (draft.size() > (size_t) n_draft_max) {
-                    SLT_WRN(slot, "draft size %d exceeds max %d, truncating\n", (int) draft.size(), n_draft_max);
                     draft.resize(n_draft_max);
                 }
 
-                // add the sampled token to the batch
                 slot.i_batch_dft.push_back(batch.n_tokens);
                 common_batch_add(batch, slot.sampled, slot.prompt.tokens.pos_next(), { slot.id }, true);
                 slot.prompt.tokens.push_back(slot.sampled);
 
                 if (slot.task->params.speculative.n_min > (int) draft.size()) {
-                    SLT_DBG(slot, "ignoring small draft: %d < %d\n", (int) draft.size(), slot.task->params.speculative.n_min);
-                    // fallback to normal decoding
                     slot.i_batch = slot.i_batch_dft[0];
                     slot.drafted.clear();
                     slot.i_batch_dft.clear();
                 } else {
-                    // keep track of total number of drafted tokens tested
                     slot.n_draft_total += draft.size();
-
-                    // add all drafted tokens to the batch
                     for (size_t i = 0; i < draft.size(); i++) {
                         slot.i_batch_dft.push_back(batch.n_tokens);
                         common_batch_add(batch, draft[i], slot.prompt.tokens.pos_next(), { slot.id }, true);
@@ -2147,7 +2297,6 @@ private:
                 slot.i_batch = batch.n_tokens;
 
                 common_batch_add(batch, slot.sampled, slot.prompt.tokens.pos_next(), { slot.id }, true);
-
                 slot.prompt.tokens.push_back(slot.sampled);
 
                 SLT_DBG(slot, "slot decode token, n_ctx = %d, n_tokens = %d, truncated = %d\n",
@@ -2854,7 +3003,7 @@ private:
                     slot.state = SLOT_STATE_GENERATING;
 
                     if (slot.can_speculate()) {
-                        common_speculative_begin(slot.spec, slot.prompt.tokens.get_text_tokens());
+                            common_speculative_begin(slot.spec, slot.prompt.tokens.get_text_tokens());
                     }
                 } else if (slot.state != SLOT_STATE_GENERATING) {
                     continue; // continue loop of slots
@@ -2866,13 +3015,299 @@ private:
 
                 const int tok_idx = slot.i_batch - i;
 
+                // --- Plan A 1-phase batched spec decode verifier ---
+                // The batching loop emitted [T_prev, D_1..D_k] as a single
+                // contiguous block at positions tok_idx..tok_idx+k. Sample
+                // verified[0..k], find the first index where the draft
+                // doesn't match main's greedy/sample, commit the accepted
+                // prefix + correction (or all-k drafts + bonus on full
+                // accept), and restore the pre-spec snapshot on partial
+                // reject.
+                if (plan_a_enabled && !slot.spec_drafts.empty() && !slot.spec_snap.empty()) {
+                    const int k = (int) slot.spec_drafts.size();
+
+                    // Sample verified[0..k]. verified[j] at batch position
+                    // tok_idx+j is main's prediction for the token that
+                    // should live at position (pos_of_T_prev + 1 + j).
+                    std::vector<llama_token> verified(k + 1);
+                    for (int j = 0; j <= k; j++) {
+                        verified[j] = common_sampler_sample(slot.smpl.get(), ctx, tok_idx + j);
+                    }
+
+                    // Find first mismatch in drafts[0..k-1] vs verified[0..k-1].
+                    int j_mismatch = k;
+                    for (int j = 0; j < k; j++) {
+                        if (verified[j] != slot.spec_drafts[j]) {
+                            j_mismatch = j;
+                            break;
+                        }
+                    }
+
+                    slot.n_draft_accepted += j_mismatch;
+
+                    const int64_t t_current = ggml_time_us();
+                    if (slot.n_decoded == 0) {
+                        slot.t_start_generation = t_current;
+                        slot.t_prompt_processing = (slot.t_start_generation - slot.t_start_process_prompt) / 1e3;
+                        metrics.on_prompt_eval(slot);
+                    }
+
+                    // State-management: on partial reject, roll back to the
+                    // snapshot point and re-run the accepted prefix + the
+                    // correction token so state is coherent for next iter.
+                    // On full accept, state is already at the correct
+                    // position (after decoding T_prev + all k drafts).
+                    if (j_mismatch < k) {
+                        fprintf(stderr, "[PLAN-A] partial reject j=%d/%d\n", j_mismatch, k);
+                        fflush(stderr);
+
+                        // Restore recurrent state to pre-spec position
+                        const size_t nset = llama_state_seq_set_data_ext(
+                            ctx, slot.spec_snap.data(), slot.spec_snap.size(),
+                            slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                        if (nset != slot.spec_snap.size()) {
+                            SLT_WRN(slot, "Plan A snapshot restore failed: got %zu expected %zu\n",
+                                    nset, slot.spec_snap.size());
+                        }
+
+                        // Trim KV cache past the snapshot position
+                        llama_memory_seq_rm(llama_get_memory(ctx), slot.id,
+                                            slot.spec_n_past_before, -1);
+
+                        // Also trim slot.prompt.tokens back to the snapshot point
+                        // (the batching loop pushed T_prev + k drafts; we keep
+                        // only the tokens we re-push below).
+                        slot.prompt.tokens.keep_first(slot.spec_n_past_before);
+
+                        // Re-run [T_prev, spec_drafts[0..j_mismatch-1]] as a
+                        // fresh batch. verified[j_mismatch] is NOT decoded
+                        // here — it stays as slot.sampled and will be fed by
+                        // the next iteration's batching loop at position
+                        // (spec_n_past_before + j_mismatch + 1). This keeps
+                        // the invariant "prompt.tokens.n_tokens() == KV
+                        // cache length" and avoids duplicating verified[j]
+                        // across two positions in the KV cache.
+                        //
+                        // MTP logits after this rerun come from position
+                        // (spec_n_past_before + j_mismatch) = the last
+                        // accepted draft's position. MTP iter 0 predicts
+                        // P+2 = (spec_n_past_before + j_mismatch + 2),
+                        // which is exactly D_1's position in the next iter's
+                        // spec batch (where slot.sampled=verified[j_mismatch]
+                        // will sit at spec_n_past_before + j_mismatch + 1).
+                        // So the rollout maps directly: drafts[j] = iter j.
+                        llama_batch rerun = llama_batch_init(j_mismatch + 1, 0, 1);
+                        common_batch_add(rerun, slot.sampled,
+                            slot.spec_n_past_before, { slot.id }, true);
+                        slot.prompt.tokens.push_back(slot.sampled);
+                        for (int j = 0; j < j_mismatch; j++) {
+                            common_batch_add(rerun, slot.spec_drafts[j],
+                                slot.spec_n_past_before + 1 + j, { slot.id }, true);
+                            slot.prompt.tokens.push_back(slot.spec_drafts[j]);
+                        }
+
+                        const int ret2 = llama_decode(ctx, rerun);
+                        llama_batch_free(rerun);
+                        if (ret2 != 0) {
+                            SLT_WRN(slot, "Plan A re-run decode failed with ret=%d\n", ret2);
+                        }
+                    } else {
+                        fprintf(stderr, "[PLAN-A] FULL ACCEPT %d drafts + bonus\n", k);
+                        fflush(stderr);
+                    }
+
+                    // Emit committed tokens via process_token.
+                    // Partial reject: drafts[0..j-1] + verified[j] (correction)
+                    // Full accept:    drafts[0..k-1] + verified[k] (bonus)
+                    bool stopped = false;
+                    const int n_committed_drafts = j_mismatch;
+                    for (int j = 0; j < n_committed_drafts; j++) {
+                        completion_token_output r;
+                        r.tok          = slot.spec_drafts[j];
+                        r.text_to_send = common_token_to_piece(ctx, r.tok,
+                            accept_special_token(slot, r.tok));
+                        r.prob         = 1.0f;
+                        slot.n_decoded += 1;
+                        if (!process_token(r, slot)) {
+                            slot.print_timings();
+                            send_final_response(slot);
+                            metrics.on_prediction(slot);
+                            slot.release();
+                            stopped = true;
+                            break;
+                        }
+                    }
+                    if (!stopped) {
+                        completion_token_output r;
+                        r.tok          = verified[j_mismatch];
+                        r.text_to_send = common_token_to_piece(ctx, r.tok,
+                            accept_special_token(slot, r.tok));
+                        r.prob         = 1.0f;
+                        slot.n_decoded += 1;
+                        if (!process_token(r, slot)) {
+                            slot.print_timings();
+                            send_final_response(slot);
+                            metrics.on_prediction(slot);
+                            slot.release();
+                            stopped = true;
+                        }
+                    }
+
+                    slot.t_token_generation = std::max<int64_t>(1,
+                        t_current - slot.t_start_generation) / 1e3;
+
+                    // Clear Plan A state regardless of stop
+                    slot.spec_drafts.clear();
+                    slot.spec_snap.clear();
+                    slot.mtp_pending     = false;
+                    slot.mtp_draft_token = -1;
+                    slot.mtp_i_batch     = -1;
+                    slot.i_batch         = -1;
+
+                    // Queue the next iteration's drafts from the freshly-
+                    // updated MTP logits (from the re-run or the spec batch).
+                    if (!stopped) {
+                        try_set_mtp_draft(slot);
+                    }
+
+                    continue; // done with this slot for this decode step
+                }
+
+                // --- Two-phase MTP: verify draft after decoding sampled token ---
+                // The sampled token was decoded alone (1-token batch).
+                // Now verify the draft against main model logits.
+                // If accepted: decode draft in a second pass (correct checkpoint position).
+                // If rejected: skip draft decode (no seq_rm needed — state is clean).
+                if (slot.mtp_pending) {
+                    // Sample from main model at the sampled token's position
+                    llama_token verified = common_sampler_sample(slot.smpl.get(), ctx, tok_idx);
+                    common_sampler_accept(slot.smpl.get(), verified, true);
+
+                    slot.n_draft_total += 1;
+
+                    const int64_t t_current = ggml_time_us();
+                    if (slot.n_decoded == 0) {
+                        slot.t_start_generation = t_current;
+                        slot.t_prompt_processing = (slot.t_start_generation - slot.t_start_process_prompt) / 1e3;
+                        metrics.on_prompt_eval(slot);
+                    }
+
+                    if (verified == slot.mtp_draft_token) {
+                        // ACCEPTED — decode the draft token in a second pass.
+                        // At this point the recurrent state checkpoint is at the
+                        // correct position (after sampled, before draft).
+                        slot.n_draft_accepted += 1;
+                        slot.n_decoded += 1;
+
+                        // Output the verified/sampled token
+                        completion_token_output result_sampled;
+                        result_sampled.tok          = verified;
+                        result_sampled.text_to_send = common_token_to_piece(ctx, result_sampled.tok, accept_special_token(slot, result_sampled.tok));
+                        result_sampled.prob         = 1.0f;
+
+                        bool should_stop = !process_token(result_sampled, slot);
+                        if (should_stop) {
+                            slot.print_timings();
+                            send_final_response(slot);
+                            metrics.on_prediction(slot);
+                            slot.release();
+                            slot.mtp_pending = false;
+                            slot.mtp_draft_token = -1;
+                            continue;
+                        }
+
+                        // Build a 1-token batch for the draft token and decode it
+                        llama_batch draft_batch = llama_batch_init(1, 0, 1);
+                        common_batch_clear(draft_batch);
+                        common_batch_add(draft_batch, slot.mtp_draft_token, slot.prompt.tokens.pos_next(), { slot.id }, true);
+                        slot.prompt.tokens.push_back(slot.mtp_draft_token);
+
+                        fprintf(stderr, "[MTP-2PHASE] draft ACCEPTED (verified=%d), decoding draft at pos %d\n",
+                                (int)verified, (int)(slot.prompt.tokens.pos_next() - 1));
+                        fflush(stderr);
+
+                        int ret2 = llama_decode(ctx, draft_batch);
+                        llama_batch_free(draft_batch);
+
+                        if (ret2 != 0) {
+                            fprintf(stderr, "[MTP-2PHASE] ERROR: draft decode failed with ret=%d\n", ret2);
+                            fflush(stderr);
+                            // Fall through — state is still valid at pre-draft position
+                        } else {
+                            // Sample bonus token from draft's logits (the NEXT-NEXT token)
+                            llama_token bonus = common_sampler_sample(slot.smpl.get(), ctx, 0);
+                            common_sampler_accept(slot.smpl.get(), bonus, true);
+                            slot.n_decoded += 1;
+                            slot.sampled = bonus;
+
+                            // Output the bonus token (draft/verified was already output above)
+                            completion_token_output result_bonus;
+                            result_bonus.tok          = bonus;
+                            result_bonus.text_to_send = common_token_to_piece(ctx, result_bonus.tok, accept_special_token(slot, result_bonus.tok));
+                            result_bonus.prob         = 1.0f;
+
+                            if (!process_token(result_bonus, slot)) {
+                                slot.print_timings();
+                                send_final_response(slot);
+                                metrics.on_prediction(slot);
+                                slot.release();
+                                slot.mtp_pending = false;
+                                slot.mtp_draft_token = -1;
+                                continue;
+                            }
+
+                            // NOTE: do not call common_speculative_accept() here —
+                            // inline MTP bypasses common_speculative_draft(), so
+                            // spec->curr_impl is never set and the assert would fire.
+                            // Acceptance stats are tracked locally via
+                            // slot.n_draft_accepted (line above).
+                        }
+                    } else {
+                        // REJECTED — draft was never decoded, state is clean.
+                        // No seq_rm needed!
+                        fprintf(stderr, "[MTP-2PHASE] draft REJECTED (verified=%d, draft=%d)\n",
+                                (int)verified, (int)slot.mtp_draft_token);
+                        fflush(stderr);
+
+                        slot.sampled = verified;
+                        slot.n_decoded += 1;
+
+                        // Output the verified token
+                        completion_token_output result_verified;
+                        result_verified.tok          = verified;
+                        result_verified.text_to_send = common_token_to_piece(ctx, result_verified.tok, accept_special_token(slot, result_verified.tok));
+                        result_verified.prob         = 1.0f;
+
+                        if (!process_token(result_verified, slot)) {
+                            slot.print_timings();
+                            send_final_response(slot);
+                            metrics.on_prediction(slot);
+                            slot.release();
+                            slot.mtp_pending = false;
+                            slot.mtp_draft_token = -1;
+                            continue;
+                        }
+                    }
+
+                    slot.t_token_generation = std::max<int64_t>(1, t_current - slot.t_start_generation) / 1e3;
+                    slot.i_batch = -1;
+
+                    // Producer: propose next draft from the fresh MTP logits produced
+                    // by the most recent decode. Both accept (draft_batch) and reject
+                    // (T-alone) paths leave valid MTP logits pointing at the right
+                    // next-next position. Clears mtp_pending if logits unavailable.
+                    try_set_mtp_draft(slot);
+
+                    continue; // done with this slot for this decode step
+                }
+
+                // --- Normal sampling (no pending MTP draft) ---
                 llama_token id = common_sampler_sample(slot.smpl.get(), ctx, tok_idx);
 
                 slot.i_batch = -1;
 
                 common_sampler_accept(slot.smpl.get(), id, true);
 
-                // here we have synchronized the llama_context (due to the sampling above), so we can do time measurement
                 const int64_t t_current = ggml_time_us();
 
                 slot.n_decoded += 1;
@@ -2888,14 +3323,13 @@ private:
                 completion_token_output result;
                 result.tok          = id;
                 result.text_to_send = common_token_to_piece(ctx, result.tok, accept_special_token(slot, result.tok));
-                result.prob         = 1.0f; // TODO: set it here instead of doing inside populate_token_probs
+                result.prob         = 1.0f;
 
                 if (slot.task->params.sampling.n_probs > 0) {
                     populate_token_probs(slot, result, slot.task->params.post_sampling_probs, params_base.special, tok_idx);
                 }
 
                 if (!process_token(result, slot)) {
-                    // release slot because of stop condition
                     slot.print_timings();
                     send_final_response(slot);
                     metrics.on_prediction(slot);
@@ -2903,6 +3337,12 @@ private:
 
                     continue;
                 }
+
+                // Producer: after the first post-prompt sample (and any subsequent
+                // sample that falls through the normal path), propose a draft from
+                // the fresh MTP logits so the next iteration enters the verifier
+                // block above instead of looping through normal sample again.
+                try_set_mtp_draft(slot);
             }
 
             // speculative decoding - main model sample and accept
@@ -2937,7 +3377,15 @@ private:
                 slot.prompt.tokens.insert({ids.begin(), ids.end() - 1});
                 slot.sampled = ids.back(); // last accepted token
 
-                llama_memory_seq_rm(llama_get_memory(ctx), slot.id, slot.prompt.n_tokens(), -1);
+                // Remove rejected draft tokens from KV cache.
+                // For hybrid SSM/DeltaNet, seq_rm may fail. In that case,
+                // just log and continue — the recurrent state has the draft
+                // token baked in, but the checkpoint mechanism in
+                // llama-memory-recurrent.cpp should handle rollback internally
+                // during the next find_slot call.
+                if (!llama_memory_seq_rm(llama_get_memory(ctx), slot.id, slot.prompt.n_tokens(), -1)) {
+                    SLT_WRN(slot, "seq_rm failed at pos %d\n", (int)slot.prompt.n_tokens());
+                }
 
                 for (size_t i = 0; i < ids.size(); ++i) {
                     completion_token_output result;

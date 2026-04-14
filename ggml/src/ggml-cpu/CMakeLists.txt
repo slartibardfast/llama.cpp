@@ -33,6 +33,8 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         ggml-cpu/repack.h
         ggml-cpu/hbm.cpp
         ggml-cpu/hbm.h
+        ggml-cpu/numa-mirror.cpp
+        ggml-cpu/numa-mirror.h
         ggml-cpu/quants.c
         ggml-cpu/quants.h
         ggml-cpu/traits.cpp
@@ -101,6 +103,19 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_USE_CPU_HBM)
 
         target_link_libraries(${GGML_CPU_NAME} PUBLIC memkind)
+    endif()
+
+    # Link libnuma for the NUMA mirror buffer type's mbind() calls.
+    # Optional: if not found, the mirror code falls through to the
+    # single-copy allocator (effectively a no-op CPU buffer).
+    if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        find_library(NUMA_LIB numa)
+        if (NUMA_LIB)
+            message(STATUS "libnuma found: enabling NUMA mirror buffer type")
+            target_link_libraries(${GGML_CPU_NAME} PRIVATE ${NUMA_LIB})
+        else()
+            message(STATUS "libnuma not found: NUMA mirror buffer type will fall back to single-copy")
+        endif()
     endif()
 
     if (GGML_SYSTEM_ARCH STREQUAL "ARM")

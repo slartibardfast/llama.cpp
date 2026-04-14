@@ -2,9 +2,31 @@
 #extension GL_EXT_shader_16bit_storage : require
 #extension GL_EXT_shader_8bit_storage : require
 
+#ifdef FLOAT16
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_spirv_intrinsics : require
+// DenormFlushToZero for Float16: enables v_mad_mix_f32 (f16*f16+f32) on GCN.
+// ACO converts v_add_f32(cvt_f32_f16, x) → v_fma_mix_f32 when fp_mode.denorm == 0.
+// Float32 denorms default to flush on AMD compute, so only Float16 needs explicit flush.
+spirv_execution_mode(capabilities = [4465], 4460, 16);
+#endif
+
 #if USE_SUBGROUP_ADD || USE_SUBGROUP_ADD_NO_SHMEM
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
+#ifdef FLOAT16
+#extension GL_EXT_shader_subgroup_extended_types_float16 : require
+#endif
+#endif
+
+#ifndef FLOAT_TYPEV4
+#define FLOAT_TYPEV4 vec4
+#endif
+
+// ACC_TYPE: accumulator type for cross-block reduction. Defaults to FLOAT_TYPE
+// but overridden to float for f16acc variants (F16 intermediates, F32 accumulation).
+#ifndef ACC_TYPE
+#define ACC_TYPE FLOAT_TYPE
 #endif
 
 #ifdef MUL_MAT_ID
@@ -91,7 +113,7 @@ layout (constant_id = 1) const uint NUM_ROWS = 1;
 layout (constant_id = 2) const uint NUM_COLS = 1;
 
 #ifdef USE_SUBGROUP_ADD_NO_SHMEM
-void reduce_result(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t d_offset, const in uint32_t first_row, const in uint32_t num_rows, const in uint32_t tid) {
+void reduce_result(inout ACC_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t d_offset, const in uint32_t first_row, const in uint32_t num_rows, const in uint32_t tid) {
     [[unroll]] for (uint j = 0; j < NUM_COLS; ++j) {
         [[unroll]] for (uint n = 0; n < num_rows; ++n) {
             temp[j][n] = subgroupAdd(temp[j][n]);
@@ -127,9 +149,9 @@ void reduce_result(inout FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t 
     }
 }
 #else
-shared FLOAT_TYPE tmpsh[NUM_COLS][NUM_ROWS][BLOCK_SIZE];
+shared ACC_TYPE tmpsh[NUM_COLS][NUM_ROWS][BLOCK_SIZE];
 
-void reduce_result(FLOAT_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t d_offset, const in uint32_t first_row, const in uint32_t num_rows, const in uint32_t tid) {
+void reduce_result(ACC_TYPE temp[NUM_COLS][NUM_ROWS], const in uint32_t d_offset, const in uint32_t first_row, const in uint32_t num_rows, const in uint32_t tid) {
     // subgroupAdd is probably faster on devices that support it,
     // particularly when the workgroup has more than one subgroup
 #if USE_SUBGROUP_ADD

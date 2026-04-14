@@ -12,6 +12,7 @@ llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
         const llama_model & model,
                             /* attn */
                 ggml_type   type_k,
+                ggml_type   type_k_static,
                 ggml_type   type_v,
                      bool   v_trans,
                      bool   swa_full,
@@ -33,6 +34,7 @@ llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
     mem_attn(new llama_kv_cache_iswa(
         model,
         type_k,
+        type_k_static,
         type_v,
         v_trans,
         offload,

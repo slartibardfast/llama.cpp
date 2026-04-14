@@ -4,6 +4,7 @@
 
 #include "ggml.h"
 #include "ggml-impl.h"
+#include "ggml-cpu.h"
 
 #include <stdlib.h> // load `stdlib.h` before other headers to work around MinGW bug: https://sourceforge.net/p/mingw-w64/bugs/192/
 //#include <stddef.h>
@@ -28,6 +29,27 @@ struct ggml_compute_params {
     // use reference implementation
     bool use_ref;
 };
+
+// NUMA-mirror plumbing. ggml_tls_numa_node is set per worker thread by
+// set_numa_thread_affinity when GGML_NUMA_STRATEGY_MIRROR is active. The
+// helpers are read by the CPU compute kernels (ops.cpp) and the mirror
+// buffer abstraction to pick the local copy of replicated buffers.
+int ggml_cpu_get_numa_node(void);
+enum ggml_numa_strategy ggml_cpu_get_numa_strategy(void);
+ptrdiff_t ggml_backend_cpu_numa_mirror_alt_offset(struct ggml_backend_buffer * buffer);
+
+// Helper used by the matmul / FA / get_rows compute kernels to read a
+// read-only tensor from the local NUMA copy. For non-mirrored tensors
+// the alt offset is 0 and the result is just t->data, so this compiles
+// down to the same access as before. For mirrored tensors it adds the
+// per-NUMA alt offset based on the calling thread's TLS node id.
+//
+// Hoist this once per kernel invocation (not per element) so the inner
+// loops see a plain `const char *` and the cost amortizes to nothing.
+static inline const char * ggml_tensor_data_numa_local(const struct ggml_tensor * t) {
+    const ptrdiff_t alt = ggml_backend_cpu_numa_mirror_alt_offset(t->buffer);
+    return (const char *) t->data + alt * (ptrdiff_t) ggml_cpu_get_numa_node();
+}
 
 
 #if defined(_MSC_VER)

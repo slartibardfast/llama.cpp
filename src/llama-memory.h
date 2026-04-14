@@ -16,6 +16,7 @@ class llama_io_read_i;
 struct llama_memory_params {
     // kv cache
     ggml_type type_k;
+    ggml_type type_k_static; // split K: type for static (non-RoPE) dims. GGML_TYPE_COUNT = no split
     ggml_type type_v;
 
     // use full-size SWA cache

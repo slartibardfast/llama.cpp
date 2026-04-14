@@ -112,6 +112,8 @@ FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
 #define BLOCK_BYTE_SIZE 18
 #elif defined(DATA_A_Q4_1)
 #define BLOCK_BYTE_SIZE 20
+#elif defined(DATA_A_TQ_V_4B)
+#define BLOCK_BYTE_SIZE 66
 #endif
 
 #if defined(DATA_A_Q4_0) || defined(DATA_A_Q4_1)
@@ -142,6 +144,38 @@ FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
 #else
         return FLOAT_TYPE(v_packed.v_data_packed16[a_offset + ib].d) * (nibbles - FLOAT_TYPE(8.0f));
 #endif
+    }
+}
+#endif
+
+#if defined(DATA_A_TQ_V_4B)
+// TurboQuant V 4-bit. 128-element block, same q4_0-style nibble semantics but
+// with the larger half. iqs arrives as a multiple of 4 in [0, 128); the low
+// half covers positions 0..63 (low nibbles of qs[0..63]) and the high half
+// covers positions 64..127 (high nibbles of the SAME qs bytes, not the next
+// 64). Because iqs is always 4-aligned and 64 is 4-aligned, the 4 elements
+// returned are always within the same half — no crossings.
+FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
+    if (binding_idx == BINDING_IDX_K) {
+        uint byte_idx = iqs & 0x3F;     // 0..63, the byte index within either half
+        uint shift    = (iqs & 0x40) >> 4; // 0 for low nibbles, 4 for high nibbles
+        uint vui_lo = uint(k_packed.k_data_packed16[a_offset + ib].qs[byte_idx / 2 + 0]);
+        uint vui_hi = uint(k_packed.k_data_packed16[a_offset + ib].qs[byte_idx / 2 + 1]);
+        vui_lo >>= shift;
+        vui_hi >>= shift;
+
+        FLOAT_TYPEV4 nibbles = FLOAT_TYPEV4(vui_lo & 0xF, (vui_lo >> 8) & 0xF, vui_hi & 0xF, (vui_hi >> 8) & 0xF);
+        return FLOAT_TYPE(k_packed.k_data_packed16[a_offset + ib].d) * (nibbles - FLOAT_TYPE(8.0f));
+    } else {
+        uint byte_idx = iqs & 0x3F;
+        uint shift    = (iqs & 0x40) >> 4;
+        uint vui_lo = uint(v_packed.v_data_packed16[a_offset + ib].qs[byte_idx / 2 + 0]);
+        uint vui_hi = uint(v_packed.v_data_packed16[a_offset + ib].qs[byte_idx / 2 + 1]);
+        vui_lo >>= shift;
+        vui_hi >>= shift;
+
+        FLOAT_TYPEV4 nibbles = FLOAT_TYPEV4(vui_lo & 0xF, (vui_lo >> 8) & 0xF, vui_hi & 0xF, (vui_hi >> 8) & 0xF);
+        return FLOAT_TYPE(v_packed.v_data_packed16[a_offset + ib].d) * (nibbles - FLOAT_TYPE(8.0f));
     }
 }
 #endif
@@ -246,6 +280,270 @@ FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
     }
 }
 #endif
+
+// ============================================================================
+// Independent K / V type support
+//
+// The flash-attention shader historically assumed that K and V share a single
+// type (DATA_A_X). Supporting a quantised V cache with an F16 K cache — the
+// --cache-type-v <quant> + --flash-attn on path — requires independent K and V
+// type metadata. When a caller sets any DATA_K_* / DATA_V_* define, we follow
+// the split path below. Otherwise we alias the new K_* / V_* macros to the
+// legacy BLOCK_SIZE / BLOCK_BYTE_SIZE / dequantize4() symbols, so the
+// flash_attn_cm1 / flash_attn_cm2 shaders (which still use the legacy API)
+// keep working unchanged.
+// ============================================================================
+
+#if defined(DATA_K_F32) || defined(DATA_K_F16) || defined(DATA_K_Q4_0) || defined(DATA_K_Q4_1) || defined(DATA_K_Q5_0) || defined(DATA_K_Q5_1) || defined(DATA_K_Q8_0) || defined(DATA_K_IQ4_NL) || defined(DATA_K_TQ_V_4B) || \
+    defined(DATA_V_F32) || defined(DATA_V_F16) || defined(DATA_V_Q4_0) || defined(DATA_V_Q4_1) || defined(DATA_V_Q5_0) || defined(DATA_V_Q5_1) || defined(DATA_V_Q8_0) || defined(DATA_V_IQ4_NL) || defined(DATA_V_TQ_V_4B)
+#define KV_SPLIT_PATH 1
+#endif
+
+#ifdef KV_SPLIT_PATH
+
+// ---------- K side ----------
+#if defined(DATA_K_F16)
+#define K_BLOCK_SIZE 1
+// No extra K binding here — flash_attn.comp declares `data_kv4` at binding 1.
+
+#elif defined(DATA_K_Q4_0)
+#define K_BLOCK_SIZE 32
+#define K_BLOCK_BYTE_SIZE 18
+layout (binding = 1) readonly buffer K_PACKED16_Q40 {block_q4_0_packed16 k_data_packed16[];} k_packed;
+FLOAT_TYPEV4 dequantize4_k(uint ib, uint iqs, uint a_offset) {
+    uint vui_lo = uint(k_packed.k_data_packed16[a_offset + ib].qs[(iqs & 0xF) / 2 + 0]);
+    uint vui_hi = uint(k_packed.k_data_packed16[a_offset + ib].qs[(iqs & 0xF) / 2 + 1]);
+    uint shift = (iqs & 0x10) >> 2;
+    vui_lo >>= shift;
+    vui_hi >>= shift;
+    FLOAT_TYPEV4 nibbles = FLOAT_TYPEV4(vui_lo & 0xF, (vui_lo >> 8) & 0xF, vui_hi & 0xF, (vui_hi >> 8) & 0xF);
+    return FLOAT_TYPE(k_packed.k_data_packed16[a_offset + ib].d) * (nibbles - FLOAT_TYPE(8.0f));
+}
+
+#elif defined(DATA_K_Q4_1)
+#define K_BLOCK_SIZE 32
+#define K_BLOCK_BYTE_SIZE 20
+layout (binding = 1) readonly buffer K_PACKED16_Q41 {block_q4_1_packed16 k_data_packed16[];} k_packed;
+FLOAT_TYPEV4 dequantize4_k(uint ib, uint iqs, uint a_offset) {
+    uint vui_lo = uint(k_packed.k_data_packed16[a_offset + ib].qs[(iqs & 0xF) / 2 + 0]);
+    uint vui_hi = uint(k_packed.k_data_packed16[a_offset + ib].qs[(iqs & 0xF) / 2 + 1]);
+    uint shift = (iqs & 0x10) >> 2;
+    vui_lo >>= shift;
+    vui_hi >>= shift;
+    FLOAT_TYPEV4 nibbles = FLOAT_TYPEV4(vui_lo & 0xF, (vui_lo >> 8) & 0xF, vui_hi & 0xF, (vui_hi >> 8) & 0xF);
+    return FLOAT_TYPE(k_packed.k_data_packed16[a_offset + ib].d) * nibbles + FLOAT_TYPE(k_packed.k_data_packed16[a_offset + ib].m);
+}
+
+#elif defined(DATA_K_Q5_0)
+#define K_BLOCK_SIZE 32
+#define K_BLOCK_BYTE_SIZE 22
+layout (binding = 1) readonly buffer K_PACKED16_Q50 {block_q5_0_packed16 k_data_packed16[];} k_packed;
+FLOAT_TYPEV4 dequantize4_k(uint ib, uint iqs, uint a_offset) {
+    uint vui_lo = uint(k_packed.k_data_packed16[a_offset + ib].qs[(iqs & 0xF) / 2 + 0]);
+    uint vui_hi = uint(k_packed.k_data_packed16[a_offset + ib].qs[(iqs & 0xF) / 2 + 1]);
+    uint shift = (iqs & 0x10) >> 2;
+    vui_lo >>= shift;
+    vui_hi >>= shift;
+    uint qh = uint(k_packed.k_data_packed16[a_offset + ib].qh[0]) | (uint(k_packed.k_data_packed16[a_offset + ib].qh[1]) << 16);
+    FLOAT_TYPEV4 hb = FLOAT_TYPEV4((qh >> iqs) & 1, (qh >> (iqs + 1)) & 1, (qh >> (iqs + 2)) & 1, (qh >> (iqs + 3)) & 1) * FLOAT_TYPE(16.0f);
+    FLOAT_TYPEV4 nibbles = FLOAT_TYPEV4(vui_lo & 0xF, (vui_lo >> 8) & 0xF, vui_hi & 0xF, (vui_hi >> 8) & 0xF);
+    return FLOAT_TYPE(k_packed.k_data_packed16[a_offset + ib].d) * (nibbles + hb - FLOAT_TYPE(16.0f));
+}
+
+#elif defined(DATA_K_Q5_1)
+#define K_BLOCK_SIZE 32
+#define K_BLOCK_BYTE_SIZE 24
+layout (binding = 1) readonly buffer K_PACKED16_Q51 {block_q5_1_packed16 k_data_packed16[];} k_packed;
+FLOAT_TYPEV4 dequantize4_k(uint ib, uint iqs, uint a_offset) {
+    uint vui_lo = uint(k_packed.k_data_packed16[a_offset + ib].qs[(iqs & 0xF) / 2 + 0]);
+    uint vui_hi = uint(k_packed.k_data_packed16[a_offset + ib].qs[(iqs & 0xF) / 2 + 1]);
+    uint shift = (iqs & 0x10) >> 2;
+    vui_lo >>= shift;
+    vui_hi >>= shift;
+    uint qh = k_packed.k_data_packed16[a_offset + ib].qh;
+    FLOAT_TYPEV4 hb = FLOAT_TYPEV4((qh >> iqs) & 1, (qh >> (iqs + 1)) & 1, (qh >> (iqs + 2)) & 1, (qh >> (iqs + 3)) & 1) * FLOAT_TYPE(16.0f);
+    FLOAT_TYPEV4 nibbles = FLOAT_TYPEV4(vui_lo & 0xF, (vui_lo >> 8) & 0xF, vui_hi & 0xF, (vui_hi >> 8) & 0xF);
+    return FLOAT_TYPE(k_packed.k_data_packed16[a_offset + ib].d) * (nibbles + hb) + FLOAT_TYPE(k_packed.k_data_packed16[a_offset + ib].m);
+}
+
+#elif defined(DATA_K_Q8_0)
+#define K_BLOCK_SIZE 32
+#define K_BLOCK_BYTE_SIZE 34
+layout (binding = 1) readonly buffer K_PACKED16_Q80 {block_q8_0_packed16 k_data_packed16[];} k_packed;
+FLOAT_TYPEV4 dequantize4_k(uint ib, uint iqs, uint a_offset) {
+    const i8vec2 v0 = unpack8(int32_t(k_packed.k_data_packed16[a_offset + ib].qs[iqs / 2])).xy;
+    const i8vec2 v1 = unpack8(int32_t(k_packed.k_data_packed16[a_offset + ib].qs[iqs / 2 + 1])).xy;
+    return FLOAT_TYPE(k_packed.k_data_packed16[a_offset + ib].d) * FLOAT_TYPEV4(v0.x, v0.y, v1.x, v1.y);
+}
+
+#elif defined(DATA_K_IQ4_NL)
+#define K_BLOCK_SIZE 32
+#define K_BLOCK_BYTE_SIZE 18
+layout (binding = 1) readonly buffer K_PACKED16_IQ4NL {block_iq4_nl_packed16 k_data_packed16[];} k_packed;
+FLOAT_TYPEV4 dequantize4_k(uint ib, uint iqs, uint a_offset) {
+    uint vui_lo = uint(k_packed.k_data_packed16[a_offset + ib].qs[(iqs & 0xF) / 2 + 0]);
+    uint vui_hi = uint(k_packed.k_data_packed16[a_offset + ib].qs[(iqs & 0xF) / 2 + 1]);
+    uint shift = (iqs & 0x10) >> 2;
+    vui_lo >>= shift;
+    vui_hi >>= shift;
+    return FLOAT_TYPE(k_packed.k_data_packed16[a_offset + ib].d) * FLOAT_TYPEV4(
+        kvalues_iq4nl[vui_lo & 0xF],
+        kvalues_iq4nl[(vui_lo >> 8) & 0xF],
+        kvalues_iq4nl[vui_hi & 0xF],
+        kvalues_iq4nl[(vui_hi >> 8) & 0xF]);
+}
+
+#elif defined(DATA_K_TQ_V_4B)
+#define K_BLOCK_SIZE 128
+#define K_BLOCK_BYTE_SIZE 66
+layout (binding = 1) readonly buffer K_PACKED16_TQ {block_tq_v_4b_packed16 k_data_packed16[];} k_packed;
+FLOAT_TYPEV4 dequantize4_k(uint ib, uint iqs, uint a_offset) {
+    uint byte_idx = iqs & 0x3F;
+    uint shift    = (iqs & 0x40) >> 4;
+    uint vui_lo = uint(k_packed.k_data_packed16[a_offset + ib].qs[byte_idx / 2 + 0]);
+    uint vui_hi = uint(k_packed.k_data_packed16[a_offset + ib].qs[byte_idx / 2 + 1]);
+    vui_lo >>= shift;
+    vui_hi >>= shift;
+    FLOAT_TYPEV4 nibbles = FLOAT_TYPEV4(vui_lo & 0xF, (vui_lo >> 8) & 0xF, vui_hi & 0xF, (vui_hi >> 8) & 0xF);
+    return FLOAT_TYPE(k_packed.k_data_packed16[a_offset + ib].d) * (nibbles - FLOAT_TYPE(8.0f));
+}
+
+#else
+#error "KV_SPLIT_PATH: unsupported K type — add a DATA_K_* case"
+#endif
+
+// ---------- V side ----------
+#if defined(DATA_V_F16)
+#define V_BLOCK_SIZE 1
+// No extra V binding — flash_attn.comp declares `data_vv4` at binding 2.
+
+#elif defined(DATA_V_Q4_0)
+#define V_BLOCK_SIZE 32
+#define V_BLOCK_BYTE_SIZE 18
+layout (binding = 2) readonly buffer V_PACKED16_Q40 {block_q4_0_packed16 v_data_packed16[];} v_packed;
+FLOAT_TYPEV4 dequantize4_v(uint ib, uint iqs, uint a_offset) {
+    uint vui_lo = uint(v_packed.v_data_packed16[a_offset + ib].qs[(iqs & 0xF) / 2 + 0]);
+    uint vui_hi = uint(v_packed.v_data_packed16[a_offset + ib].qs[(iqs & 0xF) / 2 + 1]);
+    uint shift = (iqs & 0x10) >> 2;
+    vui_lo >>= shift;
+    vui_hi >>= shift;
+    FLOAT_TYPEV4 nibbles = FLOAT_TYPEV4(vui_lo & 0xF, (vui_lo >> 8) & 0xF, vui_hi & 0xF, (vui_hi >> 8) & 0xF);
+    return FLOAT_TYPE(v_packed.v_data_packed16[a_offset + ib].d) * (nibbles - FLOAT_TYPE(8.0f));
+}
+
+#elif defined(DATA_V_Q4_1)
+#define V_BLOCK_SIZE 32
+#define V_BLOCK_BYTE_SIZE 20
+layout (binding = 2) readonly buffer V_PACKED16_Q41 {block_q4_1_packed16 v_data_packed16[];} v_packed;
+FLOAT_TYPEV4 dequantize4_v(uint ib, uint iqs, uint a_offset) {
+    uint vui_lo = uint(v_packed.v_data_packed16[a_offset + ib].qs[(iqs & 0xF) / 2 + 0]);
+    uint vui_hi = uint(v_packed.v_data_packed16[a_offset + ib].qs[(iqs & 0xF) / 2 + 1]);
+    uint shift = (iqs & 0x10) >> 2;
+    vui_lo >>= shift;
+    vui_hi >>= shift;
+    FLOAT_TYPEV4 nibbles = FLOAT_TYPEV4(vui_lo & 0xF, (vui_lo >> 8) & 0xF, vui_hi & 0xF, (vui_hi >> 8) & 0xF);
+    return FLOAT_TYPE(v_packed.v_data_packed16[a_offset + ib].d) * nibbles + FLOAT_TYPE(v_packed.v_data_packed16[a_offset + ib].m);
+}
+
+#elif defined(DATA_V_Q5_0)
+#define V_BLOCK_SIZE 32
+#define V_BLOCK_BYTE_SIZE 22
+layout (binding = 2) readonly buffer V_PACKED16_Q50 {block_q5_0_packed16 v_data_packed16[];} v_packed;
+FLOAT_TYPEV4 dequantize4_v(uint ib, uint iqs, uint a_offset) {
+    uint vui_lo = uint(v_packed.v_data_packed16[a_offset + ib].qs[(iqs & 0xF) / 2 + 0]);
+    uint vui_hi = uint(v_packed.v_data_packed16[a_offset + ib].qs[(iqs & 0xF) / 2 + 1]);
+    uint shift = (iqs & 0x10) >> 2;
+    vui_lo >>= shift;
+    vui_hi >>= shift;
+    uint qh = uint(v_packed.v_data_packed16[a_offset + ib].qh[0]) | (uint(v_packed.v_data_packed16[a_offset + ib].qh[1]) << 16);
+    FLOAT_TYPEV4 hb = FLOAT_TYPEV4((qh >> iqs) & 1, (qh >> (iqs + 1)) & 1, (qh >> (iqs + 2)) & 1, (qh >> (iqs + 3)) & 1) * FLOAT_TYPE(16.0f);
+    FLOAT_TYPEV4 nibbles = FLOAT_TYPEV4(vui_lo & 0xF, (vui_lo >> 8) & 0xF, vui_hi & 0xF, (vui_hi >> 8) & 0xF);
+    return FLOAT_TYPE(v_packed.v_data_packed16[a_offset + ib].d) * (nibbles + hb - FLOAT_TYPE(16.0f));
+}
+
+#elif defined(DATA_V_Q5_1)
+#define V_BLOCK_SIZE 32
+#define V_BLOCK_BYTE_SIZE 24
+layout (binding = 2) readonly buffer V_PACKED16_Q51 {block_q5_1_packed16 v_data_packed16[];} v_packed;
+FLOAT_TYPEV4 dequantize4_v(uint ib, uint iqs, uint a_offset) {
+    uint vui_lo = uint(v_packed.v_data_packed16[a_offset + ib].qs[(iqs & 0xF) / 2 + 0]);
+    uint vui_hi = uint(v_packed.v_data_packed16[a_offset + ib].qs[(iqs & 0xF) / 2 + 1]);
+    uint shift = (iqs & 0x10) >> 2;
+    vui_lo >>= shift;
+    vui_hi >>= shift;
+    uint qh = v_packed.v_data_packed16[a_offset + ib].qh;
+    FLOAT_TYPEV4 hb = FLOAT_TYPEV4((qh >> iqs) & 1, (qh >> (iqs + 1)) & 1, (qh >> (iqs + 2)) & 1, (qh >> (iqs + 3)) & 1) * FLOAT_TYPE(16.0f);
+    FLOAT_TYPEV4 nibbles = FLOAT_TYPEV4(vui_lo & 0xF, (vui_lo >> 8) & 0xF, vui_hi & 0xF, (vui_hi >> 8) & 0xF);
+    return FLOAT_TYPE(v_packed.v_data_packed16[a_offset + ib].d) * (nibbles + hb) + FLOAT_TYPE(v_packed.v_data_packed16[a_offset + ib].m);
+}
+
+#elif defined(DATA_V_Q8_0)
+#define V_BLOCK_SIZE 32
+#define V_BLOCK_BYTE_SIZE 34
+layout (binding = 2) readonly buffer V_PACKED16_Q80 {block_q8_0_packed16 v_data_packed16[];} v_packed;
+FLOAT_TYPEV4 dequantize4_v(uint ib, uint iqs, uint a_offset) {
+    const i8vec2 v0 = unpack8(int32_t(v_packed.v_data_packed16[a_offset + ib].qs[iqs / 2])).xy;
+    const i8vec2 v1 = unpack8(int32_t(v_packed.v_data_packed16[a_offset + ib].qs[iqs / 2 + 1])).xy;
+    return FLOAT_TYPE(v_packed.v_data_packed16[a_offset + ib].d) * FLOAT_TYPEV4(v0.x, v0.y, v1.x, v1.y);
+}
+
+#elif defined(DATA_V_IQ4_NL)
+#define V_BLOCK_SIZE 32
+#define V_BLOCK_BYTE_SIZE 18
+layout (binding = 2) readonly buffer V_PACKED16_IQ4NL {block_iq4_nl_packed16 v_data_packed16[];} v_packed;
+FLOAT_TYPEV4 dequantize4_v(uint ib, uint iqs, uint a_offset) {
+    uint vui_lo = uint(v_packed.v_data_packed16[a_offset + ib].qs[(iqs & 0xF) / 2 + 0]);
+    uint vui_hi = uint(v_packed.v_data_packed16[a_offset + ib].qs[(iqs & 0xF) / 2 + 1]);
+    uint shift = (iqs & 0x10) >> 2;
+    vui_lo >>= shift;
+    vui_hi >>= shift;
+    return FLOAT_TYPE(v_packed.v_data_packed16[a_offset + ib].d) * FLOAT_TYPEV4(
+        kvalues_iq4nl[vui_lo & 0xF],
+        kvalues_iq4nl[(vui_lo >> 8) & 0xF],
+        kvalues_iq4nl[vui_hi & 0xF],
+        kvalues_iq4nl[(vui_hi >> 8) & 0xF]);
+}
+
+#elif defined(DATA_V_TQ_V_4B)
+#define V_BLOCK_SIZE 128
+#define V_BLOCK_BYTE_SIZE 66
+layout (binding = 2) readonly buffer V_PACKED16_TQ {block_tq_v_4b_packed16 v_data_packed16[];} v_packed;
+FLOAT_TYPEV4 dequantize4_v(uint ib, uint iqs, uint a_offset) {
+    uint byte_idx = iqs & 0x3F;
+    uint shift    = (iqs & 0x40) >> 4;
+    uint vui_lo = uint(v_packed.v_data_packed16[a_offset + ib].qs[byte_idx / 2 + 0]);
+    uint vui_hi = uint(v_packed.v_data_packed16[a_offset + ib].qs[byte_idx / 2 + 1]);
+    vui_lo >>= shift;
+    vui_hi >>= shift;
+    FLOAT_TYPEV4 nibbles = FLOAT_TYPEV4(vui_lo & 0xF, (vui_lo >> 8) & 0xF, vui_hi & 0xF, (vui_hi >> 8) & 0xF);
+    return FLOAT_TYPE(v_packed.v_data_packed16[a_offset + ib].d) * (nibbles - FLOAT_TYPE(8.0f));
+}
+
+#else
+#error "KV_SPLIT_PATH: unsupported V type — add a DATA_V_* case"
+#endif
+
+#else  // !KV_SPLIT_PATH — legacy single-type path
+
+// Alias the K_* / V_* macros to the existing BLOCK_SIZE / BLOCK_BYTE_SIZE /
+// dequantize4() so flash_attn.comp can use a single code path.
+#define K_BLOCK_SIZE BLOCK_SIZE
+#define V_BLOCK_SIZE BLOCK_SIZE
+#ifdef BLOCK_BYTE_SIZE
+#define K_BLOCK_BYTE_SIZE BLOCK_BYTE_SIZE
+#define V_BLOCK_BYTE_SIZE BLOCK_BYTE_SIZE
+#endif
+
+#if BLOCK_SIZE > 1
+FLOAT_TYPEV4 dequantize4_k(uint ib, uint iqs, uint a_offset) {
+    return dequantize4(ib, iqs, a_offset, BINDING_IDX_K);
+}
+FLOAT_TYPEV4 dequantize4_v(uint ib, uint iqs, uint a_offset) {
+    return dequantize4(ib, iqs, a_offset, BINDING_IDX_V);
+}
+#endif
+
+#endif // KV_SPLIT_PATH
 
 #define CEIL_DIV(a, b) (((a) + (b) - 1) / (b))
 
