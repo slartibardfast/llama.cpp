@@ -193,6 +193,11 @@ struct llama_model_loader {
     // for backwards compatibility, does not support ggml-backend
     void load_data_for(struct ggml_tensor * cur) const;
 
+    // If the GGUF contains "turbo.codebook.Nbit" tensors, read their data and
+    // override the TURBO_*B codebooks on the relevant backends (Vulkan).
+    // Called from llama_model::load_tensors after devices are initialized.
+    void apply_turbo_codebooks() const;
+
     // Returns false if cancelled by progress_callback
     bool load_all_data(
             struct ggml_context * ctx,

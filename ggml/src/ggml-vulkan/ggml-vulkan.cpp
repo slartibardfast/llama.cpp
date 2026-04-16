@@ -16391,12 +16391,34 @@ static ggml_backend_dev_t ggml_backend_vk_reg_get_device(ggml_backend_reg_t reg,
     return devices[device];
 }
 
+static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t /*reg*/, const char * name) {
+    if (strcmp(name, "ggml_backend_vk_set_turbo_codebook") == 0) {
+        return (void *) ggml_backend_vk_set_turbo_codebook;
+    }
+    return NULL;
+}
+
 static const struct ggml_backend_reg_i ggml_backend_vk_reg_i = {
     /* .get_name         = */ ggml_backend_vk_reg_get_name,
     /* .get_device_count = */ ggml_backend_vk_reg_get_device_count,
     /* .get_device       = */ ggml_backend_vk_reg_get_device,
-    /* .get_proc_address = */ NULL,
+    /* .get_proc_address = */ ggml_backend_vk_reg_get_proc_address,
 };
+
+void ggml_backend_vk_set_turbo_codebook(int bits, const float * centroids) {
+    if (bits < 2 || bits > 5 || centroids == nullptr) {
+        return;
+    }
+    const size_t n = (size_t)1 << bits;
+    const size_t size = n * sizeof(float);
+    const int cb_idx = bits - 2;
+    for (size_t i = 0; i < GGML_VK_MAX_DEVICES; i++) {
+        vk_device & device = vk_instance.devices[i];
+        if (!device) continue;
+        if (!device->turbo_codebook_buf[cb_idx]) continue;
+        ggml_vk_buffer_write(device->turbo_codebook_buf[cb_idx], 0, centroids, size);
+    }
+}
 
 ggml_backend_reg_t ggml_backend_vk_reg() {
     static ggml_backend_reg reg = {

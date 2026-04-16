@@ -8344,6 +8344,11 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         }
     }
 
+    // If the GGUF carries per-model TURBO codebook tensors
+    // ("turbo.codebook.Nbit"), forward them to backends that support
+    // runtime codebook override (currently Vulkan). No-op otherwise.
+    ml.apply_turbo_codebooks();
+
     if (use_mmap_buffer) {
         for (auto & mapping : ml.mappings) {
             pimpl->mappings.emplace_back(std::move(mapping));

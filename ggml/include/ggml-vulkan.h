@@ -24,6 +24,14 @@ GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_vk_host_buffer_type(voi
 
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_vk_reg(void);
 
+// Override the TURBO_*B weight codebook on all initialized Vulkan devices.
+// bits must be in [2,5]; centroids points to 2^bits floats. Used when a
+// model GGUF carries "turbo.codebook.Nbit" tensors (e.g., per-model
+// imatrix-weighted Lloyd-Max centroids from the llama-turbo-codebook tool).
+// If no Vulkan devices are initialized yet, the override is ignored; the
+// model loader should call this after device init.
+GGML_BACKEND_API void ggml_backend_vk_set_turbo_codebook(int bits, const float * centroids);
+
 #ifdef  __cplusplus
 }
 #endif

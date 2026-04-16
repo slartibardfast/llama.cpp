@@ -2,6 +2,7 @@
 
 #include "ggml-alloc.h"
 #include "ggml.h"
+#include "ggml-backend.h"
 #include "ggml-cpu.h"
 #include "gguf.h"
 #include "llama-hparams.h"
@@ -1379,6 +1380,63 @@ void llama_model_loader::get_mapping_range(size_t * first, size_t * last, void *
         }
         *first = std::min(*first, weight->offs);
         *last  = std::max(*last,  weight->offs + ggml_nbytes(tensor));
+    }
+}
+
+void llama_model_loader::apply_turbo_codebooks() const {
+    // Signature of the backend override hook. Backends that support TURBO
+    // codebook override expose this via ggml_backend_reg_get_proc_address.
+    typedef void (*set_turbo_codebook_t)(int bits, const float * centroids);
+
+    // Resolve hooks from all registered backends (currently only Vulkan
+    // implements it; CPU/other backends return NULL and are skipped).
+    std::vector<set_turbo_codebook_t> hooks;
+    for (size_t i = 0; i < ggml_backend_reg_count(); i++) {
+        ggml_backend_reg_t reg = ggml_backend_reg_get(i);
+        if (!reg) continue;
+        void * fn = ggml_backend_reg_get_proc_address(reg, "ggml_backend_vk_set_turbo_codebook");
+        if (fn) {
+            hooks.push_back(reinterpret_cast<set_turbo_codebook_t>(fn));
+        }
+    }
+    if (hooks.empty()) {
+        return;
+    }
+
+    // For each per-bitrate codebook tensor present in the GGUF, read it and
+    // forward to every backend hook. Tensors are named turbo.codebook.Nbit
+    // and hold 2^N floats (Lloyd-Max centroids).
+    const char * names[4] = {
+        "turbo.codebook.2bit",
+        "turbo.codebook.3bit",
+        "turbo.codebook.4bit",
+        "turbo.codebook.5bit",
+    };
+    for (int i = 0; i < 4; i++) {
+        const int bits = i + 2;
+        const size_t n_centroids = (size_t)1 << bits;
+        const auto * w = get_weight(names[i]);
+        if (!w) continue;
+        if ((size_t)ggml_nelements(w->tensor) != n_centroids || w->tensor->type != GGML_TYPE_F32) {
+            fprintf(stderr, "%s: skipping malformed %s (nel=%ld, type=%s)\n",
+                    __func__, names[i], (long)ggml_nelements(w->tensor),
+                    ggml_type_name(w->tensor->type));
+            continue;
+        }
+        std::vector<float> centroids(n_centroids);
+        if (use_mmap) {
+            const auto & mapping = mappings.at(w->idx);
+            memcpy(centroids.data(), (const uint8_t *)mapping->addr() + w->offs, n_centroids * sizeof(float));
+        } else {
+            const auto & file = files.at(w->idx);
+            file->seek(w->offs, SEEK_SET);
+            file->read_raw(centroids.data(), n_centroids * sizeof(float));
+        }
+        for (auto hook : hooks) {
+            hook(bits, centroids.data());
+        }
+        fprintf(stderr, "%s: applied %zu-centroid codebook %s\n",
+                __func__, n_centroids, names[i]);
     }
 }
 
