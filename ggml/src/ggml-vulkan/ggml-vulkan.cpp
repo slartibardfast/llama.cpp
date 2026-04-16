@@ -15589,7 +15589,6 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     case GGML_TYPE_IQ4_NL:
                     case GGML_TYPE_MXFP4:
                         break;
-                    case GGML_TYPE_TURBO_2B:
                     case GGML_TYPE_TURBO_3B:
                     case GGML_TYPE_TURBO_4B:
                     case GGML_TYPE_TURBO_5B:
@@ -15599,6 +15598,10 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                             return false;
                         }
                         break;
+                    case GGML_TYPE_TURBO_2B:
+                        // TURBO_2B uses E8P lattice VQ — not yet ported to GLSL.
+                        // Fall back to CPU for now.
+                        return false;
                     default:
                         return false;
                 }

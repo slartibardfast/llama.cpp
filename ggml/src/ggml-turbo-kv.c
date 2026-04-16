@@ -578,7 +578,14 @@ static inline int turbo_unpack_bits(const uint8_t * qs, int i, int bits) {
     return val & mask;
 }
 
-/* Generic quantize: any bit-width, any codebook */
+/* E8P CENT_MAX: max per-coord after sign/shift = 3.5 + 0.25 = 3.75.
+ * We scale post-RHT values so max_abs maps to ~3.0 to stay inside the
+ * dense part of the lattice. */
+#define E8P_CENT_MAX 3.0f
+
+/* Generic quantize: any bit-width, any codebook.
+ * Special case: bits==2 uses E8P lattice VQ on groups of 8 elements
+ * (scalar 4-level is too coarse at 2 bpw — catastrophic PPL). */
 static void quantize_block_turbo(
     const float * src, uint8_t * dst, int block_size,
     const float * codebook, int n_levels, int bits, float cent_max)
@@ -608,6 +615,27 @@ static void quantize_block_turbo(
         if (a > max_abs) max_abs = a;
     }
     if (max_abs < 1e-10f) max_abs = 1.0f;
+
+    if (bits == 2) {
+        /* --- E8P lattice VQ path for TURBO_2B --- */
+        const float inv_std = E8P_CENT_MAX / max_abs;
+        *p_inv_std = turbo_kv_fp32_to_fp16(inv_std);
+
+        /* 128 elements / 8 per group = 16 groups × 16-bit code = 32 bytes */
+        GGML_ASSERT(block_size % 8 == 0);
+        const int n_groups = block_size / 8;
+        memset(qs, 0, 2 * n_groups);
+        for (int g = 0; g < n_groups; g++) {
+            float x[8];
+            for (int j = 0; j < 8; j++) x[j] = rotated[g * 8 + j] * inv_std;
+            uint16_t code = e8p_encode_16bit(x);
+            qs[g * 2 + 0] = (uint8_t)(code & 0xFF);
+            qs[g * 2 + 1] = (uint8_t)(code >> 8);
+        }
+        return;
+    }
+
+    /* --- Scalar Lloyd-Max path for bits >= 3 --- */
     const float inv_std = cent_max / max_abs;
     *p_inv_std = turbo_kv_fp32_to_fp16(inv_std);
 
@@ -626,7 +654,8 @@ static void quantize_block_turbo(
     }
 }
 
-/* Generic dequantize: any bit-width, any codebook */
+/* Generic dequantize: any bit-width, any codebook.
+ * Special case: bits==2 uses E8P lattice decode. */
 static void dequantize_block_turbo(
     const uint8_t * src, float * dst, int block_size,
     const float * codebook, int n_levels, int bits)
@@ -637,15 +666,25 @@ static void dequantize_block_turbo(
     const float scale = 1.0f / inv_std;
     const uint8_t * qs = src + 4;
 
-    /* Build scaled LUT */
-    float lut[32]; /* max 5-bit = 32 entries */
-    for (int c = 0; c < n_levels; c++) lut[c] = codebook[c] * scale;
-
-    /* Unpack + codebook lookup */
     float rotated[256];
-    for (int i = 0; i < block_size; i++) {
-        int idx = turbo_unpack_bits(qs, i, bits);
-        rotated[i] = lut[idx];
+
+    if (bits == 2) {
+        /* E8P lattice decode: 16-bit code per group of 8 elements */
+        const int n_groups = block_size / 8;
+        for (int g = 0; g < n_groups; g++) {
+            uint16_t code = (uint16_t)qs[g * 2 + 0] | ((uint16_t)qs[g * 2 + 1] << 8);
+            float vals[8];
+            e8p_decode_16bit(code, vals);
+            for (int j = 0; j < 8; j++) rotated[g * 8 + j] = vals[j] * scale;
+        }
+    } else {
+        /* Scalar codebook decode */
+        float lut[32]; /* max 5-bit = 32 entries */
+        for (int c = 0; c < n_levels; c++) lut[c] = codebook[c] * scale;
+        for (int i = 0; i < block_size; i++) {
+            int idx = turbo_unpack_bits(qs, i, bits);
+            rotated[i] = lut[idx];
+        }
     }
 
     /* Inverse RHT */
@@ -861,13 +900,24 @@ static float turbo_block_dot_dequant(
     const float scale = 1.0f / inv_std;
     const uint8_t * qs = block_data + 4;
 
-    float lut[32];
-    for (int c = 0; c < cfg->n_levels; c++) lut[c] = cb[c] * scale;
-
     float rotated[256];
-    for (int i = 0; i < cfg->block_size; i++) {
-        int idx = turbo_unpack_bits(qs, i, cfg->bits);
-        rotated[i] = lut[idx];
+
+    if (cfg->bits == 2) {
+        /* E8P lattice decode */
+        const int n_groups = cfg->block_size / 8;
+        for (int g = 0; g < n_groups; g++) {
+            uint16_t code = (uint16_t)qs[g * 2 + 0] | ((uint16_t)qs[g * 2 + 1] << 8);
+            float vals[8];
+            e8p_decode_16bit(code, vals);
+            for (int j = 0; j < 8; j++) rotated[g * 8 + j] = vals[j] * scale;
+        }
+    } else {
+        float lut[32];
+        for (int c = 0; c < cfg->n_levels; c++) lut[c] = cb[c] * scale;
+        for (int i = 0; i < cfg->block_size; i++) {
+            int idx = turbo_unpack_bits(qs, i, cfg->bits);
+            rotated[i] = lut[idx];
+        }
     }
 
     turbo_kv_rht_inverse(rotated, cfg->block_size, TURBO_KV_DEFAULT_SEED);
@@ -891,11 +941,24 @@ static float turbo_block_dot_fused(
     const float scale = 1.0f / inv_std;
     const uint8_t * qs = block_data + 4;
 
-    /* Dot in rotated space: codebook lookup (already in RHT space) × rotated activation */
     float acc = 0.0f;
-    for (int i = 0; i < cfg->block_size; i++) {
-        int idx = turbo_unpack_bits(qs, i, cfg->bits);
-        acc += (cb[idx] * scale) * act_rotated[i];
+
+    if (cfg->bits == 2) {
+        /* E8P: decode in RHT space, dot with rotated activation */
+        const int n_groups = cfg->block_size / 8;
+        for (int g = 0; g < n_groups; g++) {
+            uint16_t code = (uint16_t)qs[g * 2 + 0] | ((uint16_t)qs[g * 2 + 1] << 8);
+            float vals[8];
+            e8p_decode_16bit(code, vals);
+            for (int j = 0; j < 8; j++) {
+                acc += (vals[j] * scale) * act_rotated[g * 8 + j];
+            }
+        }
+    } else {
+        for (int i = 0; i < cfg->block_size; i++) {
+            int idx = turbo_unpack_bits(qs, i, cfg->bits);
+            acc += (cb[idx] * scale) * act_rotated[i];
+        }
     }
     return acc * norm;
 }
@@ -909,23 +972,12 @@ static void ggml_vec_dot_turbo_generic(
     const uint8_t * wd = (const uint8_t *)vx;
     const float   * ac = (const float *)vy;
 
-    /* Pre-rotate activation in block-sized chunks */
-    float act_rot[4 * 256]; /* support up to 4 blocks = 1024 elements */
-    int rot_n = n;
-    if (rot_n > 4 * cfg->block_size) rot_n = 4 * cfg->block_size;
-
-    memcpy(act_rot, ac, rot_n * sizeof(float));
-    for (int i = 0; i < rot_n; i += cfg->block_size) {
-        int chunk = cfg->block_size;
-        if (i + chunk > rot_n) chunk = rot_n - i;
-        turbo_kv_rht_forward(act_rot + i, chunk, TURBO_KV_DEFAULT_SEED);
-    }
-
-    /* Dot in RHT space — no inverse FWHT per block */
+    /* Weight vec_dot can be called with very long rows (n=4096+) during CPU
+     * inference. Use dequant-then-dot path to avoid stack buffer limits. */
     float total = 0.0f;
     int d = 0, offset = 0;
-    while (d + cfg->block_size <= rot_n) {
-        total += turbo_block_dot_fused(wd + offset, act_rot + d, cfg);
+    while (d + cfg->block_size <= n) {
+        total += turbo_block_dot_dequant(wd + offset, ac + d, cfg);
         d += cfg->block_size;
         offset += cfg->block_bytes;
     }
