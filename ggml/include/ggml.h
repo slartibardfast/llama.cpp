@@ -435,7 +435,9 @@ extern "C" {
         // RHT + 16-entry Lloyd-Max-Gaussian codebook, 72 bytes per 128 elements, ~4.5 bpe.
         // Has a real vec_dot so it works with both FA on and FA off, unlike TQ_V_4B.
         GGML_TYPE_TURBO_KV_4B = 44,
-        GGML_TYPE_COUNT    = 45,
+        GGML_TYPE_TURBO_4B    = 45, // RHT + Lloyd-Max codebook weight quant, 68B per 128 elems, 4.25 bpw
+        GGML_TYPE_TURBO_4B_S  = 46, // same, 36B per 64 elems, 4.5 bpw (fallback for ne[0] % 128 != 0)
+        GGML_TYPE_COUNT    = 47,
     };
 
     // precision
@@ -473,6 +475,7 @@ extern "C" {
         GGML_FTYPE_MOSTLY_MXFP4   = 25, // except 1d tensors
         GGML_FTYPE_MOSTLY_NVFP4   = 26, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q1_0    = 27, // except 1d tensors
+        GGML_FTYPE_MOSTLY_TURBO_4B = 28, // except 1d tensors
     };
 
     // available tensor operations:

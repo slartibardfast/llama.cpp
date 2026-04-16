@@ -761,7 +761,22 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = (ggml_to_float_t) dequantize_row_turbo_kv_4b,
         .from_float_ref           = (ggml_from_float_t) quantize_row_turbo_kv_4b_ref,
     },
-    // GGML_TYPE_TURBO_KV_Q_ROT_F32 (45) removed — superseded by split K cache
+    [GGML_TYPE_TURBO_4B] = {
+        .type_name                = "turbo_4b",
+        .blck_size                = 128,
+        .type_size                = sizeof(block_turbo_4b),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_turbo_4b,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_turbo_4b_ref,
+    },
+    [GGML_TYPE_TURBO_4B_S] = {
+        .type_name                = "turbo_4b_s",
+        .blck_size                = 64,
+        .type_size                = sizeof(block_turbo_4b_s),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_turbo_4b_s,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_turbo_4b_s_ref,
+    },
     [GGML_TYPE_Q2_K] = {
         .type_name                = "q2_K",
         .blck_size                = QK_K,
@@ -1444,6 +1459,7 @@ enum ggml_type ggml_ftype_to_ggml_type(enum ggml_ftype ftype) {
         case GGML_FTYPE_MOSTLY_IQ4_XS:        wtype = GGML_TYPE_IQ4_XS;   break;
         case GGML_FTYPE_MOSTLY_IQ3_S:         wtype = GGML_TYPE_IQ3_S;    break;
         case GGML_FTYPE_MOSTLY_IQ2_S:         wtype = GGML_TYPE_IQ2_S;    break;
+        case GGML_FTYPE_MOSTLY_TURBO_4B:      wtype = GGML_TYPE_TURBO_4B; break;
         case GGML_FTYPE_UNKNOWN:              wtype = GGML_TYPE_COUNT; break;
         case GGML_FTYPE_MOSTLY_Q4_1_SOME_F16: wtype = GGML_TYPE_COUNT; break;
     }

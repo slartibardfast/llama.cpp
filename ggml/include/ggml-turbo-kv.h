@@ -76,6 +76,12 @@ typedef char turbo_kv_4b_check_block_size
     [(sizeof(block_turbo_kv_4b) == TURBO_KV_4B_BYTES) ? 1 : -1];
 
 /* ============================================================
+ * FP16 / FP32 conversion helpers (used by all turbo_* types)
+ * ============================================================ */
+float    turbo_kv_fp16_to_fp32(uint16_t h);
+uint16_t turbo_kv_fp32_to_fp16(float f);
+
+/* ============================================================
  * Lloyd-Max-Gaussian 16-entry codebook for N(0,1)
  * ============================================================ */
 extern const float turbo_kv_4b_codebook[16];
@@ -158,6 +164,59 @@ void turbo_kv_4b_attention_multi(
     int                        valid_count,
     int                        head_dim,
     int                        k_stride_blocks);
+
+/* ============================================================
+ * TURBO_4B — RHT + Lloyd-Max codebook for WEIGHT tensors
+ *
+ * Same algorithm as TURBO_KV_4B (RHT + 16-entry codebook) but
+ * optimized for offline weight quantization:
+ *   - Drops residual_norm + _pad fields (68 bytes vs 72)
+ *   - Two block sizes: 128 (primary) and 64 (fallback for ne[0] % 128 != 0)
+ *   - vec_dot does full inverse RHT per block (no query pre-rotation trick)
+ *   - Fused variant: pre-rotate activation, dot in RHT space
+ * ============================================================ */
+
+#define TURBO_4B_BLOCK_SIZE    128   /* elements per block (primary) */
+#define TURBO_4B_BYTES         68    /* 2+2+64 bytes per 128-elem block */
+#define TURBO_4B_S_BLOCK_SIZE  64    /* elements per block (small fallback) */
+#define TURBO_4B_S_BYTES       36    /* 2+2+32 bytes per 64-elem block */
+
+typedef struct {
+    uint16_t norm;                              /* fp16, ||x||_2 of original block */
+    uint16_t inv_std;                           /* fp16, = CENT_MAX / max(|rotated|) */
+    uint8_t  qs[TURBO_4B_BLOCK_SIZE / 2];       /* 4-bit packed codebook indices */
+} block_turbo_4b;
+
+typedef char turbo_4b_check_size
+    [(sizeof(block_turbo_4b) == TURBO_4B_BYTES) ? 1 : -1];
+
+typedef struct {
+    uint16_t norm;                              /* fp16, ||x||_2 of original block */
+    uint16_t inv_std;                           /* fp16, = CENT_MAX / max(|rotated|) */
+    uint8_t  qs[TURBO_4B_S_BLOCK_SIZE / 2];     /* 4-bit packed codebook indices */
+} block_turbo_4b_s;
+
+typedef char turbo_4b_s_check_size
+    [(sizeof(block_turbo_4b_s) == TURBO_4B_S_BYTES) ? 1 : -1];
+
+/* Quantize / dequantize API for weight tensors */
+void quantize_row_turbo_4b_ref  (const float * GGML_RESTRICT x, block_turbo_4b   * GGML_RESTRICT y, int64_t k);
+void dequantize_row_turbo_4b    (const block_turbo_4b   * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+void quantize_row_turbo_4b_s_ref(const float * GGML_RESTRICT x, block_turbo_4b_s * GGML_RESTRICT y, int64_t k);
+void dequantize_row_turbo_4b_s  (const block_turbo_4b_s * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+
+/* vec_dot: <quantized weight row, f32 activation> */
+void ggml_vec_dot_turbo_4b_f32(
+    int n, float * GGML_RESTRICT s, size_t bs,
+    const void * GGML_RESTRICT vx, size_t bx,
+    const void * GGML_RESTRICT vy, size_t by,
+    int nrc);
+
+void ggml_vec_dot_turbo_4b_s_f32(
+    int n, float * GGML_RESTRICT s, size_t bs,
+    const void * GGML_RESTRICT vx, size_t bx,
+    const void * GGML_RESTRICT vy, size_t by,
+    int nrc);
 
 #ifdef __cplusplus
 }

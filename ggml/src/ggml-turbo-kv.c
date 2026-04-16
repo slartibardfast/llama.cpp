@@ -192,13 +192,13 @@ void turbo_kv_rht_inverse(float * data, int n, uint32_t seed) {
  * We use ggml's existing FP16_TO_FP32 / FP32_TO_FP16 macros via
  * ggml-impl.h so we don't introduce a second conversion path.
  * ============================================================ */
-static inline float turbo_kv_fp16_to_fp32(uint16_t h) {
+float turbo_kv_fp16_to_fp32(uint16_t h) {
     ggml_fp16_t h16;
     memcpy(&h16, &h, sizeof(h16));
     return GGML_FP16_TO_FP32(h16);
 }
 
-static inline uint16_t turbo_kv_fp32_to_fp16(float f) {
+uint16_t turbo_kv_fp32_to_fp16(float f) {
     const ggml_fp16_t r = GGML_FP32_TO_FP16(f);
     uint16_t out;
     memcpy(&out, &r, sizeof(out));
@@ -509,3 +509,242 @@ void ggml_vec_dot_turbo_kv_4b_f32(
 
 /* turbo_kv_precompute_rope_cache and turbo_kv_4b_attention_fused_rope
  * removed — superseded by split K cache (--cache-type-k q8_0:q4_0). */
+
+/* ============================================================
+ * TURBO_4B — RHT + Lloyd-Max codebook for WEIGHT tensors
+ *
+ * Same algorithm as TURBO_KV_4B but with a compact block layout
+ * (68 bytes for bs=128, 36 bytes for bs=64 — no residual_norm/_pad).
+ *
+ * quantize/dequant are parametric by block_size. The public API wrappers
+ * call through with the appropriate size.
+ * ============================================================ */
+
+static void quantize_block_turbo_4b(const float * src, uint8_t * dst, int block_size) {
+    /* dst layout: [norm:2][inv_std:2][qs[block_size/2]] */
+    uint16_t * p_norm    = (uint16_t *)(dst + 0);
+    uint16_t * p_inv_std = (uint16_t *)(dst + 2);
+    uint8_t  * qs        = dst + 4;
+
+    /* Step 1: L2 norm */
+    float norm_sq = 0.0f;
+    for (int i = 0; i < block_size; i++) {
+        norm_sq += src[i] * src[i];
+    }
+    const float norm = sqrtf(norm_sq);
+    *p_norm = turbo_kv_fp32_to_fp16(norm);
+
+    /* Step 2: normalize to unit vector */
+    float rotated[256]; /* max supported block_size */
+    const float inv_norm = (norm > 1e-10f) ? (1.0f / norm) : 0.0f;
+    for (int i = 0; i < block_size; i++) {
+        rotated[i] = src[i] * inv_norm;
+    }
+
+    /* Step 3: forward RHT */
+    turbo_kv_rht_forward(rotated, block_size, TURBO_KV_DEFAULT_SEED);
+
+    /* Step 4: compute max_abs and inv_std scale */
+    float max_abs = 0.0f;
+    for (int i = 0; i < block_size; i++) {
+        const float a = fabsf(rotated[i]);
+        if (a > max_abs) max_abs = a;
+    }
+    if (max_abs < 1e-10f) max_abs = 1.0f;
+    const float inv_std = TURBO_KV_4B_CENT_MAX / max_abs;
+    *p_inv_std = turbo_kv_fp32_to_fp16(inv_std);
+
+    /* Step 5: nearest-centroid quantization */
+    const int qs_bytes = block_size / 2;
+    memset(qs, 0, qs_bytes);
+    for (int i = 0; i < block_size; i++) {
+        const float x = rotated[i] * inv_std;
+        int best = 0;
+        float best_dist = fabsf(x - turbo_kv_4b_codebook[0]);
+        for (int c = 1; c < 16; c++) {
+            const float d = fabsf(x - turbo_kv_4b_codebook[c]);
+            if (d < best_dist) {
+                best_dist = d;
+                best = c;
+            }
+        }
+        const int byte_idx = i / 2;
+        const int bit_pos  = (i & 1) * 4;
+        qs[byte_idx] |= (uint8_t)((best & 0x0F) << bit_pos);
+    }
+}
+
+static void dequantize_block_turbo_4b(const uint8_t * src, float * dst, int block_size) {
+    /* src layout: [norm:2][inv_std:2][qs[block_size/2]] */
+    const uint16_t * p_norm    = (const uint16_t *)(src + 0);
+    const uint16_t * p_inv_std = (const uint16_t *)(src + 2);
+    const uint8_t  * qs        = src + 4;
+
+    const float norm = turbo_kv_fp16_to_fp32(*p_norm);
+    float inv_std = turbo_kv_fp16_to_fp32(*p_inv_std);
+    if (inv_std < 1e-10f) inv_std = sqrtf((float)block_size);
+    const float scale = 1.0f / inv_std;
+
+    /* Build scaled LUT */
+    float lut[16];
+    for (int c = 0; c < 16; c++) {
+        lut[c] = turbo_kv_4b_codebook[c] * scale;
+    }
+
+    /* Unpack + codebook lookup */
+    float rotated[256];
+    for (int i = 0; i < block_size; i++) {
+        const int byte_idx = i / 2;
+        const int idx = (i & 1) ? (qs[byte_idx] >> 4) : (qs[byte_idx] & 0x0F);
+        rotated[i] = lut[idx];
+    }
+
+    /* Inverse RHT */
+    turbo_kv_rht_inverse(rotated, block_size, TURBO_KV_DEFAULT_SEED);
+
+    /* Scale by original norm */
+    for (int i = 0; i < block_size; i++) {
+        dst[i] = rotated[i] * norm;
+    }
+}
+
+/* --- Public row-wise wrappers --- */
+
+void quantize_row_turbo_4b_ref(const float * GGML_RESTRICT x,
+                                block_turbo_4b * GGML_RESTRICT y, int64_t k) {
+    GGML_ASSERT(k % TURBO_4B_BLOCK_SIZE == 0);
+    const int64_t nb = k / TURBO_4B_BLOCK_SIZE;
+    for (int64_t b = 0; b < nb; b++) {
+        quantize_block_turbo_4b(
+            x + b * TURBO_4B_BLOCK_SIZE,
+            (uint8_t *)(y + b),
+            TURBO_4B_BLOCK_SIZE);
+    }
+}
+
+void dequantize_row_turbo_4b(const block_turbo_4b * GGML_RESTRICT x,
+                              float * GGML_RESTRICT y, int64_t k) {
+    GGML_ASSERT(k % TURBO_4B_BLOCK_SIZE == 0);
+    const int64_t nb = k / TURBO_4B_BLOCK_SIZE;
+    for (int64_t b = 0; b < nb; b++) {
+        dequantize_block_turbo_4b(
+            (const uint8_t *)(x + b),
+            y + b * TURBO_4B_BLOCK_SIZE,
+            TURBO_4B_BLOCK_SIZE);
+    }
+}
+
+void quantize_row_turbo_4b_s_ref(const float * GGML_RESTRICT x,
+                                  block_turbo_4b_s * GGML_RESTRICT y, int64_t k) {
+    GGML_ASSERT(k % TURBO_4B_S_BLOCK_SIZE == 0);
+    const int64_t nb = k / TURBO_4B_S_BLOCK_SIZE;
+    for (int64_t b = 0; b < nb; b++) {
+        quantize_block_turbo_4b(
+            x + b * TURBO_4B_S_BLOCK_SIZE,
+            (uint8_t *)(y + b),
+            TURBO_4B_S_BLOCK_SIZE);
+    }
+}
+
+void dequantize_row_turbo_4b_s(const block_turbo_4b_s * GGML_RESTRICT x,
+                                float * GGML_RESTRICT y, int64_t k) {
+    GGML_ASSERT(k % TURBO_4B_S_BLOCK_SIZE == 0);
+    const int64_t nb = k / TURBO_4B_S_BLOCK_SIZE;
+    for (int64_t b = 0; b < nb; b++) {
+        dequantize_block_turbo_4b(
+            (const uint8_t *)(x + b),
+            y + b * TURBO_4B_S_BLOCK_SIZE,
+            TURBO_4B_S_BLOCK_SIZE);
+    }
+}
+
+/* ============================================================
+ * vec_dot: <quantized weight row, f32 activation>
+ *
+ * Dequant-then-dot approach: inverse RHT per weight block,
+ * then standard dot product with activation.
+ * ============================================================ */
+
+static float turbo_4b_block_dot_dequant(
+    const uint8_t * block_data, const float * activation, int block_size)
+{
+    const float norm = turbo_kv_fp16_to_fp32(*(const uint16_t *)(block_data + 0));
+    float inv_std = turbo_kv_fp16_to_fp32(*(const uint16_t *)(block_data + 2));
+    if (inv_std < 1e-10f) inv_std = sqrtf((float)block_size);
+    const float scale = 1.0f / inv_std;
+    const uint8_t * qs = block_data + 4;
+
+    /* Build scaled LUT */
+    float lut[16];
+    for (int c = 0; c < 16; c++) {
+        lut[c] = turbo_kv_4b_codebook[c] * scale;
+    }
+
+    /* Unpack + codebook lookup into rotated values */
+    float rotated[256];
+    for (int i = 0; i < block_size; i++) {
+        const int byte_idx = i / 2;
+        const int idx = (i & 1) ? (qs[byte_idx] >> 4) : (qs[byte_idx] & 0x0F);
+        rotated[i] = lut[idx];
+    }
+
+    /* Inverse RHT */
+    turbo_kv_rht_inverse(rotated, block_size, TURBO_KV_DEFAULT_SEED);
+
+    /* Dot product with activation, scaled by norm */
+    float acc = 0.0f;
+    for (int i = 0; i < block_size; i++) {
+        acc += rotated[i] * activation[i];
+    }
+    return acc * norm;
+}
+
+void ggml_vec_dot_turbo_4b_f32(
+    int n, float * GGML_RESTRICT s, size_t bs,
+    const void * GGML_RESTRICT vx, size_t bx,
+    const void * GGML_RESTRICT vy, size_t by,
+    int nrc)
+{
+    GGML_UNUSED(bs); GGML_UNUSED(bx); GGML_UNUSED(by); GGML_UNUSED(nrc);
+
+    const uint8_t * weight_data = (const uint8_t *)vx;
+    const float   * activation  = (const float *)vy;
+    const int block_size = TURBO_4B_BLOCK_SIZE;
+    const int block_bytes = TURBO_4B_BYTES;
+
+    float total = 0.0f;
+    int d = 0;
+    int offset = 0;
+    while (d + block_size <= n) {
+        total += turbo_4b_block_dot_dequant(
+            weight_data + offset, activation + d, block_size);
+        d += block_size;
+        offset += block_bytes;
+    }
+    *s = total;
+}
+
+void ggml_vec_dot_turbo_4b_s_f32(
+    int n, float * GGML_RESTRICT s, size_t bs,
+    const void * GGML_RESTRICT vx, size_t bx,
+    const void * GGML_RESTRICT vy, size_t by,
+    int nrc)
+{
+    GGML_UNUSED(bs); GGML_UNUSED(bx); GGML_UNUSED(by); GGML_UNUSED(nrc);
+
+    const uint8_t * weight_data = (const uint8_t *)vx;
+    const float   * activation  = (const float *)vy;
+    const int block_size = TURBO_4B_S_BLOCK_SIZE;
+    const int block_bytes = TURBO_4B_S_BYTES;
+
+    float total = 0.0f;
+    int d = 0;
+    int offset = 0;
+    while (d + block_size <= n) {
+        total += turbo_4b_block_dot_dequant(
+            weight_data + offset, activation + d, block_size);
+        d += block_size;
+        offset += block_bytes;
+    }
+    *s = total;
+}

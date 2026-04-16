@@ -271,6 +271,9 @@ target_link_libraries(test-turbo-kv-set-rows PRIVATE ggml-base ggml)
 add_executable(test-turbo-kv-4b-attn test-turbo-kv-4b-attn.cpp)
 target_link_libraries(test-turbo-kv-4b-attn PRIVATE ggml-base)
 
+add_executable(test-turbo-4b-roundtrip test-turbo-4b-roundtrip.cpp)
+target_link_libraries(test-turbo-4b-roundtrip PRIVATE ggml-base)
+
 add_executable(test-split-k-attention test-split-k-attention.cpp)
 
 add_executable(test-split-k-graph test-split-k-graph.cpp)
