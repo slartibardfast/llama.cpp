@@ -61,24 +61,33 @@ void main() {
     const uint col = gl_SubgroupID;
     if (col >= NUM_COLS) return;
 
-    // Row index from workgroup Y grid
-    const uint row = gl_WorkGroupID.y + p.base_work_group_y;
+    // Row index — standard pattern: WorkGroupID.x carries rows, z for overflow
+    const uint row = NUM_ROWS * (gl_WorkGroupID.x + gl_NumWorkGroups.x * gl_WorkGroupID.z);
+    if (row >= p.stride_d) return; // stride_d = ne01 = number of rows
 
-    // Batch index
-    const uint batch_idx = gl_WorkGroupID.z;
+    // Batch index from WorkGroupID.y
+    const uint batch_idx = gl_WorkGroupID.y + p.base_work_group_y;
 
-    // Push constant strides are in elements. Convert to bytes for data_a access.
-    // One row of ncols elements = (ncols / BLOCK_ELEMS) * BLOCK_BYTES bytes.
+    // Batch offset for A (weights): push constants give strides in elements,
+    // but data_a is byte-addressed. Convert using block geometry.
+    uint batch_idx_a = 0u;
+    if (batch_idx != 0u) {
+        uint i13 = batch_idx / p.ne12;
+        uint i12 = batch_idx % p.ne12;
+        uint i03 = i13 / p.broadcast3;
+        uint i02 = i12 / p.broadcast2;
+        batch_idx_a = i03 * p.ne02 + i02;
+    }
+
+    // a_offset in bytes: batch_stride_a is in elements, convert to blocks then bytes
+    const uint a_batch_offset = batch_idx_a * (p.batch_stride_a / BLOCK_ELEMS) * BLOCK_BYTES;
     const uint bytes_per_row = (p.ncols / BLOCK_ELEMS) * BLOCK_BYTES;
+    const uint a_offset = row * bytes_per_row + a_batch_offset;
 
-    // Weight row offset (bytes) — shared across all columns
-    const uint a_offset = row * bytes_per_row
-                        + batch_idx * (p.batch_stride_a / BLOCK_ELEMS) * BLOCK_BYTES;
-
-    // Activation column offset (f32 elements) — different per column
+    // B offset (f32 elements) — column and batch
     const uint b_offset = col * p.stride_b + batch_idx * p.batch_stride_b;
 
-    // Output index
+    // D output index
     const uint d_idx = row + col * p.stride_d + batch_idx * p.batch_stride_d;
 
     const uint n_blocks = p.ncols / BLOCK_ELEMS;
