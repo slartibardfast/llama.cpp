@@ -886,6 +886,29 @@ static float turbo_block_dot_dequant(
     return acc * norm;
 }
 
+/* Fused RHT-space dot: pre-rotate activation, dot without inverse RHT.
+ * <w, x> = <RHT^{-1}(w_rot), x> = <w_rot, RHT(x)> because RHT is orthogonal.
+ * Eliminates the inverse FWHT per block (7-stage butterfly × n_blocks). */
+static float turbo_block_dot_fused(
+    const uint8_t * block_data, const float * act_rotated,
+    const turbo_config_t * cfg)
+{
+    const float * cb = turbo_get_codebook(cfg);
+    const float norm = turbo_kv_fp16_to_fp32(*(const uint16_t *)(block_data + 0));
+    float inv_std = turbo_kv_fp16_to_fp32(*(const uint16_t *)(block_data + 2));
+    if (inv_std < 1e-10f) inv_std = sqrtf((float)cfg->block_size);
+    const float scale = 1.0f / inv_std;
+    const uint8_t * qs = block_data + 4;
+
+    /* Dot in rotated space: codebook lookup (already in RHT space) × rotated activation */
+    float acc = 0.0f;
+    for (int i = 0; i < cfg->block_size; i++) {
+        int idx = turbo_unpack_bits(qs, i, cfg->bits);
+        acc += (cb[idx] * scale) * act_rotated[i];
+    }
+    return acc * norm;
+}
+
 static void ggml_vec_dot_turbo_generic(
     int n, float * GGML_RESTRICT s,
     const void * GGML_RESTRICT vx,
@@ -894,10 +917,24 @@ static void ggml_vec_dot_turbo_generic(
 {
     const uint8_t * wd = (const uint8_t *)vx;
     const float   * ac = (const float *)vy;
+
+    /* Pre-rotate activation in block-sized chunks */
+    float act_rot[4 * 256]; /* support up to 4 blocks = 1024 elements */
+    int rot_n = n;
+    if (rot_n > 4 * cfg->block_size) rot_n = 4 * cfg->block_size;
+
+    memcpy(act_rot, ac, rot_n * sizeof(float));
+    for (int i = 0; i < rot_n; i += cfg->block_size) {
+        int chunk = cfg->block_size;
+        if (i + chunk > rot_n) chunk = rot_n - i;
+        turbo_kv_rht_forward(act_rot + i, chunk, TURBO_KV_DEFAULT_SEED);
+    }
+
+    /* Dot in RHT space — no inverse FWHT per block */
     float total = 0.0f;
     int d = 0, offset = 0;
-    while (d + cfg->block_size <= n) {
-        total += turbo_block_dot_dequant(wd + offset, ac + d, cfg);
+    while (d + cfg->block_size <= rot_n) {
+        total += turbo_block_dot_fused(wd + offset, act_rot + d, cfg);
         d += cfg->block_size;
         offset += cfg->block_bytes;
     }
