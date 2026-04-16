@@ -18,6 +18,8 @@
 #extension GL_KHR_shader_subgroup_shuffle : require
 #extension GL_KHR_shader_subgroup_arithmetic : require
 
+// Codebook storage buffer binding — declared inside turbo_rht.glsl.
+#define TURBO_CB_BINDING 5
 #include "turbo_rht.glsl"
 
 #define BLOCK_ELEMS 128

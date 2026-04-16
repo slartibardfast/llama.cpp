@@ -16,6 +16,8 @@
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_shuffle : require
 
+// Codebook storage buffer binding — declared inside turbo_rht.glsl.
+#define TURBO_CB_BINDING 2
 #include "turbo_rht.glsl"
 
 // Block size in bytes: 4 header + 128*BITS/8 data

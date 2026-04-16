@@ -10,28 +10,21 @@
 #ifndef TURBO_RHT_GLSL
 #define TURBO_RHT_GLSL
 
-// ---- Published Lloyd-Max Gaussian codebooks (tq_codebook.c, Max 1960) ----
+// ---- Codebook storage buffer ----
+// Each TURBO_*B shader binds a per-bitrate codebook buffer at binding
+// TURBO_CB_BINDING (defined by the including .comp before #include).
+// Buffer layout: 2^BITS consecutive floats, centroids in ascending order.
+// Default contents are the published Lloyd-Max Gaussian centroids (Max 1960),
+// uploaded at device init. A custom codebook can overwrite the buffer
+// (e.g., per-model imatrix-weighted Lloyd-Max from turbo-codebook tool).
 
-const float TURBO_CB_2BIT[4] = float[4](
-    -1.5104, -0.4528, 0.4528, 1.5104
-);
+#ifndef TURBO_CB_BINDING
+#error "TURBO_CB_BINDING must be #defined before including turbo_rht.glsl"
+#endif
 
-const float TURBO_CB_3BIT[8] = float[8](
-    -2.1520, -1.3440, -0.7560, -0.2451,
-     0.2451,  0.7560,  1.3440,  2.1520
-);
-
-const float TURBO_CB_4BIT[16] = float[16](
-    -2.7326, -2.0690, -1.6180, -1.2562, -0.9423, -0.6568, -0.3881, -0.1284,
-     0.1284,  0.3881,  0.6568,  0.9423,  1.2562,  1.6180,  2.0690,  2.7326
-);
-
-const float TURBO_CB_5BIT[32] = float[32](
-    -1.9956, -1.7900, -1.6107, -1.4493, -1.3010, -1.1631, -1.0334, -0.9104,
-    -0.7928, -0.6795, -0.5697, -0.4626, -0.3576, -0.2543, -0.1520, -0.0506,
-     0.0506,  0.1520,  0.2543,  0.3576,  0.4626,  0.5697,  0.6795,  0.7928,
-     0.9104,  1.0334,  1.1631,  1.3010,  1.4493,  1.6107,  1.7900,  1.9956
-);
+layout (binding = TURBO_CB_BINDING) readonly buffer TurboCodebook {
+    float turbo_codebook_data[];
+};
 
 // ---- Constants ----
 
@@ -70,18 +63,10 @@ uvec2 turbo_bit_address(uint elem_idx) {
     return uvec2(bit_offset >> 3, bit_offset & 7u);
 }
 
-// ---- Codebook lookup (selects table based on BITS) ----
+// ---- Codebook lookup (reads from bound buffer) ----
 
 float turbo_codebook_lookup(uint idx) {
-#if BITS == 2
-    return TURBO_CB_2BIT[idx];
-#elif BITS == 3
-    return TURBO_CB_3BIT[idx];
-#elif BITS == 4
-    return TURBO_CB_4BIT[idx];
-#elif BITS == 5
-    return TURBO_CB_5BIT[idx];
-#endif
+    return turbo_codebook_data[idx];
 }
 
 // ================================================================

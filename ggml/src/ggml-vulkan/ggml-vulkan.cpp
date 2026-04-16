@@ -65,6 +65,7 @@ DispatchLoaderDynamic & ggml_vk_default_dispatcher();
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 #include "ggml-fusion.h"
+#include "ggml-turbo-kv.h"
 
 #include "ggml-vulkan-shaders.hpp"
 
@@ -875,6 +876,12 @@ struct vk_device_struct {
     vk::Fence fence;
     vk_buffer sync_staging;
 
+    // Per-bitrate codebook buffers for TURBO_*B weight types. Indexed by (bits - 2).
+    // Default contents: published Lloyd-Max Gaussian centroids (Max 1960).
+    // A custom codebook (e.g., imatrix-weighted from turbo-codebook tool) can overwrite
+    // via ggml_vk_set_turbo_codebook().
+    vk_buffer turbo_codebook_buf[4];
+
     ggml_backend_buffer_type buffer_type;
 
     bool disable_fusion;
@@ -890,6 +897,10 @@ struct vk_device_struct {
         device.destroyFence(fence);
 
         ggml_vk_destroy_buffer(sync_staging);
+
+        for (int i = 0; i < 4; i++) {
+            ggml_vk_destroy_buffer(turbo_codebook_buf[i]);
+        }
 
         compute_queue.cmd_pool.destroy(device);
         transfer_queue.cmd_pool.destroy(device);
@@ -1677,6 +1688,7 @@ struct ggml_vk_garbage_collector {
 static void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_context subctx);
 static void ggml_vk_load_shaders(vk_device& device);
 static void ggml_pipeline_allocate_descriptor_sets(ggml_backend_vk_context * ctx);
+static void ggml_vk_buffer_write(vk_buffer& dst, size_t offset, const void * src, size_t size);
 
 static bool vk_memory_logger_enabled = false;
 
@@ -4293,15 +4305,16 @@ static void ggml_vk_load_shaders(vk_device& device) {
     if (device->subgroup_shuffle && device->subgroup_arithmetic) {
         const uint32_t ss = device->subgroup_size;
 
+        // 3 bindings: A (quantized), D (dequantized fp16), codebook.
 #define TURBO_DEQUANT_PIPELINE(TYPE, name_w64, name_w32) \
         if (ss >= 64) { \
             ggml_vk_create_pipeline(device, device->pipeline_dequant[TYPE], \
                 #name_w64, name_w64##_len, name_w64##_data, \
-                "main", 2, 5 * sizeof(uint32_t), {128, 1, 1}, {ss, 1, 1}, 1, false, true, ss); \
+                "main", 3, 5 * sizeof(uint32_t), {128, 1, 1}, {ss, 1, 1}, 1, false, true, ss); \
         } else { \
             ggml_vk_create_pipeline(device, device->pipeline_dequant[TYPE], \
                 #name_w32, name_w32##_len, name_w32##_data, \
-                "main", 2, 5 * sizeof(uint32_t), {128, 1, 1}, {ss, 1, 1}, 1, false, true, ss); \
+                "main", 3, 5 * sizeof(uint32_t), {128, 1, 1}, {ss, 1, 1}, 1, false, true, ss); \
         }
 
         TURBO_DEQUANT_PIPELINE(GGML_TYPE_TURBO_2B, dequant_turbo_2b, dequant_turbo_2b_w32)
@@ -4316,17 +4329,17 @@ static void ggml_vk_load_shaders(vk_device& device) {
         // (workgroup size index 0, 1 output column).
         // TURBO mul_mat_vec: NUM_COLS subgroups per workgroup, each handles one column.
         // Spec constants: 0=BLOCK_SIZE=ss*ncols, 1=NUM_ROWS=1, 2=NUM_COLS=ncols.
-        // 5 bindings: A, B, D, Fuse0, Fuse1 (matching standard mul_mat_vec).
+        // 6 bindings: A, B, D, Fuse0, Fuse1, codebook (extends standard mul_mat_vec).
 #define TURBO_MMV_PIPELINE(TYPE, name_w64, name_w32) \
         for (uint32_t ncols = 1; ncols <= mul_mat_vec_max_cols; ncols++) { \
             if (ss >= 64) { \
                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[0][TYPE][ncols-1], \
                     #name_w64, name_w64##_len, name_w64##_data, \
-                    "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1, 1, 1}, {ss * ncols, 1, ncols}, 1, false, true, ss); \
+                    "main", mul_mat_vec_num_bindings + 1, sizeof(vk_mat_vec_push_constants), {1, 1, 1}, {ss * ncols, 1, ncols}, 1, false, true, ss); \
             } else { \
                 ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[0][TYPE][ncols-1], \
                     #name_w32, name_w32##_len, name_w32##_data, \
-                    "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1, 1, 1}, {ss * ncols, 1, ncols}, 1, false, true, ss); \
+                    "main", mul_mat_vec_num_bindings + 1, sizeof(vk_mat_vec_push_constants), {1, 1, 1}, {ss * ncols, 1, ncols}, 1, false, true, ss); \
             } \
         }
 
@@ -5706,6 +5719,26 @@ static vk_device ggml_vk_get_device(size_t idx) {
             device->mmvq_mode = 1;
         }
 
+        // Upload default Gaussian Lloyd-Max codebooks for TURBO_*B weight types.
+        // Per-bitrate: 2^BITS floats. A custom codebook can overwrite via
+        // ggml_vk_set_turbo_codebook() once the model is loaded.
+        {
+            const float * defaults[4] = {
+                turbo_codebook_2bit,
+                turbo_codebook_3bit,
+                turbo_kv_4b_codebook,
+                turbo_codebook_5bit,
+            };
+            for (int i = 0; i < 4; i++) {
+                const size_t n = (size_t)1 << (i + 2);
+                const size_t size = n * sizeof(float);
+                device->turbo_codebook_buf[i] = ggml_vk_create_buffer(device, size,
+                    {vk::MemoryPropertyFlagBits::eDeviceLocal | vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent,
+                     vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent});
+                ggml_vk_buffer_write(device->turbo_codebook_buf[i], 0, defaults[i], size);
+            }
+        }
+
         return device;
     }
 
@@ -6722,6 +6755,41 @@ static void ggml_vk_dispatch_pipeline(ggml_backend_vk_context* ctx, vk_context& 
     subctx->s->buffer->buf.dispatch(wg0, wg1, wg2);
 }
 
+// Overload accepting std::vector<vk_subbuffer> for dispatches where the
+// binding list is built dynamically (e.g., TURBO types append the codebook
+// buffer only when src0->type is TURBO_*B).
+template <typename T>
+static void ggml_vk_dispatch_pipeline(ggml_backend_vk_context* ctx, vk_context& subctx, vk_pipeline& pipeline, const std::vector<vk_subbuffer> & subbuffers, const T &push_constants, std::array<uint32_t, 3> elements) {
+    std::vector<vk::DescriptorBufferInfo> infos;
+    infos.reserve(subbuffers.size());
+    for (const auto & sb : subbuffers) {
+        infos.push_back(static_cast<vk::DescriptorBufferInfo>(sb));
+    }
+    const uint32_t wg0 = CEIL_DIV(elements[0], pipeline->wg_denoms[0]);
+    const uint32_t wg1 = CEIL_DIV(elements[1], pipeline->wg_denoms[1]);
+    const uint32_t wg2 = CEIL_DIV(elements[2], pipeline->wg_denoms[2]);
+    GGML_ASSERT(wg0 <= ctx->device->properties.limits.maxComputeWorkGroupCount[0] &&
+                wg1 <= ctx->device->properties.limits.maxComputeWorkGroupCount[1] &&
+                wg2 <= ctx->device->properties.limits.maxComputeWorkGroupCount[2]);
+    GGML_ASSERT(ctx->descriptor_set_idx < ctx->descriptor_sets.size());
+    GGML_ASSERT(infos.size() <= MAX_PARAMETER_COUNT);
+    GGML_ASSERT(pipeline->parameter_count == infos.size());
+    GGML_ASSERT(pipeline->push_constant_size == push_constant_size(push_constants));
+
+    vk::DescriptorSet& descriptor_set = ctx->descriptor_sets[ctx->descriptor_set_idx++];
+    vk::WriteDescriptorSet write_descriptor_set{ descriptor_set, 0, 0, pipeline->parameter_count, vk::DescriptorType::eStorageBuffer, nullptr, infos.data() };
+    ctx->device->device.updateDescriptorSets({ write_descriptor_set }, {});
+
+    subctx->s->buffer->buf.pushConstants(pipeline->layout, vk::ShaderStageFlagBits::eCompute, 0, push_constant_size(push_constants), push_constant_data(push_constants));
+    subctx->s->buffer->buf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->pipeline);
+    subctx->s->buffer->buf.bindDescriptorSets(vk::PipelineBindPoint::eCompute,
+                                pipeline->layout,
+                                0,
+                                { descriptor_set },
+                                {});
+    subctx->s->buffer->buf.dispatch(wg0, wg1, wg2);
+}
+
 static void ggml_vk_end_submission(vk_submission& s, std::vector<vk_semaphore> wait_semaphores, std::vector<vk_semaphore> signal_semaphores) {
     s.buffer->buf.end();
 
@@ -7574,6 +7642,18 @@ static vk_pipeline ggml_vk_get_64b_indexing_pipeline(ggml_backend_vk_context * c
     return pipeline;
 }
 
+// Map a TURBO_*B weight type to its codebook buffer index (0..3 for bits 2..5).
+// Returns -1 for non-TURBO types.
+static int ggml_vk_turbo_codebook_index(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_TURBO_2B: return 0;
+        case GGML_TYPE_TURBO_3B: return 1;
+        case GGML_TYPE_TURBO_4B: return 2;
+        case GGML_TYPE_TURBO_5B: return 3;
+        default: return -1;
+    }
+}
+
 static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, bool disable_split_k) {
     VK_LOG_DEBUG("ggml_vk_mul_mat_q_f16((" << src0 << ", name=" << src0->name << ", type=" << ggml_type_name(src0->type) << ", ne0=" << src0->ne[0] << ", ne1=" << src0->ne[1] << ", ne2=" << src0->ne[2] << ", ne3=" << src0->ne[3] << ", nb0=" << src0->nb[0] << ", nb1=" << src0->nb[1] << ", nb2=" << src0->nb[2] << ", nb3=" << src0->nb[3];
     std::cerr << "), (" << src1 << ", name=" << src1->name << ", type=" << ggml_type_name(src1->type) << ", ne0=" << src1->ne[0] << ", ne1=" << src1->ne[1] << ", ne2=" << src1->ne[2] << ", ne3=" << src1->ne[3] << ", nb0=" << src1->nb[0] << ", nb1=" << src1->nb[1] << ", nb2=" << src1->nb[2] << ", nb3=" << src1->nb[3];
@@ -7781,7 +7861,15 @@ static void ggml_vk_mul_mat_q_f16(ggml_backend_vk_context * ctx, vk_context& sub
         ggml_vk_cpy_to_contiguous(ctx, subctx, to_fp16_vk_0, src0, ggml_vk_subbuffer(ctx, d_Qx, qx_buf_offset), ggml_vk_subbuffer(ctx, d_X, 0));
     } else if (qx_needs_dequant) {
         const std::vector<uint32_t> pc = { (uint32_t)ne01, (uint32_t)ne10, (uint32_t)ne10, (uint32_t)ne10, (uint32_t)(ggml_nelements(src0)) };
-        ggml_vk_dispatch_pipeline(ctx, subctx, to_fp16_vk_0, { vk_subbuffer{ d_Qx, qx_buf_offset, qx_sz }, vk_subbuffer{ d_X, 0, x_sz } }, pc, { (uint32_t)(x_ne), 1, 1});
+        // TURBO_*B types use a 3rd binding for the codebook buffer; all other
+        // dequant shaders use exactly 2 bindings (A, D).
+        std::vector<vk_subbuffer> dequant_buffers = { vk_subbuffer{ d_Qx, qx_buf_offset, qx_sz }, vk_subbuffer{ d_X, 0, x_sz } };
+        const int cb_idx = ggml_vk_turbo_codebook_index(src0->type);
+        if (cb_idx >= 0) {
+            vk_buffer& cb_buf = ctx->device->turbo_codebook_buf[cb_idx];
+            dequant_buffers.push_back(vk_subbuffer{ cb_buf, 0, cb_buf->size });
+        }
+        ggml_vk_dispatch_pipeline(ctx, subctx, to_fp16_vk_0, dequant_buffers, pc, { (uint32_t)(x_ne), 1, 1});
         ggml_vk_sync_buffers(ctx, subctx);
     }
     if (y_non_contig) {
@@ -8125,6 +8213,9 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
 
     ggml_pipeline_request_descriptor_sets(ctx, dmmv, CEIL_DIV(ne12 * ne13, ctx->device->properties.limits.maxComputeWorkGroupCount[1]));
 
+    // TURBO_*B fused mul_mat_vec uses a 6th binding for the codebook buffer.
+    const int turbo_cb_idx = ggml_vk_turbo_codebook_index(src0->type);
+
     uint32_t base_work_group_y = 0;
     while (base_work_group_y < ne12 * ne13) {
 
@@ -8135,14 +8226,13 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
             fusion_flags, base_work_group_y,
             (uint32_t)ne02, (uint32_t)ne12, (uint32_t)r2, (uint32_t)r3,
         };
+        std::vector<vk_subbuffer> mmv_buffers = { d_X, d_Y, d_D, d_F0, d_F1 };
+        if (turbo_cb_idx >= 0) {
+            vk_buffer& cb_buf = ctx->device->turbo_codebook_buf[turbo_cb_idx];
+            mmv_buffers.push_back(vk_subbuffer{ cb_buf, 0, cb_buf->size });
+        }
         ggml_vk_dispatch_pipeline(ctx, subctx, dmmv,
-                                  {
-                                    d_X,
-                                    d_Y,
-                                    d_D,
-                                    d_F0,
-                                    d_F1,
-                                  },
+                                  mmv_buffers,
                                   pc, { groups_x, groups_y, groups_z });
         base_work_group_y += groups_y;
     }
@@ -8638,8 +8728,14 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
         ggml_vk_cpy_to_contiguous(ctx, subctx, to_fp16_vk_0, src0, ggml_vk_subbuffer(ctx, d_Qx, qx_buf_offset), ggml_vk_subbuffer(ctx, d_X, 0));
     } else if (qx_needs_dequant) {
         const std::vector<uint32_t> pc = { (uint32_t)ne01, (uint32_t)ne10, (uint32_t)ne10, (uint32_t)ne10, (uint32_t)(ggml_nelements(src0)) };
+        std::vector<vk_subbuffer> dequant_buffers = { vk_subbuffer{ d_Qx, qx_buf_offset, qx_sz }, vk_subbuffer{ d_X, 0, x_sz } };
+        const int cb_idx = ggml_vk_turbo_codebook_index(src0->type);
+        if (cb_idx >= 0) {
+            vk_buffer& cb_buf = ctx->device->turbo_codebook_buf[cb_idx];
+            dequant_buffers.push_back(vk_subbuffer{ cb_buf, 0, cb_buf->size });
+        }
         ggml_vk_dispatch_pipeline(ctx, subctx, to_fp16_vk_0,
-            { vk_subbuffer{ d_Qx, qx_buf_offset, qx_sz }, vk_subbuffer{ d_X, 0, x_sz } }, pc, { (uint32_t)x_ne, 1, 1});
+            dequant_buffers, pc, { (uint32_t)x_ne, 1, 1});
     }
     if (y_non_contig) {
         if (ctx->prealloc_y_last_pipeline_used != to_fp16_vk_1.get() ||
