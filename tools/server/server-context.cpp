@@ -2190,6 +2190,13 @@ private:
                 slot.task->params.sampling.preserved_tokens.find(token) != slot.task->params.sampling.preserved_tokens.end();
         };
 
+        // MTP 2-phase does a second llama_decode for draft verification,
+        // which replaces the context's output logits. Only one generating
+        // slot can be in the batch at a time.
+        const bool mtp_single_slot =
+            (params_base.speculative.type == COMMON_SPECULATIVE_TYPE_MTP) &&
+            (llama_model_n_mtp_layers(model) > 0);
+
         // first, add sampled tokens from any ongoing sequences
         for (auto & slot : slots) {
             if (slot.state != SLOT_STATE_GENERATING) {
@@ -2201,18 +2208,18 @@ private:
                 slot_batched = &slot;
             } else if (!slot_batched->can_batch_with(slot)) {
                 continue;
+            } else if (mtp_single_slot) {
+                // MTP draft verification calls llama_decode with a separate batch,
+                // which replaces the context's output logits. A second generating
+                // slot would lose its logits after the first slot's draft decode.
+                continue;
             }
 
             // generate draft tokens in speculative decoding mode
             const int n_draft_max = slot.get_n_draft_max();
 
-            // Inline MTP path: model has MTP layers AND spec type is MTP.
-            // We do NOT stuff drafts into the main batch — the verifier block
-            // in the sampling loop handles the two-phase decode. Fall through
-            // to the "no speculative" branch which just adds slot.sampled.
-            const bool use_inline_mtp =
-                (params_base.speculative.type == COMMON_SPECULATIVE_TYPE_MTP) &&
-                (llama_model_n_mtp_layers(model) > 0);
+            // Inline MTP: use the hoisted flag (same conditions, computed once).
+            const bool use_inline_mtp = mtp_single_slot;
 
             // Plan A 1-phase spec decode path: snapshot recurrent state, then
             // emit [T_prev, D_1, ..., D_k] into the main batch as a single

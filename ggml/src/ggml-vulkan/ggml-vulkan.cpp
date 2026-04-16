@@ -4314,16 +4314,19 @@ static void ggml_vk_load_shaders(vk_device& device) {
         // TURBO mul_mat_vec: fused RHT-space dot, one row per workgroup.
         // Registered in pipeline_dequant_mul_mat_vec_f32_f32[0][type][0]
         // (workgroup size index 0, 1 output column).
+        // TURBO mul_mat_vec: NUM_COLS subgroups per workgroup, each handles one column.
+        // Spec constants: 0=BLOCK_SIZE=ss*ncols, 1=NUM_ROWS=1, 2=NUM_COLS=ncols.
+        // 5 bindings: A, B, D, Fuse0, Fuse1 (matching standard mul_mat_vec).
 #define TURBO_MMV_PIPELINE(TYPE, name_w64, name_w32) \
-        for (uint32_t col = 0; col < mul_mat_vec_max_cols; col++) { \
+        for (uint32_t ncols = 1; ncols <= mul_mat_vec_max_cols; ncols++) { \
             if (ss >= 64) { \
-                ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[0][TYPE][col], \
+                ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[0][TYPE][ncols-1], \
                     #name_w64, name_w64##_len, name_w64##_data, \
-                    "main", 3, sizeof(vk_mat_vec_push_constants), {1, 1, 1}, {ss, 1, col+1}, 1, false, true, ss); \
+                    "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1, 1, 1}, {ss * ncols, 1, ncols}, 1, false, true, ss); \
             } else { \
-                ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[0][TYPE][col], \
+                ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[0][TYPE][ncols-1], \
                     #name_w32, name_w32##_len, name_w32##_data, \
-                    "main", 3, sizeof(vk_mat_vec_push_constants), {1, 1, 1}, {ss, 1, col+1}, 1, false, true, ss); \
+                    "main", mul_mat_vec_num_bindings, sizeof(vk_mat_vec_push_constants), {1, 1, 1}, {ss * ncols, 1, ncols}, 1, false, true, ss); \
             } \
         }
 
@@ -15579,8 +15582,16 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     case GGML_TYPE_TURBO_3B:
                     case GGML_TYPE_TURBO_4B:
                     case GGML_TYPE_TURBO_5B:
+                        // TURBO mul_mat_vec only — no mat-mat path yet.
+                        // For large batches (ne[1] > 8), fall back to CPU.
                         if (!(device->subgroup_shuffle && device->subgroup_arithmetic)) {
                             return false;
+                        }
+                        {
+                            const ggml_tensor * b = (op->op == GGML_OP_MUL_MAT) ? op->src[1] : op->src[1];
+                            if (b->ne[1] > mul_mat_vec_max_cols) {
+                                return false;
+                            }
                         }
                         break;
                     default:
