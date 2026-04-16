@@ -435,9 +435,12 @@ extern "C" {
         // RHT + 16-entry Lloyd-Max-Gaussian codebook, 72 bytes per 128 elements, ~4.5 bpe.
         // Has a real vec_dot so it works with both FA on and FA off, unlike TQ_V_4B.
         GGML_TYPE_TURBO_KV_4B = 44,
-        GGML_TYPE_TURBO_4B    = 45, // RHT + Lloyd-Max codebook weight quant, 68B per 128 elems, 4.25 bpw
-        GGML_TYPE_TURBO_4B_S  = 46, // same, 36B per 64 elems, 4.5 bpw (fallback for ne[0] % 128 != 0)
-        GGML_TYPE_COUNT    = 47,
+        GGML_TYPE_TURBO_4B    = 45, // RHT + Lloyd-Max weight quant, 68B/128 elems, 4.25 bpw
+        GGML_TYPE_TURBO_4B_S  = 46, // same, 36B/64 elems, 4.5 bpw (fallback for ne[0]%128!=0)
+        GGML_TYPE_TURBO_2B    = 47, // RHT + 4-level Lloyd-Max, 36B/128 elems, 2.25 bpw
+        GGML_TYPE_TURBO_3B    = 48, // RHT + 8-level Lloyd-Max, 52B/128 elems, 3.25 bpw
+        GGML_TYPE_TURBO_5B    = 49, // RHT + 32-level Lloyd-Max, 84B/128 elems, 5.25 bpw
+        GGML_TYPE_COUNT    = 50,
     };
 
     // precision

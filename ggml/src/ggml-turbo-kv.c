@@ -41,25 +41,39 @@ const float turbo_kv_4b_codebook[16] = {
      1.2562f,  1.6180f,  2.0690f,  2.7326f
 };
 
-/* Empirical Lloyd-Max codebook for post-RHT weight distribution at d=128.
- * Computed from 772M post-RHT scaled values (Qwen3.5-0.8B, all 2D tensors).
- * Kurtosis=2.960 (sub-Gaussian, excess=-0.040), KS=0.003 vs N(0,1).
- * 5.26% MSE improvement over Gaussian codebook on real weight data.
- *
- * The max centroid magnitude (2.5296) replaces TURBO_KV_4B_CENT_MAX (2.7326)
- * for weight quantization scaling: inv_std = 2.5296 / max(|rotated|). */
-const float turbo_4b_weight_codebook[16] = {
-    -2.5296f, -1.9576f, -1.5425f, -1.2011f,
-    -0.9032f, -0.6317f, -0.3761f, -0.1287f,
-     0.1148f,  0.3611f,  0.6147f,  0.8864f,
-     1.1858f,  1.5284f,  1.9481f,  2.5250f
+/* Published Lloyd-Max Gaussian codebooks from tq_codebook.c (Max 1960).
+ * Weight quantization uses the SAME codebooks as KV cache — the post-RHT
+ * distribution is confirmed near-Gaussian (kurtosis 2.96, KS 0.003).
+ * Model-specific codebooks can be computed via llama-turbo-codebook tool
+ * and loaded at quantize time via --codebook flag. */
+
+const float turbo_codebook_2bit[4] = {
+    -1.5104f, -0.4528f, 0.4528f, 1.5104f
 };
 
-#define TURBO_4B_WEIGHT_CENT_MAX 2.5296f  /* max(|turbo_4b_weight_codebook|) */
+const float turbo_codebook_3bit[8] = {
+    -2.1520f, -1.3440f, -0.7560f, -0.2451f,
+     0.2451f,  0.7560f,  1.3440f,  2.1520f
+};
+
+/* turbo_kv_4b_codebook[16] is the 4-bit codebook — already defined above */
+
+const float turbo_codebook_5bit[32] = {
+    -1.9956f, -1.7900f, -1.6107f, -1.4493f, -1.3010f, -1.1631f, -1.0334f, -0.9104f,
+    -0.7928f, -0.6795f, -0.5697f, -0.4626f, -0.3576f, -0.2543f, -0.1520f, -0.0506f,
+     0.0506f,  0.1520f,  0.2543f,  0.3576f,  0.4626f,  0.5697f,  0.6795f,  0.7928f,
+     0.9104f,  1.0334f,  1.1631f,  1.3010f,  1.4493f,  1.6107f,  1.7900f,  1.9956f
+};
+
+/* Max centroid magnitudes for per-block scaling: inv_std = CENT_MAX / max_abs */
+#define TURBO_2B_CENT_MAX 1.5104f
+#define TURBO_3B_CENT_MAX 2.1520f
+#define TURBO_5B_CENT_MAX 1.9956f
+/* 4-bit uses TURBO_KV_4B_CENT_MAX (2.7326f) from the header */
 
 /* Per-centroid decision boundaries are midpoints between consecutive
  * centroids. For nearest-centroid lookup we compute |x - c| and take min.
- * With only 16 entries, linear scan beats binary search (~15 cmps). */
+ * With only 4-32 entries, linear scan beats binary search. */
 
 /* ============================================================
  * Random sign generation from seed (Knuth multiplicative hash)
@@ -567,7 +581,7 @@ static void quantize_block_turbo_4b(const float * src, uint8_t * dst, int block_
         if (a > max_abs) max_abs = a;
     }
     if (max_abs < 1e-10f) max_abs = 1.0f;
-    const float inv_std = TURBO_4B_WEIGHT_CENT_MAX / max_abs;
+    const float inv_std = TURBO_KV_4B_CENT_MAX / max_abs;
     *p_inv_std = turbo_kv_fp32_to_fp16(inv_std);
 
     /* Step 5: nearest-centroid quantization (weight-optimized codebook) */
@@ -576,9 +590,9 @@ static void quantize_block_turbo_4b(const float * src, uint8_t * dst, int block_
     for (int i = 0; i < block_size; i++) {
         const float x = rotated[i] * inv_std;
         int best = 0;
-        float best_dist = fabsf(x - turbo_4b_weight_codebook[0]);
+        float best_dist = fabsf(x - turbo_kv_4b_codebook[0]);
         for (int c = 1; c < 16; c++) {
-            const float d = fabsf(x - turbo_4b_weight_codebook[c]);
+            const float d = fabsf(x - turbo_kv_4b_codebook[c]);
             if (d < best_dist) {
                 best_dist = d;
                 best = c;
@@ -604,7 +618,7 @@ static void dequantize_block_turbo_4b(const uint8_t * src, float * dst, int bloc
     /* Build scaled LUT (weight-optimized codebook) */
     float lut[16];
     for (int c = 0; c < 16; c++) {
-        lut[c] = turbo_4b_weight_codebook[c] * scale;
+        lut[c] = turbo_kv_4b_codebook[c] * scale;
     }
 
     /* Unpack + codebook lookup */
@@ -674,11 +688,11 @@ static void quantize_block_turbo_4b_weighted(
      * The base scale maps max_abs to CENT_MAX. We try factors around 1.0
      * to find the scale that minimizes importance-weighted quantization error.
      * For uniform weights this collapses to the default scale. */
-    float best_inv_std = TURBO_4B_WEIGHT_CENT_MAX / max_abs;
+    float best_inv_std = TURBO_KV_4B_CENT_MAX / max_abs;
     float best_wmse = 1e30f;
 
     static const float scale_factors[] = { 0.90f, 0.95f, 1.00f, 1.05f, 1.10f };
-    const float base_inv_std = TURBO_4B_WEIGHT_CENT_MAX / max_abs;
+    const float base_inv_std = TURBO_KV_4B_CENT_MAX / max_abs;
 
     for (int sf = 0; sf < 5; sf++) {
         float candidate_inv_std = base_inv_std * scale_factors[sf];
@@ -687,14 +701,14 @@ static void quantize_block_turbo_4b_weighted(
         for (int i = 0; i < block_size; i++) {
             float x = rotated[i] * candidate_inv_std;
             /* Find nearest codebook entry */
-            float best_dist = fabsf(x - turbo_4b_weight_codebook[0]);
+            float best_dist = fabsf(x - turbo_kv_4b_codebook[0]);
             int best_c = 0;
             for (int c = 1; c < 16; c++) {
-                float d = fabsf(x - turbo_4b_weight_codebook[c]);
+                float d = fabsf(x - turbo_kv_4b_codebook[c]);
                 if (d < best_dist) { best_dist = d; best_c = c; }
             }
             /* Weighted reconstruction error (in original space before norm scaling) */
-            float recon = turbo_4b_weight_codebook[best_c] / candidate_inv_std;
+            float recon = turbo_kv_4b_codebook[best_c] / candidate_inv_std;
             float err = rotated[i] - recon;
             float w = weights ? weights[i] : 1.0f;
             wmse += w * err * err;
@@ -714,9 +728,9 @@ static void quantize_block_turbo_4b_weighted(
     for (int i = 0; i < block_size; i++) {
         const float x = rotated[i] * best_inv_std;
         int best = 0;
-        float best_dist = fabsf(x - turbo_4b_weight_codebook[0]);
+        float best_dist = fabsf(x - turbo_kv_4b_codebook[0]);
         for (int c = 1; c < 16; c++) {
-            float d = fabsf(x - turbo_4b_weight_codebook[c]);
+            float d = fabsf(x - turbo_kv_4b_codebook[c]);
             if (d < best_dist) { best_dist = d; best = c; }
         }
         const int byte_idx = i / 2;
@@ -830,7 +844,7 @@ static float turbo_4b_block_dot_dequant(
     /* Build scaled LUT (weight-optimized codebook) */
     float lut[16];
     for (int c = 0; c < 16; c++) {
-        lut[c] = turbo_4b_weight_codebook[c] * scale;
+        lut[c] = turbo_kv_4b_codebook[c] * scale;
     }
 
     /* Unpack + codebook lookup into rotated values */

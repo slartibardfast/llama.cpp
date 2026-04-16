@@ -88,13 +88,11 @@ uint16_t turbo_kv_fp32_to_fp16(float f);
  *   Used by TURBO_KV_4B (KV cache), where the post-RHT distribution varies
  *   by sequence and token — Gaussian is a safe static choice.
  *
- * turbo_4b_weight_codebook: Lloyd-Max optimal for empirical post-RHT weight
- *   distribution (Qwen3.5-0.8B, 772M values). Kurtosis=2.96 (sub-Gaussian),
- *   tails ~0.2 lighter than Gaussian. 5.26% MSE improvement over Gaussian
- *   codebook on real weight data at d=128.
+ * All TURBO weight types use the same Gaussian codebooks by default.
+ * Model-specific codebooks can be computed via llama-turbo-codebook
+ * and loaded at quantize time.
  * ============================================================ */
 extern const float turbo_kv_4b_codebook[16];
-extern const float turbo_4b_weight_codebook[16];
 
 /* ============================================================
  * Random Hadamard Transform (O(n log n) butterfly, in-place)
@@ -209,11 +207,64 @@ typedef struct {
 typedef char turbo_4b_s_check_size
     [(sizeof(block_turbo_4b_s) == TURBO_4B_S_BYTES) ? 1 : -1];
 
+/* ---- TURBO_2B: 2-bit, 4-level Lloyd-Max (tq_codebook.c CODEBOOK_2BIT) ---- */
+
+#define TURBO_2B_BLOCK_SIZE  128
+#define TURBO_2B_BYTES       36   /* 2+2+32 bytes per 128-elem block (2 bits/elem) */
+
+typedef struct {
+    uint16_t norm;
+    uint16_t inv_std;
+    uint8_t  qs[TURBO_2B_BLOCK_SIZE / 4]; /* 2-bit packed, 4 per byte */
+} block_turbo_2b;
+
+typedef char turbo_2b_check_size
+    [(sizeof(block_turbo_2b) == TURBO_2B_BYTES) ? 1 : -1];
+
+/* ---- TURBO_3B: 3-bit, 8-level Lloyd-Max (tq_codebook.c CODEBOOK_3BIT) ---- */
+
+#define TURBO_3B_BLOCK_SIZE  128
+#define TURBO_3B_BYTES       52   /* 2+2+48 bytes per 128-elem block (3 bits/elem) */
+
+typedef struct {
+    uint16_t norm;
+    uint16_t inv_std;
+    uint8_t  qs[48];              /* 3-bit packed: 8 elems → 3 bytes (bit-stream) */
+} block_turbo_3b;
+
+typedef char turbo_3b_check_size
+    [(sizeof(block_turbo_3b) == TURBO_3B_BYTES) ? 1 : -1];
+
+/* ---- TURBO_5B: 5-bit, 32-level Lloyd-Max (tq_codebook.c CODEBOOK_5BIT) ---- */
+
+#define TURBO_5B_BLOCK_SIZE  128
+#define TURBO_5B_BYTES       84   /* 2+2+80 bytes per 128-elem block (5 bits/elem) */
+
+typedef struct {
+    uint16_t norm;
+    uint16_t inv_std;
+    uint8_t  qs[80];              /* 5-bit packed: 8 elems → 5 bytes (bit-stream) */
+} block_turbo_5b;
+
+typedef char turbo_5b_check_size
+    [(sizeof(block_turbo_5b) == TURBO_5B_BYTES) ? 1 : -1];
+
+/* Published Lloyd-Max Gaussian codebooks from tq_codebook.c (Max 1960) */
+extern const float turbo_codebook_2bit[4];
+extern const float turbo_codebook_3bit[8];
+extern const float turbo_codebook_5bit[32];
+
 /* Quantize / dequantize API for weight tensors */
+void quantize_row_turbo_2b_ref  (const float * GGML_RESTRICT x, block_turbo_2b   * GGML_RESTRICT y, int64_t k);
+void dequantize_row_turbo_2b    (const block_turbo_2b   * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+void quantize_row_turbo_3b_ref  (const float * GGML_RESTRICT x, block_turbo_3b   * GGML_RESTRICT y, int64_t k);
+void dequantize_row_turbo_3b    (const block_turbo_3b   * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 void quantize_row_turbo_4b_ref  (const float * GGML_RESTRICT x, block_turbo_4b   * GGML_RESTRICT y, int64_t k);
 void dequantize_row_turbo_4b    (const block_turbo_4b   * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 void quantize_row_turbo_4b_s_ref(const float * GGML_RESTRICT x, block_turbo_4b_s * GGML_RESTRICT y, int64_t k);
 void dequantize_row_turbo_4b_s  (const block_turbo_4b_s * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+void quantize_row_turbo_5b_ref  (const float * GGML_RESTRICT x, block_turbo_5b   * GGML_RESTRICT y, int64_t k);
+void dequantize_row_turbo_5b    (const block_turbo_5b   * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 
 /* ============================================================
  * E8P lattice vector quantizer (8D, 256-entry D8-hat codebook)
@@ -228,12 +279,30 @@ uint32_t e8p_encode_rvq4bit(const float * x);
 uint32_t e8p_encode_rvq4bit_weighted(const float * x, const float * weights);
 
 /* imatrix-aware quantization wrappers (ggml_quantize_chunk API) */
+size_t quantize_turbo_2b  (const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
+                            int64_t nrows, int64_t n_per_row, const float * quant_weights);
+size_t quantize_turbo_3b  (const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
+                            int64_t nrows, int64_t n_per_row, const float * quant_weights);
 size_t quantize_turbo_4b  (const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
                             int64_t nrows, int64_t n_per_row, const float * quant_weights);
 size_t quantize_turbo_4b_s(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
                             int64_t nrows, int64_t n_per_row, const float * quant_weights);
+size_t quantize_turbo_5b  (const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
+                            int64_t nrows, int64_t n_per_row, const float * quant_weights);
 
 /* vec_dot: <quantized weight row, f32 activation> */
+void ggml_vec_dot_turbo_2b_f32(
+    int n, float * GGML_RESTRICT s, size_t bs,
+    const void * GGML_RESTRICT vx, size_t bx,
+    const void * GGML_RESTRICT vy, size_t by,
+    int nrc);
+
+void ggml_vec_dot_turbo_3b_f32(
+    int n, float * GGML_RESTRICT s, size_t bs,
+    const void * GGML_RESTRICT vx, size_t bx,
+    const void * GGML_RESTRICT vy, size_t by,
+    int nrc);
+
 void ggml_vec_dot_turbo_4b_f32(
     int n, float * GGML_RESTRICT s, size_t bs,
     const void * GGML_RESTRICT vx, size_t bx,
@@ -241,6 +310,12 @@ void ggml_vec_dot_turbo_4b_f32(
     int nrc);
 
 void ggml_vec_dot_turbo_4b_s_f32(
+    int n, float * GGML_RESTRICT s, size_t bs,
+    const void * GGML_RESTRICT vx, size_t bx,
+    const void * GGML_RESTRICT vy, size_t by,
+    int nrc);
+
+void ggml_vec_dot_turbo_5b_f32(
     int n, float * GGML_RESTRICT s, size_t bs,
     const void * GGML_RESTRICT vx, size_t bx,
     const void * GGML_RESTRICT vy, size_t by,
