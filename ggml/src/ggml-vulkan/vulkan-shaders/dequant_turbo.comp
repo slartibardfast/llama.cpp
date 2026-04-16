@@ -12,6 +12,7 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_shuffle : require
 
@@ -23,33 +24,27 @@
 #define DATA_BYTES (BLOCK_ELEMS * BITS / 8)
 #define BLOCK_BYTES (HEADER_BYTES + DATA_BYTES)
 
+// Matches dequant_head.glsl — 5 uint32s, 20 bytes total.
+// Used by ggml_vk_mul_mat_q_f16 which dispatches with this layout.
 layout (push_constant) uniform parameter {
-    uint ne;       // total elements
-    uint ne00; uint ne01; uint ne02; uint ne03;
-    uint nb00; uint nb01; uint nb02; uint nb03;
-    uint ne10; uint ne11; uint ne12; uint ne13;
-    uint nb10; uint nb11; uint nb12; uint nb13;
-    uint misalign_offsets;
-    float param1; float param2;
-    uint ne0_012mp; uint ne0_012L;
-    uint ne0_01mp;  uint ne0_01L;
-    uint ne0_0mp;   uint ne0_0L;
-    uint ne1_012mp; uint ne1_012L;
-    uint ne1_01mp;  uint ne1_01L;
-    uint ne1_0mp;   uint ne1_0L;
+    uint M;         // unused by turbo dequant, but kept for layout compat
+    uint K;         // unused
+    uint stride_a;  // unused
+    uint stride_b;  // unused
+    uint nel;       // total number of elements (== ne of tensor)
 } p;
 
 layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
 
 // Raw byte access to the quantized data
 layout (binding = 0) readonly buffer A { uint8_t data_a[]; };
-layout (binding = 1) writeonly buffer D { float data_b[]; };
+layout (binding = 1) writeonly buffer D { D_TYPE data_b[]; };
 
 void main() {
     const uint block_id = gl_WorkGroupID.z * gl_NumWorkGroups.y * gl_NumWorkGroups.x
                         + gl_WorkGroupID.y * gl_NumWorkGroups.x
                         + gl_WorkGroupID.x;
-    if (block_id >= p.ne / BLOCK_ELEMS) return;
+    if (block_id >= p.nel / BLOCK_ELEMS) return;
 
     const uint tid = gl_SubgroupInvocationID;
     const uint block_offset = block_id * BLOCK_BYTES;
@@ -76,8 +71,8 @@ void main() {
     turbo_inverse_rht(val0, val1, tid, norm);
 
     const uint base = block_id * BLOCK_ELEMS;
-    data_b[base + tid]       = val0;
-    data_b[base + tid + 64u] = val1;
+    data_b[base + tid]       = D_TYPE(val0);
+    data_b[base + tid + 64u] = D_TYPE(val1);
 #else
     // Wave32: each thread handles 4 elements [tid, tid+32, tid+64, tid+96]
     uvec2 a0 = turbo_bit_address(tid);
@@ -92,9 +87,9 @@ void main() {
     turbo_inverse_rht(v0, v1, v2, v3, tid, norm);
 
     const uint base = block_id * BLOCK_ELEMS;
-    data_b[base + tid]       = v0;
-    data_b[base + tid + 32u] = v1;
-    data_b[base + tid + 64u] = v2;
-    data_b[base + tid + 96u] = v3;
+    data_b[base + tid]       = D_TYPE(v0);
+    data_b[base + tid + 32u] = D_TYPE(v1);
+    data_b[base + tid + 64u] = D_TYPE(v2);
+    data_b[base + tid + 96u] = D_TYPE(v3);
 #endif
 }

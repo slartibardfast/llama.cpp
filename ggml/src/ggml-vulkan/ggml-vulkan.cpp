@@ -4297,11 +4297,11 @@ static void ggml_vk_load_shaders(vk_device& device) {
         if (ss >= 64) { \
             ggml_vk_create_pipeline(device, device->pipeline_dequant[TYPE], \
                 #name_w64, name_w64##_len, name_w64##_data, \
-                "main", 2, sizeof(vk_op_unary_push_constants), {128, 1, 1}, {ss, 1, 1}, 1, false, true, ss); \
+                "main", 2, 5 * sizeof(uint32_t), {128, 1, 1}, {ss, 1, 1}, 1, false, true, ss); \
         } else { \
             ggml_vk_create_pipeline(device, device->pipeline_dequant[TYPE], \
                 #name_w32, name_w32##_len, name_w32##_data, \
-                "main", 2, sizeof(vk_op_unary_push_constants), {128, 1, 1}, {ss, 1, 1}, 1, false, true, ss); \
+                "main", 2, 5 * sizeof(uint32_t), {128, 1, 1}, {ss, 1, 1}, 1, false, true, ss); \
         }
 
         TURBO_DEQUANT_PIPELINE(GGML_TYPE_TURBO_2B, dequant_turbo_2b, dequant_turbo_2b_w32)
@@ -6199,6 +6199,10 @@ static vk_pipeline ggml_vk_get_to_fp16(ggml_backend_vk_context * ctx, ggml_type 
         case GGML_TYPE_IQ4_NL:
         case GGML_TYPE_MXFP4:
         case GGML_TYPE_TURBO_KV_4B:
+        case GGML_TYPE_TURBO_2B:
+        case GGML_TYPE_TURBO_3B:
+        case GGML_TYPE_TURBO_4B:
+        case GGML_TYPE_TURBO_5B:
             break;
         default:
             return nullptr;
@@ -8043,6 +8047,13 @@ static void ggml_vk_mul_mat_vec_q_f16(ggml_backend_vk_context * ctx, vk_context&
         }
 
         GGML_ASSERT(x_sz == ggml_vk_align_size(ggml_type_size(src0->type) * x_ne, ctx->device->properties.limits.minStorageBufferOffsetAlignment));
+        ggml_vk_cpy_to_contiguous(ctx, subctx, to_fp16_vk_0, src0, d_Qx, d_X);
+    } else if (qx_needs_dequant) {
+        // Contiguous but no dedicated matmul pipeline (e.g., TURBO types) —
+        // dequant to f16 via the standard dequant pipeline.
+        if (ctx->prealloc_x_need_sync) {
+            ggml_vk_sync_buffers(ctx, subctx);
+        }
         ggml_vk_cpy_to_contiguous(ctx, subctx, to_fp16_vk_0, src0, d_Qx, d_X);
     }
     if (y_non_contig) {
@@ -15582,16 +15593,10 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     case GGML_TYPE_TURBO_3B:
                     case GGML_TYPE_TURBO_4B:
                     case GGML_TYPE_TURBO_5B:
-                        // TURBO mul_mat_vec only — no mat-mat path yet.
-                        // For large batches (ne[1] > 8), fall back to CPU.
+                        // ne[1] <= 8: fused mul_mat_vec (direct)
+                        // ne[1] > 8: dequant-to-f16 + standard f16 matmul
                         if (!(device->subgroup_shuffle && device->subgroup_arithmetic)) {
                             return false;
-                        }
-                        {
-                            const ggml_tensor * b = (op->op == GGML_OP_MUL_MAT) ? op->src[1] : op->src[1];
-                            if (b->ne[1] > mul_mat_vec_max_cols) {
-                                return false;
-                            }
                         }
                         break;
                     default:

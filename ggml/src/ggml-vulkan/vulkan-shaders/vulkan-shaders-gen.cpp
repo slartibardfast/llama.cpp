@@ -837,15 +837,16 @@ void process_shaders() {
 
     // TURBO_*B weight dequant shaders — parametric by BITS, shared turbo_rht.glsl core.
     // Each bitrate gets its own SPV compiled from the same dequant_turbo.comp template.
+    // Output is fp16 (matches pipeline_dequant[type] contract — mat-mat path expects fp16).
     for (int bits : {2, 3, 4, 5}) {
         std::string suffix = std::to_string(bits) + "b";
         std::string bits_str = std::to_string(bits);
         string_to_spv("dequant_turbo_" + suffix,
             "dequant_turbo.comp",
-            {{"BITS", bits_str}, {"SUBGROUP_SIZE", "64"}});
+            {{"BITS", bits_str}, {"SUBGROUP_SIZE", "64"}, {"D_TYPE", "float16_t"}});
         string_to_spv("dequant_turbo_" + suffix + "_w32",
             "dequant_turbo.comp",
-            {{"BITS", bits_str}, {"SUBGROUP_SIZE", "32"}});
+            {{"BITS", bits_str}, {"SUBGROUP_SIZE", "32"}, {"D_TYPE", "float16_t"}});
     }
 
     // TURBO_*B fused mul_mat_vec — dot in RHT space, no inverse FWHT per block.
