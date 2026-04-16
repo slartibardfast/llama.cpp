@@ -4288,6 +4288,30 @@ static void ggml_vk_load_shaders(vk_device& device) {
         ggml_vk_create_pipeline(device, device->pipeline_cpy_quant_f32[GGML_TYPE_TURBO_KV_4B], "cpy_turbo_kv_4b_f32",       cpy_turbo_kv_4b_f32_len,       cpy_turbo_kv_4b_f32_data,       "main", 2, sizeof(vk_op_unary_push_constants),  {128, 1, 1}, {ss, 1, 1}, 1, false, true, ss);
     }
 
+    // TURBO_*B weight dequant: same subgroup-cooperative FWHT as TURBO_KV_4B.
+    // Select wave32 or wave64 SPV variant based on device subgroup size.
+    if (device->subgroup_shuffle && device->subgroup_arithmetic) {
+        const uint32_t ss = device->subgroup_size;
+
+#define TURBO_DEQUANT_PIPELINE(TYPE, name_w64, name_w32) \
+        if (ss >= 64) { \
+            ggml_vk_create_pipeline(device, device->pipeline_dequant[TYPE], \
+                #name_w64, name_w64##_len, name_w64##_data, \
+                "main", 2, sizeof(vk_op_unary_push_constants), {128, 1, 1}, {ss, 1, 1}, 1, false, true, ss); \
+        } else { \
+            ggml_vk_create_pipeline(device, device->pipeline_dequant[TYPE], \
+                #name_w32, name_w32##_len, name_w32##_data, \
+                "main", 2, sizeof(vk_op_unary_push_constants), {128, 1, 1}, {ss, 1, 1}, 1, false, true, ss); \
+        }
+
+        TURBO_DEQUANT_PIPELINE(GGML_TYPE_TURBO_2B, dequant_turbo_2b, dequant_turbo_2b_w32)
+        TURBO_DEQUANT_PIPELINE(GGML_TYPE_TURBO_3B, dequant_turbo_3b, dequant_turbo_3b_w32)
+        TURBO_DEQUANT_PIPELINE(GGML_TYPE_TURBO_4B, dequant_turbo_4b, dequant_turbo_4b_w32)
+        TURBO_DEQUANT_PIPELINE(GGML_TYPE_TURBO_5B, dequant_turbo_5b, dequant_turbo_5b_w32)
+
+#undef TURBO_DEQUANT_PIPELINE
+    }
+
     // get_rows
     ggml_vk_create_pipeline(device, device->pipeline_get_rows[GGML_TYPE_F32 ], "get_rows_f32",  get_rows_f32_len,  get_rows_f32_data,  "main", 3, sizeof(vk_op_binary_push_constants), { 512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_get_rows[GGML_TYPE_F16 ], "get_rows_f16",  get_rows_f16_len,  get_rows_f16_data,  "main", 3, sizeof(vk_op_binary_push_constants), { 512, 1, 1}, {}, 1);
@@ -15657,6 +15681,12 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     case GGML_TYPE_TURBO_KV_4B:
                     case GGML_TYPE_I32:
                         return true;
+                    case GGML_TYPE_TURBO_2B:
+                    case GGML_TYPE_TURBO_3B:
+                    case GGML_TYPE_TURBO_4B:
+                    case GGML_TYPE_TURBO_4B_S:
+                    case GGML_TYPE_TURBO_5B:
+                        return device->subgroup_shuffle && device->subgroup_arithmetic;
                     default:
                         return false;
                 }
