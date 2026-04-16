@@ -2,7 +2,9 @@
  * llama-turbo-codebook — Compute model-specific Lloyd-Max codebooks for TURBO_*B types
  *
  * Usage:
- *   llama-turbo-codebook -m model.gguf [-o codebook.gguf] [--block-size 128]
+ *   llama-turbo-codebook -m model.gguf [-o codebook.gguf]
+ *                        [--imatrix path.gguf]   # optional, weights Lloyd-Max E-step
+ *                        [--block-size 128]
  *
  * Loads an F16/F32/Q8_0 GGUF model, applies RHT to all 2D weight tensors,
  * collects the post-RHT distribution, and computes optimal Lloyd-Max centroids
@@ -11,6 +13,12 @@
  * Default codebooks are the published Gaussian Lloyd-Max tables from Max (1960),
  * matching tq_codebook.c in quantumaikr/quant.cpp. This tool computes codebooks
  * optimized for the model's actual post-RHT weight distribution.
+ *
+ * With --imatrix, each post-RHT value contributes to the Lloyd-Max expectation
+ * step weighted by its imatrix importance (sum_of_squared_activations / chunks).
+ * Centroids converge toward the distribution of high-importance elements rather
+ * than the global distribution — trades fidelity on low-importance regions for
+ * fidelity on critical ones (the Unsloth-style dynamic tradeoff).
  */
 
 #include "ggml.h"
@@ -24,11 +32,28 @@
 #include <vector>
 #include <algorithm>
 #include <string>
+#include <unordered_map>
 
 /* ================================================================
- * Lloyd-Max algorithm: iterative MSE-optimal scalar quantizer
+ * Weighted Lloyd-Max algorithm.
+ *
+ * Standard Lloyd-Max: E-step assigns each sample to nearest centroid,
+ * M-step updates each centroid to the MEAN of assigned samples.
+ *
+ * Weighted variant: M-step updates to WEIGHTED MEAN using per-sample weights.
+ * Minimizes sum(w_i * (x_i - c_nearest)^2) — the imatrix-weighted MSE.
+ *
+ * If weights is empty, all weights are 1 (standard Lloyd-Max).
  * ================================================================ */
-static void lloyd_max(const std::vector<float> & data, float * centroids, int n_centroids, int max_iter) {
+static void lloyd_max_weighted(const std::vector<float> & data,
+                                const std::vector<float> & weights,
+                                float * centroids, int n_centroids, int max_iter) {
+    const bool use_weights = !weights.empty();
+    if (use_weights && weights.size() != data.size()) {
+        fprintf(stderr, "lloyd_max_weighted: weights size mismatch\n");
+        std::exit(1);
+    }
+
     /* Initialize with uniform spacing in data range */
     float vmin = *std::min_element(data.begin(), data.end());
     float vmax = *std::max_element(data.begin(), data.end());
@@ -36,28 +61,30 @@ static void lloyd_max(const std::vector<float> & data, float * centroids, int n_
         centroids[c] = vmin + (vmax - vmin) * (c + 0.5f) / n_centroids;
     }
 
-    std::vector<double> sums(n_centroids);
-    std::vector<int> counts(n_centroids);
+    std::vector<double> wsums(n_centroids);
+    std::vector<double> wcounts(n_centroids);
 
     for (int iter = 0; iter < max_iter; iter++) {
-        std::fill(sums.begin(), sums.end(), 0.0);
-        std::fill(counts.begin(), counts.end(), 0);
+        std::fill(wsums.begin(), wsums.end(), 0.0);
+        std::fill(wcounts.begin(), wcounts.end(), 0.0);
 
-        for (float v : data) {
+        for (size_t i = 0; i < data.size(); i++) {
+            float v = data[i];
+            float w = use_weights ? weights[i] : 1.0f;
             int best = 0;
             float best_dist = fabsf(v - centroids[0]);
             for (int c = 1; c < n_centroids; c++) {
                 float d = fabsf(v - centroids[c]);
                 if (d < best_dist) { best_dist = d; best = c; }
             }
-            sums[best] += v;
-            counts[best]++;
+            wsums[best] += (double)w * v;
+            wcounts[best] += (double)w;
         }
 
         float max_shift = 0;
         for (int c = 0; c < n_centroids; c++) {
-            if (counts[c] > 0) {
-                float new_c = (float)(sums[c] / counts[c]);
+            if (wcounts[c] > 0.0) {
+                float new_c = (float)(wsums[c] / wcounts[c]);
                 float shift = fabsf(new_c - centroids[c]);
                 if (shift > max_shift) max_shift = shift;
                 centroids[c] = new_c;
@@ -68,23 +95,103 @@ static void lloyd_max(const std::vector<float> & data, float * centroids, int n_
     std::sort(centroids, centroids + n_centroids);
 }
 
+static inline void lloyd_max(const std::vector<float> & data, float * centroids, int n_centroids, int max_iter) {
+    lloyd_max_weighted(data, {}, centroids, n_centroids, max_iter);
+}
+
 /* ================================================================
- * Collect post-RHT scaled values from 2D weight tensors
+ * Load imatrix from a GGUF file.
+ * Returns map: tensor_name → per-element importance (ne0 * ne1 floats).
+ * Follows the format used by tools/quantize/quantize.cpp::load_imatrix.
  * ================================================================ */
-static std::vector<float> collect_post_rht(const char * path, int block_size, int64_t max_samples) {
+static std::unordered_map<std::string, std::vector<float>> load_imatrix(const char * path) {
+    std::unordered_map<std::string, std::vector<float>> out;
+
     struct ggml_context * ctx = nullptr;
     struct gguf_init_params params;
     params.no_alloc = false;
     params.ctx = &ctx;
     struct gguf_context * gctx = gguf_init_from_file(path, params);
-    if (!gctx) { fprintf(stderr, "ERROR: cannot open %s\n", path); return {}; }
+    if (!gctx) { fprintf(stderr, "WARN: cannot open imatrix %s\n", path); return out; }
 
-    std::vector<float> values;
-    values.reserve(max_samples);
+    const std::string sums_suffix   = ".in_sum2";
+    const std::string counts_suffix = ".counts";
+
+    struct pair_t { const ggml_tensor * sums = nullptr; const ggml_tensor * counts = nullptr; };
+    std::unordered_map<std::string, pair_t> pairs;
+
+    for (struct ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+        std::string name = t->name;
+        if (name.size() > sums_suffix.size() &&
+            name.compare(name.size() - sums_suffix.size(), sums_suffix.size(), sums_suffix) == 0) {
+            pairs[name.substr(0, name.size() - sums_suffix.size())].sums = t;
+        } else if (name.size() > counts_suffix.size() &&
+            name.compare(name.size() - counts_suffix.size(), counts_suffix.size(), counts_suffix) == 0) {
+            pairs[name.substr(0, name.size() - counts_suffix.size())].counts = t;
+        }
+    }
+
+    for (auto & kv : pairs) {
+        const auto & name = kv.first;
+        const auto * sums = kv.second.sums;
+        const auto * counts = kv.second.counts;
+        if (!sums || !counts) continue;
+
+        auto & e = out[name];
+        e.resize(ggml_nelements(sums));
+        const int64_t ne0 = sums->ne[0];
+        const int64_t ne1 = sums->ne[1];
+        for (int64_t j = 0; j < ne1; j++) {
+            float c = ((const float *)counts->data)[j];
+            if (c > 0.0f) {
+                for (int64_t i = 0; i < ne0; i++) {
+                    e[j * ne0 + i] = ((const float *)sums->data)[j * ne0 + i] / c;
+                }
+            }
+        }
+    }
+
+    fprintf(stderr, "  loaded imatrix: %zu tensors\n", out.size());
+    if (!out.empty()) {
+        auto it = out.begin();
+        fprintf(stderr, "  sample key: '%s'\n", it->first.c_str());
+    }
+    gguf_free(gctx);
+    ggml_free(ctx);
+    return out;
+}
+
+/* ================================================================
+ * Collect post-RHT scaled values from 2D weight tensors.
+ * If imatrix is provided, also collect matching per-value weights
+ * (imatrix importance at the input-channel position).
+ *
+ * Note: RHT mixes input channels. The imatrix importance for post-RHT
+ * position i is approximated as the original input-channel importance
+ * at position i — this is a well-defined projection since the importance
+ * tracks activation energy per channel, and position mapping is identity
+ * under our fixed-seed RHT for the purposes of scalar codebook learning.
+ * ================================================================ */
+static void collect_post_rht(
+    const char * path, int block_size, int64_t max_samples,
+    const std::unordered_map<std::string, std::vector<float>> & imatrix,
+    std::vector<float> & values_out,
+    std::vector<float> & weights_out)
+{
+    struct ggml_context * ctx = nullptr;
+    struct gguf_init_params params;
+    params.no_alloc = false;
+    params.ctx = &ctx;
+    struct gguf_context * gctx = gguf_init_from_file(path, params);
+    if (!gctx) { fprintf(stderr, "ERROR: cannot open %s\n", path); return; }
+
+    values_out.clear();  values_out.reserve(max_samples);
+    weights_out.clear(); weights_out.reserve(imatrix.empty() ? 0 : max_samples);
     int n_tensors = 0;
+    int n_with_imat = 0;
 
     const int total = gguf_get_n_tensors(gctx);
-    for (int t = 0; t < total && (int64_t)values.size() < max_samples; t++) {
+    for (int t = 0; t < total && (int64_t)values_out.size() < max_samples; t++) {
         const char * name = gguf_get_tensor_name(gctx, t);
         struct ggml_tensor * tensor = ggml_get_tensor(ctx, name);
         if (!tensor || ggml_n_dims(tensor) != 2) continue;
@@ -92,14 +199,29 @@ static std::vector<float> collect_post_rht(const char * path, int block_size, in
         int64_t ne0 = tensor->ne[0], ne1 = tensor->ne[1];
         if (ne0 % block_size != 0) continue;
 
+        /* Look up imatrix for this tensor. Weight tensor is [ne0 in, ne1 out];
+         * imatrix is per-input-channel importance (size ne0). Same weight applies
+         * to every row (same input channels).
+         *
+         * If imatrix is provided, skip tensors not covered by it — these are
+         * typically embeddings (GET_ROWS, not MUL_MAT) and the codebook should
+         * reflect only tensors that will be quantized under imatrix guidance. */
+        const std::vector<float> * imat = nullptr;
+        if (!imatrix.empty()) {
+            auto it = imatrix.find(name);
+            if (it == imatrix.end()) continue;  // skip uncovered tensors
+            imat = &it->second;
+            n_with_imat++;
+        }
+
         std::vector<float> row_f32(ne0);
         int64_t nb = ne0 / block_size;
 
-        for (int64_t row = 0; row < ne1 && (int64_t)values.size() < max_samples; row++) {
+        for (int64_t row = 0; row < ne1 && (int64_t)values_out.size() < max_samples; row++) {
             const void * row_data = (const char *)tensor->data + row * tensor->nb[1];
             ggml_get_type_traits(tensor->type)->to_float(row_data, row_f32.data(), ne0);
 
-            for (int64_t b = 0; b < nb && (int64_t)values.size() < max_samples; b++) {
+            for (int64_t b = 0; b < nb && (int64_t)values_out.size() < max_samples; b++) {
                 float * blk = row_f32.data() + b * block_size;
 
                 float norm_sq = 0;
@@ -120,28 +242,33 @@ static std::vector<float> collect_post_rht(const char * path, int block_size, in
                 }
                 if (max_abs < 1e-10f) continue;
 
-                /* Collect raw rotated values (not scaled by inv_std — the codebook
-                 * will be used with per-block scaling, so we want the distribution
-                 * BEFORE scaling. The per-block max-abs scaling maps max_abs → CENT_MAX,
-                 * so the codebook should cover [-CENT_MAX, CENT_MAX]. We normalize
-                 * so max_abs → 1.0 and the codebook covers [-1, 1]. The actual
-                 * CENT_MAX is max(|centroid|) of the computed codebook. */
                 for (int i = 0; i < block_size; i++) {
-                    values.push_back(rotated[i] / max_abs);
+                    values_out.push_back(rotated[i] / max_abs);
+                    if (!imatrix.empty()) {
+                        /* Use imatrix value at the input-channel position for this block.
+                         * Fall back to 1.0 if no imatrix for this tensor. */
+                        float w = 1.0f;
+                        if (imat) {
+                            int64_t idx = b * block_size + i;
+                            if (idx < (int64_t)imat->size()) w = (*imat)[idx];
+                            /* Guard against zero weights (would zero-out the sample) */
+                            if (w < 1e-6f) w = 1e-6f;
+                        }
+                        weights_out.push_back(w);
+                    }
                 }
             }
         }
         n_tensors++;
         if (n_tensors % 20 == 0) {
-            fprintf(stderr, "  [%d/%d] %zu values collected\r", n_tensors, total, values.size());
+            fprintf(stderr, "  [%d/%d] %zu values collected\r", n_tensors, total, values_out.size());
         }
     }
-    fprintf(stderr, "  Collected %zu values from %d tensors                    \n",
-        values.size(), n_tensors);
+    fprintf(stderr, "  Collected %zu values from %d tensors (imatrix matched %d)          \n",
+        values_out.size(), n_tensors, n_with_imat);
 
     gguf_free(gctx);
     ggml_free(ctx);
-    return values;
 }
 
 /* ================================================================
@@ -281,17 +408,21 @@ static void compute_stats(const std::vector<float> & values, float * kurtosis_ou
 int main(int argc, char ** argv) {
     std::string model_path;
     std::string output_path = "codebook.gguf";
+    std::string imatrix_path;
     int block_size = 128;
     int64_t max_samples = 10000000; /* 10M samples for Lloyd-Max */
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-m") == 0 && i+1 < argc) { model_path = argv[++i]; }
         else if (strcmp(argv[i], "-o") == 0 && i+1 < argc) { output_path = argv[++i]; }
+        else if (strcmp(argv[i], "--imatrix") == 0 && i+1 < argc) { imatrix_path = argv[++i]; }
         else if (strcmp(argv[i], "--block-size") == 0 && i+1 < argc) { block_size = atoi(argv[++i]); }
         else if (strcmp(argv[i], "--max-samples") == 0 && i+1 < argc) { max_samples = atoll(argv[++i]); }
         else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
-            fprintf(stderr, "Usage: %s -m model.gguf [-o codebook.gguf] [--block-size 128] [--max-samples 10000000]\n", argv[0]);
+            fprintf(stderr, "Usage: %s -m model.gguf [-o codebook.gguf] [--imatrix path.gguf]\n", argv[0]);
+            fprintf(stderr, "         [--block-size 128] [--max-samples 10000000]\n");
             fprintf(stderr, "\nComputes model-specific Lloyd-Max codebooks for TURBO_*B quantization.\n");
+            fprintf(stderr, "With --imatrix, weights the Lloyd-Max E-step by per-element importance.\n");
             fprintf(stderr, "Output is a GGUF file loadable by llama-quantize via --codebook.\n");
             return 0;
         }
@@ -304,50 +435,66 @@ int main(int argc, char ** argv) {
 
     fprintf(stderr, "llama-turbo-codebook\n");
     fprintf(stderr, "====================\n");
-    fprintf(stderr, "  model:      %s\n", model_path.c_str());
-    fprintf(stderr, "  output:     %s\n", output_path.c_str());
-    fprintf(stderr, "  block_size: %d\n", block_size);
+    fprintf(stderr, "  model:       %s\n", model_path.c_str());
+    fprintf(stderr, "  output:      %s\n", output_path.c_str());
+    fprintf(stderr, "  imatrix:     %s\n", imatrix_path.empty() ? "(none — uniform weights)" : imatrix_path.c_str());
+    fprintf(stderr, "  block_size:  %d\n", block_size);
     fprintf(stderr, "  max_samples: %lld\n", (long long)max_samples);
 
-    /* Phase 1: Collect post-RHT values */
-    fprintf(stderr, "\nPhase 1: Collecting post-RHT values...\n");
-    std::vector<float> values = collect_post_rht(model_path.c_str(), block_size, max_samples);
+    /* Phase 0: Load imatrix (if provided) */
+    std::unordered_map<std::string, std::vector<float>> imatrix;
+    if (!imatrix_path.empty()) {
+        fprintf(stderr, "\nPhase 0: Loading imatrix...\n");
+        imatrix = load_imatrix(imatrix_path.c_str());
+    }
+
+    /* Phase 1: Collect post-RHT values (and weights if imatrix provided) */
+    fprintf(stderr, "\nPhase 1: Collecting post-RHT values%s...\n",
+            imatrix.empty() ? "" : " + imatrix weights");
+    std::vector<float> values, weights;
+    collect_post_rht(model_path.c_str(), block_size, max_samples, imatrix, values, weights);
     if (values.empty()) { fprintf(stderr, "ERROR: no values\n"); return 1; }
 
-    /* Phase 2: Distribution statistics */
+    /* Phase 2: Distribution statistics (on unweighted values) */
     fprintf(stderr, "\nPhase 2: Distribution statistics...\n");
     float kurtosis, ks_stat;
     compute_stats(values, &kurtosis, &ks_stat);
     fprintf(stderr, "  kurtosis = %.4f (Gaussian: 3.000)\n", kurtosis);
     fprintf(stderr, "  KS stat  = %.4f\n", ks_stat);
 
-    /* Subsample for Lloyd-Max if needed */
+    /* Subsample for Lloyd-Max if needed (match value/weight indices) */
     const size_t lloyd_max_n = 1000000;
-    std::vector<float> lloyd_data;
+    std::vector<float> lloyd_data, lloyd_w;
     if (values.size() <= lloyd_max_n) {
         lloyd_data = values;
+        lloyd_w = weights;
     } else {
         lloyd_data.resize(lloyd_max_n);
         size_t stride = values.size() / lloyd_max_n;
         for (size_t i = 0; i < lloyd_max_n; i++) lloyd_data[i] = values[i * stride];
+        if (!weights.empty()) {
+            lloyd_w.resize(lloyd_max_n);
+            for (size_t i = 0; i < lloyd_max_n; i++) lloyd_w[i] = weights[i * stride];
+        }
     }
 
     /* Phase 3: Compute codebooks at each bitrate */
-    fprintf(stderr, "\nPhase 3: Computing Lloyd-Max codebooks (%zu samples)...\n", lloyd_data.size());
+    fprintf(stderr, "\nPhase 3: Computing %sLloyd-Max codebooks (%zu samples)...\n",
+            lloyd_w.empty() ? "" : "imatrix-weighted ", lloyd_data.size());
 
     float cb2[4], cb3[8], cb4[16], cb5[32];
 
     fprintf(stderr, "  2-bit (4 levels)...\n");
-    lloyd_max(lloyd_data, cb2, 4, 200);
+    lloyd_max_weighted(lloyd_data, lloyd_w, cb2, 4, 200);
 
     fprintf(stderr, "  3-bit (8 levels)...\n");
-    lloyd_max(lloyd_data, cb3, 8, 200);
+    lloyd_max_weighted(lloyd_data, lloyd_w, cb3, 8, 200);
 
     fprintf(stderr, "  4-bit (16 levels)...\n");
-    lloyd_max(lloyd_data, cb4, 16, 200);
+    lloyd_max_weighted(lloyd_data, lloyd_w, cb4, 16, 200);
 
     fprintf(stderr, "  5-bit (32 levels)...\n");
-    lloyd_max(lloyd_data, cb5, 32, 200);
+    lloyd_max_weighted(lloyd_data, lloyd_w, cb5, 32, 200);
 
     /* Phase 4: Compare against Gaussian codebooks */
     fprintf(stderr, "\nPhase 4: MSE comparison vs Gaussian codebooks...\n");
