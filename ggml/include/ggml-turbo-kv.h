@@ -82,9 +82,19 @@ float    turbo_kv_fp16_to_fp32(uint16_t h);
 uint16_t turbo_kv_fp32_to_fp16(float f);
 
 /* ============================================================
- * Lloyd-Max-Gaussian 16-entry codebook for N(0,1)
+ * Lloyd-Max codebooks (16 entries, symmetric, 4-bit)
+ *
+ * turbo_kv_4b_codebook: Lloyd-Max optimal for N(0,1) (Max 1960 tables).
+ *   Used by TURBO_KV_4B (KV cache), where the post-RHT distribution varies
+ *   by sequence and token — Gaussian is a safe static choice.
+ *
+ * turbo_4b_weight_codebook: Lloyd-Max optimal for empirical post-RHT weight
+ *   distribution (Qwen3.5-0.8B, 772M values). Kurtosis=2.96 (sub-Gaussian),
+ *   tails ~0.2 lighter than Gaussian. 5.26% MSE improvement over Gaussian
+ *   codebook on real weight data at d=128.
  * ============================================================ */
 extern const float turbo_kv_4b_codebook[16];
+extern const float turbo_4b_weight_codebook[16];
 
 /* ============================================================
  * Random Hadamard Transform (O(n log n) butterfly, in-place)
