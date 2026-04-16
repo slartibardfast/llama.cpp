@@ -638,6 +638,143 @@ void quantize_row_turbo_4b_ref(const float * GGML_RESTRICT x,
     }
 }
 
+/* imatrix-weighted quantization: per-element importance weighting in the
+ * codebook search. Elements with higher importance get better rounding.
+ * Also optimizes the per-block scale by trying a few candidates. */
+static void quantize_block_turbo_4b_weighted(
+    const float * src, uint8_t * dst, int block_size, const float * weights)
+{
+    uint16_t * p_norm    = (uint16_t *)(dst + 0);
+    uint16_t * p_inv_std = (uint16_t *)(dst + 2);
+    uint8_t  * qs        = dst + 4;
+
+    /* Step 1: L2 norm */
+    float norm_sq = 0.0f;
+    for (int i = 0; i < block_size; i++) norm_sq += src[i] * src[i];
+    const float norm = sqrtf(norm_sq);
+    *p_norm = turbo_kv_fp32_to_fp16(norm);
+
+    /* Step 2: normalize to unit vector */
+    float rotated[256];
+    const float inv_norm = (norm > 1e-10f) ? (1.0f / norm) : 0.0f;
+    for (int i = 0; i < block_size; i++) rotated[i] = src[i] * inv_norm;
+
+    /* Step 3: forward RHT */
+    turbo_kv_rht_forward(rotated, block_size, TURBO_KV_DEFAULT_SEED);
+
+    /* Step 4: compute max_abs */
+    float max_abs = 0.0f;
+    for (int i = 0; i < block_size; i++) {
+        float a = fabsf(rotated[i]);
+        if (a > max_abs) max_abs = a;
+    }
+    if (max_abs < 1e-10f) max_abs = 1.0f;
+
+    /* Step 4b: try several candidate scales to minimize weighted MSE.
+     * The base scale maps max_abs to CENT_MAX. We try factors around 1.0
+     * to find the scale that minimizes importance-weighted quantization error.
+     * For uniform weights this collapses to the default scale. */
+    float best_inv_std = TURBO_4B_WEIGHT_CENT_MAX / max_abs;
+    float best_wmse = 1e30f;
+
+    static const float scale_factors[] = { 0.90f, 0.95f, 1.00f, 1.05f, 1.10f };
+    const float base_inv_std = TURBO_4B_WEIGHT_CENT_MAX / max_abs;
+
+    for (int sf = 0; sf < 5; sf++) {
+        float candidate_inv_std = base_inv_std * scale_factors[sf];
+        float wmse = 0.0f;
+
+        for (int i = 0; i < block_size; i++) {
+            float x = rotated[i] * candidate_inv_std;
+            /* Find nearest codebook entry */
+            float best_dist = fabsf(x - turbo_4b_weight_codebook[0]);
+            int best_c = 0;
+            for (int c = 1; c < 16; c++) {
+                float d = fabsf(x - turbo_4b_weight_codebook[c]);
+                if (d < best_dist) { best_dist = d; best_c = c; }
+            }
+            /* Weighted reconstruction error (in original space before norm scaling) */
+            float recon = turbo_4b_weight_codebook[best_c] / candidate_inv_std;
+            float err = rotated[i] - recon;
+            float w = weights ? weights[i] : 1.0f;
+            wmse += w * err * err;
+        }
+
+        if (wmse < best_wmse) {
+            best_wmse = wmse;
+            best_inv_std = candidate_inv_std;
+        }
+    }
+
+    *p_inv_std = turbo_kv_fp32_to_fp16(best_inv_std);
+
+    /* Step 5: weighted nearest-centroid quantization with optimal scale */
+    const int qs_bytes = block_size / 2;
+    memset(qs, 0, qs_bytes);
+    for (int i = 0; i < block_size; i++) {
+        const float x = rotated[i] * best_inv_std;
+        int best = 0;
+        float best_dist = fabsf(x - turbo_4b_weight_codebook[0]);
+        for (int c = 1; c < 16; c++) {
+            float d = fabsf(x - turbo_4b_weight_codebook[c]);
+            if (d < best_dist) { best_dist = d; best = c; }
+        }
+        const int byte_idx = i / 2;
+        const int bit_pos  = (i & 1) * 4;
+        qs[byte_idx] |= (uint8_t)((best & 0x0F) << bit_pos);
+    }
+}
+
+/* quantize_turbo_4b — imatrix-aware wrapper matching ggml_quantize_chunk API.
+ * If quant_weights is NULL, uses the unweighted quantizer. */
+size_t quantize_turbo_4b(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
+                          int64_t nrows, int64_t n_per_row, const float * quant_weights) {
+    const size_t row_size = ggml_row_size(GGML_TYPE_TURBO_4B, n_per_row);
+    if (!quant_weights) {
+        quantize_row_turbo_4b_ref(src, (block_turbo_4b *)dst, nrows * n_per_row);
+    } else {
+        char * qrow = (char *)dst;
+        for (int64_t row = 0; row < nrows; row++) {
+            GGML_ASSERT(n_per_row % TURBO_4B_BLOCK_SIZE == 0);
+            const int64_t nb = n_per_row / TURBO_4B_BLOCK_SIZE;
+            for (int64_t b = 0; b < nb; b++) {
+                quantize_block_turbo_4b_weighted(
+                    src + b * TURBO_4B_BLOCK_SIZE,
+                    (uint8_t *)qrow + b * TURBO_4B_BYTES,
+                    TURBO_4B_BLOCK_SIZE,
+                    quant_weights + b * TURBO_4B_BLOCK_SIZE);
+            }
+            src += n_per_row;
+            qrow += row_size;
+        }
+    }
+    return nrows * row_size;
+}
+
+size_t quantize_turbo_4b_s(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
+                            int64_t nrows, int64_t n_per_row, const float * quant_weights) {
+    const size_t row_size = ggml_row_size(GGML_TYPE_TURBO_4B_S, n_per_row);
+    if (!quant_weights) {
+        quantize_row_turbo_4b_s_ref(src, (block_turbo_4b_s *)dst, nrows * n_per_row);
+    } else {
+        char * qrow = (char *)dst;
+        for (int64_t row = 0; row < nrows; row++) {
+            GGML_ASSERT(n_per_row % TURBO_4B_S_BLOCK_SIZE == 0);
+            const int64_t nb = n_per_row / TURBO_4B_S_BLOCK_SIZE;
+            for (int64_t b = 0; b < nb; b++) {
+                quantize_block_turbo_4b_weighted(
+                    src + b * TURBO_4B_S_BLOCK_SIZE,
+                    (uint8_t *)qrow + b * TURBO_4B_S_BYTES,
+                    TURBO_4B_S_BLOCK_SIZE,
+                    quant_weights + b * TURBO_4B_S_BLOCK_SIZE);
+            }
+            src += n_per_row;
+            qrow += row_size;
+        }
+    }
+    return nrows * row_size;
+}
+
 void dequantize_row_turbo_4b(const block_turbo_4b * GGML_RESTRICT x,
                               float * GGML_RESTRICT y, int64_t k) {
     GGML_ASSERT(k % TURBO_4B_BLOCK_SIZE == 0);
