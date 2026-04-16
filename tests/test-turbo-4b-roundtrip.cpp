@@ -400,11 +400,99 @@ static bool test_vec_dot() {
 }
 
 /* ================================================================
+ * Test 10: Full bitrate ladder roundtrip (2B/3B/5B)
+ * ================================================================ */
+static bool test_bitrate_ladder() {
+    fprintf(stderr, "\n=== Test 10: Full bitrate ladder roundtrip ===\n");
+    bool all_pass = true;
+    const int dim = 256; /* 2 blocks of 128 */
+
+    std::vector<float> input(dim), output(dim);
+    uint32_t seed = 55555;
+    for (int i = 0; i < dim; i++) input[i] = det_gauss(&seed);
+
+    /* 2-bit */
+    {
+        std::vector<block_turbo_2b> blk(dim / TURBO_2B_BLOCK_SIZE);
+        quantize_row_turbo_2b_ref(input.data(), blk.data(), dim);
+        dequantize_row_turbo_2b(blk.data(), output.data(), dim);
+        float rmse = vec_rmse(input.data(), output.data(), dim);
+        float norm = vec_norm(input.data(), dim);
+        float rel = rmse / fmaxf(norm / sqrtf((float)dim), 1e-10f);
+        bool pass = rel < 0.60f; /* 2-bit is coarse — 4 levels */
+        fprintf(stderr, "  2-bit: RMSE=%.4f rel=%.4f | %s\n", rmse, rel, pass ? "PASS" : "FAIL");
+        all_pass &= pass;
+
+        /* vec_dot */
+        std::vector<float> act(dim), dq(dim);
+        for (int i = 0; i < dim; i++) act[i] = det_gauss(&seed);
+        dequantize_row_turbo_2b(blk.data(), dq.data(), dim);
+        float ref_d = vec_dot(dq.data(), act.data(), dim);
+        float vd = 0;
+        ggml_vec_dot_turbo_2b_f32(dim, &vd, 0, blk.data(), 0, act.data(), 0, 1);
+        float err = fabsf(ref_d - vd) / fmaxf(fabsf(ref_d), 1e-10f);
+        bool vpass = err < 1e-4f;
+        fprintf(stderr, "  2-bit vec_dot: err=%.2e | %s\n", err, vpass ? "PASS" : "FAIL");
+        all_pass &= vpass;
+    }
+
+    /* 3-bit */
+    {
+        std::vector<block_turbo_3b> blk(dim / TURBO_3B_BLOCK_SIZE);
+        quantize_row_turbo_3b_ref(input.data(), blk.data(), dim);
+        dequantize_row_turbo_3b(blk.data(), output.data(), dim);
+        float rmse = vec_rmse(input.data(), output.data(), dim);
+        float norm = vec_norm(input.data(), dim);
+        float rel = rmse / fmaxf(norm / sqrtf((float)dim), 1e-10f);
+        bool pass = rel < 0.25f; /* 3-bit — 8 levels */
+        fprintf(stderr, "  3-bit: RMSE=%.4f rel=%.4f | %s\n", rmse, rel, pass ? "PASS" : "FAIL");
+        all_pass &= pass;
+
+        std::vector<float> act(dim), dq(dim);
+        for (int i = 0; i < dim; i++) act[i] = det_gauss(&seed);
+        dequantize_row_turbo_3b(blk.data(), dq.data(), dim);
+        float ref_d = vec_dot(dq.data(), act.data(), dim);
+        float vd = 0;
+        ggml_vec_dot_turbo_3b_f32(dim, &vd, 0, blk.data(), 0, act.data(), 0, 1);
+        float err = fabsf(ref_d - vd) / fmaxf(fabsf(ref_d), 1e-10f);
+        bool vpass = err < 1e-4f;
+        fprintf(stderr, "  3-bit vec_dot: err=%.2e | %s\n", err, vpass ? "PASS" : "FAIL");
+        all_pass &= vpass;
+    }
+
+    /* 5-bit */
+    {
+        std::vector<block_turbo_5b> blk(dim / TURBO_5B_BLOCK_SIZE);
+        quantize_row_turbo_5b_ref(input.data(), blk.data(), dim);
+        dequantize_row_turbo_5b(blk.data(), output.data(), dim);
+        float rmse = vec_rmse(input.data(), output.data(), dim);
+        float norm = vec_norm(input.data(), dim);
+        float rel = rmse / fmaxf(norm / sqrtf((float)dim), 1e-10f);
+        bool pass = rel < 0.06f; /* 5-bit should be very good */
+        fprintf(stderr, "  5-bit: RMSE=%.4f rel=%.4f | %s\n", rmse, rel, pass ? "PASS" : "FAIL");
+        all_pass &= pass;
+
+        std::vector<float> act(dim), dq(dim);
+        for (int i = 0; i < dim; i++) act[i] = det_gauss(&seed);
+        dequantize_row_turbo_5b(blk.data(), dq.data(), dim);
+        float ref_d = vec_dot(dq.data(), act.data(), dim);
+        float vd = 0;
+        ggml_vec_dot_turbo_5b_f32(dim, &vd, 0, blk.data(), 0, act.data(), 0, 1);
+        float err = fabsf(ref_d - vd) / fmaxf(fabsf(ref_d), 1e-10f);
+        bool vpass = err < 1e-4f;
+        fprintf(stderr, "  5-bit vec_dot: err=%.2e | %s\n", err, vpass ? "PASS" : "FAIL");
+        all_pass &= vpass;
+    }
+
+    return all_pass;
+}
+
+/* ================================================================
  * Main
  * ================================================================ */
 int main() {
-    fprintf(stderr, "TURBO_4B Weight Quantization — Roundtrip Tests\n");
-    fprintf(stderr, "================================================\n");
+    fprintf(stderr, "TURBO Weight Quantization — Full Bitrate Ladder Tests\n");
+    fprintf(stderr, "=====================================================\n");
 
     int pass = 0, fail = 0;
 
@@ -427,6 +515,9 @@ int main() {
 
     /* Test 9 requires vec_dot implementation */
     run(test_vec_dot,            "vec_dot");
+
+    /* Test 10: full bitrate ladder (2B/3B/5B) */
+    run(test_bitrate_ladder,     "bitrate_ladder");
 
     fprintf(stderr, "\n================================================\n");
     fprintf(stderr, "Results: %d passed, %d failed\n", pass, fail);
