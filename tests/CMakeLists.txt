@@ -277,6 +277,9 @@ target_link_libraries(test-turbo-4b-roundtrip PRIVATE ggml-base)
 add_executable(test-turbo-4b-codebook test-turbo-4b-codebook.cpp)
 target_link_libraries(test-turbo-4b-codebook PRIVATE ggml-base ggml)
 
+add_executable(test-turbo-4b-e8p test-turbo-4b-e8p.cpp)
+target_link_libraries(test-turbo-4b-e8p PRIVATE ggml-base)
+
 add_executable(test-split-k-attention test-split-k-attention.cpp)
 
 add_executable(test-split-k-graph test-split-k-graph.cpp)

@@ -208,6 +208,7 @@ add_library(ggml-base
             ggml-quants.h
             ggml-turbo-quant.c
             ggml-turbo-kv.c
+            ggml-turbo-e8p.c
             gguf.cpp)
 
 # ggml-turbo-quant.c hosts the Hamming-attention inner loop for the

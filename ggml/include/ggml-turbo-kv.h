@@ -215,6 +215,18 @@ void dequantize_row_turbo_4b    (const block_turbo_4b   * GGML_RESTRICT x, float
 void quantize_row_turbo_4b_s_ref(const float * GGML_RESTRICT x, block_turbo_4b_s * GGML_RESTRICT y, int64_t k);
 void dequantize_row_turbo_4b_s  (const block_turbo_4b_s * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 
+/* ============================================================
+ * E8P lattice vector quantizer (8D, 256-entry D8-hat codebook)
+ *
+ * At 4 bpw: RVQ with two 16-bit E8P codes per group of 8 elements.
+ * 32 bits per group × 16 groups = 64 bytes = same qs[64] storage.
+ * ============================================================ */
+void     e8p_decode_16bit(uint16_t code, float * out);
+uint16_t e8p_encode_16bit(const float * x);
+void     e8p_decode_rvq4bit(uint32_t code, float * out);
+uint32_t e8p_encode_rvq4bit(const float * x);
+uint32_t e8p_encode_rvq4bit_weighted(const float * x, const float * weights);
+
 /* imatrix-aware quantization wrappers (ggml_quantize_chunk API) */
 size_t quantize_turbo_4b  (const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
                             int64_t nrows, int64_t n_per_row, const float * quant_weights);
