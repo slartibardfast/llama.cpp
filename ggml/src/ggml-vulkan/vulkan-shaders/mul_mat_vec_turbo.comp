@@ -1,0 +1,138 @@
+// mul_mat_vec_turbo.comp — Fused RHT-space mul_mat_vec for TURBO_*B weight types
+//
+// Compile with: -DBITS=2|3|4|5 -DSUBGROUP_SIZE=32|64
+//
+// Each workgroup computes one output element (one row of weight matrix
+// dotted with the activation vector). The activation is pre-rotated via
+// forward RHT in registers, then dotted with the quantized weight blocks
+// directly in RHT space — no inverse FWHT per block.
+//
+// Layout: one subgroup per workgroup. Iterates over 128-element blocks
+// in the row sequentially.
+
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+#include "turbo_rht.glsl"
+
+#define BLOCK_ELEMS 128
+#define HEADER_BYTES 4
+#define DATA_BYTES (BLOCK_ELEMS * BITS / 8)
+#define BLOCK_BYTES (HEADER_BYTES + DATA_BYTES)
+
+// Push constants matching vk_mat_vec_push_constants from ggml-vulkan.cpp
+layout (push_constant) uniform parameter {
+    uint ncols;          // K (row width = ne00)
+    uint stride_a;       // row stride for A in elements (ne00)
+    uint stride_b;       // row stride for B in elements (ne10)
+    uint stride_d;       // row stride for D in elements (ne0)
+    uint batch_stride_a; // batch stride A
+    uint batch_stride_b; // batch stride B
+    uint batch_stride_d; // batch stride D
+    uint fusion_flags;
+    uint base_work_group_y;
+    uint ne02;
+    uint ne12;
+    uint broadcast2;
+    uint broadcast3;
+} p;
+
+layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer A { uint8_t data_a[]; };  // quantized weights
+layout (binding = 1) readonly buffer B { float   data_b[]; };  // f32 activation
+layout (binding = 2) writeonly buffer D { float   data_d[]; }; // f32 output
+
+void main() {
+    const uint tid = gl_SubgroupInvocationID;
+
+    // Row index — standard DMMV dispatch puts row in workgroup Y
+    const uint row = gl_WorkGroupID.y + p.base_work_group_y;
+
+    // Batch index
+    const uint batch_idx = gl_WorkGroupID.z;
+
+    // Byte offset to the start of this weight row
+    // stride_a is in elements, but our blocks are byte-addressed
+    const uint a_offset = row * (p.ncols / BLOCK_ELEMS) * BLOCK_BYTES
+                        + batch_idx * p.batch_stride_a;
+    // Element offset into activation vector
+    const uint b_offset_elems = batch_idx * p.batch_stride_b;
+    // Output index
+    const uint d_idx = row + batch_idx * p.batch_stride_d;
+
+    const uint n_blocks = p.ncols / BLOCK_ELEMS;
+    float row_acc = 0.0;
+
+    for (uint blk = 0; blk < n_blocks; blk++) {
+        const uint elem_base = blk * BLOCK_ELEMS;
+        const uint blk_byte_offset = a_offset + blk * BLOCK_BYTES;
+
+        // Read block header
+        uint16_t norm_bits    = uint16_t(data_a[blk_byte_offset + 0]) | (uint16_t(data_a[blk_byte_offset + 1]) << 8);
+        uint16_t inv_std_bits = uint16_t(data_a[blk_byte_offset + 2]) | (uint16_t(data_a[blk_byte_offset + 3]) << 8);
+        float norm    = turbo_fp16_to_f32(norm_bits);
+        float inv_std = turbo_fp16_to_f32(inv_std_bits);
+        float rcp_inv_std = 1.0 / max(inv_std, 1e-10);
+
+        const uint qs_offset = blk_byte_offset + HEADER_BYTES;
+
+#if SUBGROUP_SIZE >= 64
+        // Wave64: each thread handles 2 elements [tid, tid+64]
+
+        // Load activation and forward-RHT it (fused — no separate dispatch needed)
+        float act0 = data_b[b_offset_elems + elem_base + tid];
+        float act1 = data_b[b_offset_elems + elem_base + tid + 64u];
+        turbo_forward_rht(act0, act1, tid);
+
+        // Unpack weight codebook indices
+        uvec2 a0 = turbo_bit_address(tid);
+        uvec2 a1 = turbo_bit_address(tid + 64u);
+        float w0 = turbo_codebook_lookup(turbo_unpack_2bytes(uint(data_a[qs_offset + a0.x]), uint(data_a[qs_offset + a0.x + 1u]), a0.y)) * rcp_inv_std;
+        float w1 = turbo_codebook_lookup(turbo_unpack_2bytes(uint(data_a[qs_offset + a1.x]), uint(data_a[qs_offset + a1.x + 1u]), a1.y)) * rcp_inv_std;
+
+        // Dot in RHT space: <w_rot, RHT(activation)>
+        float local_dot = w0 * act0 + w1 * act1;
+        float block_dot = subgroupAdd(local_dot);
+
+        row_acc += block_dot * norm;
+
+#else
+        // Wave32: each thread handles 4 elements [tid, tid+32, tid+64, tid+96]
+
+        float act0 = data_b[b_offset_elems + elem_base + tid];
+        float act1 = data_b[b_offset_elems + elem_base + tid + 32u];
+        float act2 = data_b[b_offset_elems + elem_base + tid + 64u];
+        float act3 = data_b[b_offset_elems + elem_base + tid + 96u];
+        turbo_forward_rht(act0, act1, act2, act3, tid);
+
+        uvec2 a0 = turbo_bit_address(tid);
+        uvec2 a1 = turbo_bit_address(tid + 32u);
+        uvec2 a2 = turbo_bit_address(tid + 64u);
+        uvec2 a3 = turbo_bit_address(tid + 96u);
+        float w0 = turbo_codebook_lookup(turbo_unpack_2bytes(uint(data_a[qs_offset + a0.x]), uint(data_a[qs_offset + a0.x + 1u]), a0.y)) * rcp_inv_std;
+        float w1 = turbo_codebook_lookup(turbo_unpack_2bytes(uint(data_a[qs_offset + a1.x]), uint(data_a[qs_offset + a1.x + 1u]), a1.y)) * rcp_inv_std;
+        float w2 = turbo_codebook_lookup(turbo_unpack_2bytes(uint(data_a[qs_offset + a2.x]), uint(data_a[qs_offset + a2.x + 1u]), a2.y)) * rcp_inv_std;
+        float w3 = turbo_codebook_lookup(turbo_unpack_2bytes(uint(data_a[qs_offset + a3.x]), uint(data_a[qs_offset + a3.x + 1u]), a3.y)) * rcp_inv_std;
+
+        float local_dot = w0 * act0 + w1 * act1 + w2 * act2 + w3 * act3;
+        float block_dot = subgroupAdd(local_dot);
+
+        row_acc += block_dot * norm;
+#endif
+    }
+
+    // Thread 0 writes the output
+    if (tid == 0u) {
+        data_d[d_idx] = row_acc;
+    }
+}

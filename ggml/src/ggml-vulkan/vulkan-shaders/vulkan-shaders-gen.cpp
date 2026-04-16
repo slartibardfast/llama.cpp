@@ -848,6 +848,18 @@ void process_shaders() {
             {{"BITS", bits_str}, {"SUBGROUP_SIZE", "32"}});
     }
 
+    // TURBO_*B fused mul_mat_vec — dot in RHT space, no inverse FWHT per block.
+    for (int bits : {2, 3, 4, 5}) {
+        std::string suffix = std::to_string(bits) + "b";
+        std::string bits_str = std::to_string(bits);
+        string_to_spv("mul_mat_vec_turbo_" + suffix,
+            "mul_mat_vec_turbo.comp",
+            {{"BITS", bits_str}, {"SUBGROUP_SIZE", "64"}});
+        string_to_spv("mul_mat_vec_turbo_" + suffix + "_w32",
+            "mul_mat_vec_turbo.comp",
+            {{"BITS", bits_str}, {"SUBGROUP_SIZE", "32"}});
+    }
+
     auto get_type_str = [](bool f16) {
         return f16 ? "float16_t" : "float";
     };

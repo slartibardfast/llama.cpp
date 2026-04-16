@@ -4310,6 +4310,29 @@ static void ggml_vk_load_shaders(vk_device& device) {
         TURBO_DEQUANT_PIPELINE(GGML_TYPE_TURBO_5B, dequant_turbo_5b, dequant_turbo_5b_w32)
 
 #undef TURBO_DEQUANT_PIPELINE
+
+        // TURBO mul_mat_vec: fused RHT-space dot, one row per workgroup.
+        // Registered in pipeline_dequant_mul_mat_vec_f32_f32[0][type][0]
+        // (workgroup size index 0, 1 output column).
+#define TURBO_MMV_PIPELINE(TYPE, name_w64, name_w32) \
+        for (uint32_t col = 0; col < mul_mat_vec_max_cols; col++) { \
+            if (ss >= 64) { \
+                ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[0][TYPE][col], \
+                    #name_w64, name_w64##_len, name_w64##_data, \
+                    "main", 3, sizeof(vk_mat_vec_push_constants), {1, 1, 1}, {ss, 1, col+1}, 1, false, true, ss); \
+            } else { \
+                ggml_vk_create_pipeline(device, device->pipeline_dequant_mul_mat_vec_f32_f32[0][TYPE][col], \
+                    #name_w32, name_w32##_len, name_w32##_data, \
+                    "main", 3, sizeof(vk_mat_vec_push_constants), {1, 1, 1}, {ss, 1, col+1}, 1, false, true, ss); \
+            } \
+        }
+
+        TURBO_MMV_PIPELINE(GGML_TYPE_TURBO_2B, mul_mat_vec_turbo_2b, mul_mat_vec_turbo_2b_w32)
+        TURBO_MMV_PIPELINE(GGML_TYPE_TURBO_3B, mul_mat_vec_turbo_3b, mul_mat_vec_turbo_3b_w32)
+        TURBO_MMV_PIPELINE(GGML_TYPE_TURBO_4B, mul_mat_vec_turbo_4b, mul_mat_vec_turbo_4b_w32)
+        TURBO_MMV_PIPELINE(GGML_TYPE_TURBO_5B, mul_mat_vec_turbo_5b, mul_mat_vec_turbo_5b_w32)
+
+#undef TURBO_MMV_PIPELINE
     }
 
     // get_rows
@@ -6309,6 +6332,10 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec(ggml_backend_vk_context * 
         case GGML_TYPE_IQ4_XS:
         case GGML_TYPE_IQ4_NL:
         case GGML_TYPE_MXFP4:
+        case GGML_TYPE_TURBO_2B:
+        case GGML_TYPE_TURBO_3B:
+        case GGML_TYPE_TURBO_4B:
+        case GGML_TYPE_TURBO_5B:
             break;
         default:
             return nullptr;
@@ -6316,7 +6343,10 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec(ggml_backend_vk_context * 
 
     // heuristic to choose workgroup size
     uint32_t dmmv_wg = DMMV_WG_SIZE_SUBGROUP;
-    if ((ctx->device->vendor_id == VK_VENDOR_ID_NVIDIA && ctx->device->architecture != vk_device_architecture::NVIDIA_PRE_TURING) || ctx->device->vendor_id == VK_VENDOR_ID_INTEL) {
+    // TURBO types use subgroup-cooperative FWHT — only registered at DMMV_WG_SIZE_SUBGROUP
+    const bool turbo_type = (a_type == GGML_TYPE_TURBO_2B || a_type == GGML_TYPE_TURBO_3B ||
+                             a_type == GGML_TYPE_TURBO_4B || a_type == GGML_TYPE_TURBO_5B);
+    if (!turbo_type && ((ctx->device->vendor_id == VK_VENDOR_ID_NVIDIA && ctx->device->architecture != vk_device_architecture::NVIDIA_PRE_TURING) || ctx->device->vendor_id == VK_VENDOR_ID_INTEL)) {
         // Prefer larger workgroups when M is small, to spread the work out more
         // and keep more SMs busy.
         // q6_k seems to prefer small workgroup size even for "medium" values of M.
@@ -6487,7 +6517,10 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec_id(ggml_backend_vk_context
 
     // heuristic to choose workgroup size
     uint32_t dmmv_wg = DMMV_WG_SIZE_SUBGROUP;
-    if ((ctx->device->vendor_id == VK_VENDOR_ID_NVIDIA && ctx->device->architecture != vk_device_architecture::NVIDIA_PRE_TURING) || ctx->device->vendor_id == VK_VENDOR_ID_INTEL) {
+    // TURBO types use subgroup-cooperative FWHT — only registered at DMMV_WG_SIZE_SUBGROUP
+    const bool turbo_type = (a_type == GGML_TYPE_TURBO_2B || a_type == GGML_TYPE_TURBO_3B ||
+                             a_type == GGML_TYPE_TURBO_4B || a_type == GGML_TYPE_TURBO_5B);
+    if (!turbo_type && ((ctx->device->vendor_id == VK_VENDOR_ID_NVIDIA && ctx->device->architecture != vk_device_architecture::NVIDIA_PRE_TURING) || ctx->device->vendor_id == VK_VENDOR_ID_INTEL)) {
         // Prefer larger workgroups when M is small, to spread the work out more
         // and keep more SMs busy.
         // q6_k seems to prefer small workgroup size even for "medium" values of M.
@@ -15541,6 +15574,14 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     case GGML_TYPE_IQ4_XS:
                     case GGML_TYPE_IQ4_NL:
                     case GGML_TYPE_MXFP4:
+                        break;
+                    case GGML_TYPE_TURBO_2B:
+                    case GGML_TYPE_TURBO_3B:
+                    case GGML_TYPE_TURBO_4B:
+                    case GGML_TYPE_TURBO_5B:
+                        if (!(device->subgroup_shuffle && device->subgroup_arithmetic)) {
+                            return false;
+                        }
                         break;
                     default:
                         return false;
