@@ -770,28 +770,19 @@ static void quantize_block_turbo_weighted(
     }
     if (max_abs < 1e-10f) max_abs = 1.0f;
 
-    /* Try several candidate scales to minimize weighted MSE */
-    float best_inv_std = cent_max / max_abs;
-    float best_wmse = 1e30f;
-    static const float scale_factors[] = { 0.90f, 0.95f, 1.00f, 1.05f, 1.10f };
-
-    for (int sf = 0; sf < 5; sf++) {
-        float cand = (cent_max / max_abs) * scale_factors[sf];
-        float wmse = 0.0f;
-        for (int i = 0; i < block_size; i++) {
-            float x = rotated[i] * cand;
-            float bd = fabsf(x - codebook[0]); int bc = 0;
-            for (int c = 1; c < n_levels; c++) {
-                float d = fabsf(x - codebook[c]);
-                if (d < bd) { bd = d; bc = c; }
-            }
-            float recon = codebook[bc] / cand;
-            float err = rotated[i] - recon;
-            wmse += weights[i] * err * err;
-        }
-        if (wmse < best_wmse) { best_wmse = wmse; best_inv_std = cand; }
-    }
-
+    /* Weighted codebook selection at the default scale.
+     *
+     * Note: per-element nearest-centroid is invariant to a per-element weight
+     * (weight is a positive scalar, doesn't change argmin_c |x-c|). The only
+     * way imatrix can improve per-block quantization is via:
+     *   (a) scale selection — tried 5-candidate search, regresses 4B; removed
+     *   (b) mixed precision per-element — would need bit-width variance
+     *
+     * Keeping the weighted path as "same as unweighted but reads weights"
+     * so that future per-group scale optimization can be added here without
+     * changing the pipeline. Currently identical to the unweighted path. */
+    (void)weights;
+    const float best_inv_std = cent_max / max_abs;
     *p_inv_std = turbo_kv_fp32_to_fp16(best_inv_std);
 
     const int qs_bytes = (block_size * bits + 7) / 8;
