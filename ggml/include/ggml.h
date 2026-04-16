@@ -478,7 +478,10 @@ extern "C" {
         GGML_FTYPE_MOSTLY_MXFP4   = 25, // except 1d tensors
         GGML_FTYPE_MOSTLY_NVFP4   = 26, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q1_0    = 27, // except 1d tensors
-        GGML_FTYPE_MOSTLY_TURBO_4B = 28, // except 1d tensors
+        GGML_FTYPE_MOSTLY_TURBO_2B = 28, // except 1d tensors
+        GGML_FTYPE_MOSTLY_TURBO_3B = 29, // except 1d tensors
+        GGML_FTYPE_MOSTLY_TURBO_4B = 30, // except 1d tensors
+        GGML_FTYPE_MOSTLY_TURBO_5B = 31, // except 1d tensors
     };
 
     // available tensor operations:

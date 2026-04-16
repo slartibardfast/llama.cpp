@@ -829,6 +829,12 @@ ggml_type llama_ftype_get_default_type(llama_ftype ftype) {
         case LLAMA_FTYPE_MOSTLY_IQ3_S:
         case LLAMA_FTYPE_MOSTLY_IQ3_M:   return GGML_TYPE_IQ3_S;
 
+        // TURBO types (RHT + Lloyd-Max)
+        case LLAMA_FTYPE_MOSTLY_TURBO_2B: return GGML_TYPE_TURBO_2B;
+        case LLAMA_FTYPE_MOSTLY_TURBO_3B: return GGML_TYPE_TURBO_3B;
+        case LLAMA_FTYPE_MOSTLY_TURBO_4B: return GGML_TYPE_TURBO_4B;
+        case LLAMA_FTYPE_MOSTLY_TURBO_5B: return GGML_TYPE_TURBO_5B;
+
         default: return GGML_TYPE_COUNT;
     }
 }

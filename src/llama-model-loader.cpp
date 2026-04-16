@@ -69,6 +69,10 @@ static std::string llama_model_ftype_name(llama_ftype ftype) {
         case LLAMA_FTYPE_MOSTLY_IQ4_XS:   return "IQ4_XS - 4.25 bpw";
         case LLAMA_FTYPE_MOSTLY_IQ3_S:    return "IQ3_S - 3.4375 bpw";
         case LLAMA_FTYPE_MOSTLY_IQ3_M:    return "IQ3_S mix - 3.66 bpw";
+        case LLAMA_FTYPE_MOSTLY_TURBO_2B: return "TURBO_2B - 2.25 bpw";
+        case LLAMA_FTYPE_MOSTLY_TURBO_3B: return "TURBO_3B - 3.25 bpw";
+        case LLAMA_FTYPE_MOSTLY_TURBO_4B: return "TURBO_4B - 4.25 bpw";
+        case LLAMA_FTYPE_MOSTLY_TURBO_5B: return "TURBO_5B - 5.25 bpw";
 
         default: return "unknown, may not work";
     }
@@ -761,6 +765,10 @@ llama_model_loader::llama_model_loader(
             case GGML_TYPE_IQ3_S:   ftype = LLAMA_FTYPE_MOSTLY_IQ3_S;   break;
             case GGML_TYPE_NVFP4:   ftype = LLAMA_FTYPE_MOSTLY_NVFP4;   break;
             case GGML_TYPE_Q1_0:    ftype = LLAMA_FTYPE_MOSTLY_Q1_0;    break;
+            case GGML_TYPE_TURBO_2B: ftype = LLAMA_FTYPE_MOSTLY_TURBO_2B; break;
+            case GGML_TYPE_TURBO_3B: ftype = LLAMA_FTYPE_MOSTLY_TURBO_3B; break;
+            case GGML_TYPE_TURBO_4B: ftype = LLAMA_FTYPE_MOSTLY_TURBO_4B; break;
+            case GGML_TYPE_TURBO_5B: ftype = LLAMA_FTYPE_MOSTLY_TURBO_5B; break;
             default:
                 {
                     LLAMA_LOG_WARN("%s: unknown type %s\n", __func__, ggml_type_name(type_max));

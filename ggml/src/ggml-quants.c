@@ -5480,6 +5480,21 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
         case GGML_TYPE_I64:
             // nothing to validate
             break;
+        case GGML_TYPE_TURBO_2B:
+        case GGML_TYPE_TURBO_3B:
+        case GGML_TYPE_TURBO_4B:
+        case GGML_TYPE_TURBO_4B_S:
+        case GGML_TYPE_TURBO_5B:
+            {
+                /* Validate fp16 norm and inv_std in each block header.
+                 * Block layout: [norm:2][inv_std:2][qs[...]] */
+                const uint8_t * b = (const uint8_t *) data;
+                const size_t bs = ggml_type_size(type);
+                for (size_t i = 0; i < nb; ++i) {
+                    if (!validate_fp16(*(const ggml_fp16_t *)(b + i*bs + 0), i)) return false;
+                    if (!validate_fp16(*(const ggml_fp16_t *)(b + i*bs + 2), i)) return false;
+                }
+            } break;
         default:
             {
                 fprintf(stderr, "%s: invalid type %d\n", __func__, type);
