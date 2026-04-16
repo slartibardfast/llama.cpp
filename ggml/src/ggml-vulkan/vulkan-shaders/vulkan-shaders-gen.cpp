@@ -835,6 +835,19 @@ void process_shaders() {
     string_to_spv("set_rows_turbo_kv_4b_f32_i32", "set_rows_turbo_kv_4b.comp", {{"A_TYPE", "float"}, {"B_TYPE", "uint"},  {"B_SIZE", "32"}, {"D_TYPE", "uint8_t"}});
     string_to_spv("set_rows_turbo_kv_4b_f32_i64", "set_rows_turbo_kv_4b.comp", {{"A_TYPE", "float"}, {"B_TYPE", "uvec2"}, {"B_SIZE", "64"}, {"D_TYPE", "uint8_t"}});
 
+    // TURBO_*B weight dequant shaders — parametric by BITS, shared turbo_rht.glsl core.
+    // Each bitrate gets its own SPV compiled from the same dequant_turbo.comp template.
+    for (int bits : {2, 3, 4, 5}) {
+        std::string suffix = std::to_string(bits) + "b";
+        std::string bits_str = std::to_string(bits);
+        string_to_spv("dequant_turbo_" + suffix,
+            "dequant_turbo.comp",
+            {{"BITS", bits_str}, {"SUBGROUP_SIZE", "64"}});
+        string_to_spv("dequant_turbo_" + suffix + "_w32",
+            "dequant_turbo.comp",
+            {{"BITS", bits_str}, {"SUBGROUP_SIZE", "32"}});
+    }
+
     auto get_type_str = [](bool f16) {
         return f16 ? "float16_t" : "float";
     };

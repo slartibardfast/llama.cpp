@@ -50,16 +50,24 @@ float turbo_sign(uint idx) {
 // Reads BITS-wide index at element position i from packed byte array.
 // BITS must be defined as a specialization constant or compile define.
 
-uint turbo_unpack(const uint8_t qs[], uint i) {
-    uint bit_offset = i * BITS;
-    uint byte_idx   = bit_offset >> 3;
-    uint bit_shift  = bit_offset & 7u;
-    uint mask       = (1u << BITS) - 1u;
-    uint val = uint(qs[byte_idx]) >> bit_shift;
+// Generic bit-stream unpacking.
+// Caller provides two bytes straddling the target index.
+// For use: read byte0 = buf[byte_idx], byte1 = buf[byte_idx+1],
+// then call turbo_unpack_2bytes(byte0, byte1, bit_shift).
+uint turbo_unpack_2bytes(uint byte0, uint byte1, uint bit_shift) {
+    uint mask = (1u << BITS) - 1u;
+    uint val = byte0 >> bit_shift;
     if (bit_shift + BITS > 8u) {
-        val |= uint(qs[byte_idx + 1u]) << (8u - bit_shift);
+        val |= byte1 << (8u - bit_shift);
     }
     return val & mask;
+}
+
+// Convenience: compute byte index and shift from element index.
+// Returns: x = byte_idx_relative, y = bit_shift
+uvec2 turbo_bit_address(uint elem_idx) {
+    uint bit_offset = elem_idx * BITS;
+    return uvec2(bit_offset >> 3, bit_offset & 7u);
 }
 
 // ---- Codebook lookup (selects table based on BITS) ----
