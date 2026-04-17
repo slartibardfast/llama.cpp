@@ -454,6 +454,13 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
                      ftype == LLAMA_FTYPE_MOSTLY_IQ1_M) {
                 new_type = GGML_TYPE_Q5_K;
             }
+            else if (ftype == LLAMA_FTYPE_MOSTLY_TURBO_2B || ftype == LLAMA_FTYPE_MOSTLY_TURBO_3B ||
+                     ftype == LLAMA_FTYPE_MOSTLY_TURBO_4B || ftype == LLAMA_FTYPE_MOSTLY_TURBO_5B) {
+                // TURBO_*B: output tensor is always outlier-sensitive (Unsloth-style).
+                // Q6_K is the standard high-precision fallback used across llama.cpp
+                // mixes; the small extra bpw cost is well worth the PPL gain.
+                new_type = GGML_TYPE_Q6_K;
+            }
             else if (new_type != GGML_TYPE_Q8_0) {
                 new_type = GGML_TYPE_Q6_K;
             }
@@ -482,6 +489,14 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
             }
             else if (ftype == LLAMA_FTYPE_MOSTLY_TQ1_0 || ftype == LLAMA_FTYPE_MOSTLY_TQ2_0) {
                 new_type = GGML_TYPE_Q4_K;
+            }
+            else if (ftype == LLAMA_FTYPE_MOSTLY_TURBO_2B || ftype == LLAMA_FTYPE_MOSTLY_TURBO_3B) {
+                // Token embedding is highly sensitive at low bitrates — promote
+                // directly to a robust quant instead of bumping within TURBO.
+                new_type = GGML_TYPE_Q6_K;
+            }
+            else if (ftype == LLAMA_FTYPE_MOSTLY_TURBO_4B) {
+                new_type = GGML_TYPE_Q6_K;
             }
         }
     } else if (ftype == LLAMA_FTYPE_MOSTLY_IQ2_XXS || ftype == LLAMA_FTYPE_MOSTLY_IQ2_XS || ftype == LLAMA_FTYPE_MOSTLY_IQ1_S ||
@@ -652,6 +667,61 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
             new_type = GGML_TYPE_IQ3_XXS;
         }
         ++qs.i_ffn_up;
+    }
+
+    // Unsloth-style outlier protection for TURBO_*B (applied on top of the
+    // category-specific logic above). Sensitive tensors (attention projections,
+    // first/last FFN_DOWN layers) are promoted within the TURBO family so that
+    // bulk weights stay at the requested bitrate while critical paths retain
+    // extra precision. Output and token_embedding are handled separately (above)
+    // via Q6_K — the standard llama.cpp pattern for outlier-sensitive heads.
+    //
+    // Layer selection follows the same rule as use_more_bits(): first 12.5% +
+    // last 12.5% + every 3rd in the middle. Layer index is parsed from the
+    // tensor name (blk.N.*) to avoid off-by-one issues with the stateful
+    // qs counters.
+    const bool is_turbo_2b = (ftype == LLAMA_FTYPE_MOSTLY_TURBO_2B);
+    const bool is_turbo_3b = (ftype == LLAMA_FTYPE_MOSTLY_TURBO_3B);
+    const bool is_turbo_4b = (ftype == LLAMA_FTYPE_MOSTLY_TURBO_4B);
+    if (is_turbo_2b || is_turbo_3b || is_turbo_4b) {
+        int i_layer = -1;
+        const int n_layer = (int)qs.model.hparams.n_layer;
+        sscanf(name.c_str(), "blk.%d.", &i_layer);
+        const bool edge_layer = (i_layer >= 0 && n_layer > 0) &&
+                                (i_layer < n_layer/8 || i_layer >= 7*n_layer/8);
+
+        // ATTN_V (value projection): most sensitive after the output tensor.
+        if (category == tensor_category::ATTENTION_V || category == tensor_category::ATTENTION_KV_B) {
+            if      (is_turbo_2b) new_type = GGML_TYPE_TURBO_4B;
+            else if (is_turbo_3b) new_type = GGML_TYPE_TURBO_5B;
+            else if (is_turbo_4b && edge_layer) new_type = GGML_TYPE_TURBO_5B;
+        }
+        // ATTN_K: identity preservation matters for RoPE mixing.
+        else if (category == tensor_category::ATTENTION_K) {
+            if      (is_turbo_2b) new_type = GGML_TYPE_TURBO_4B;
+            else if (is_turbo_3b) new_type = GGML_TYPE_TURBO_4B;
+        }
+        // ATTN_Q: less sensitive than K/V but benefits at 2b.
+        else if (category == tensor_category::ATTENTION_Q) {
+            if (is_turbo_2b) new_type = GGML_TYPE_TURBO_3B;
+        }
+        // ATTN_QKV (fused): protect at all low bitrates.
+        else if (category == tensor_category::ATTENTION_QKV) {
+            if      (is_turbo_2b) new_type = GGML_TYPE_TURBO_4B;
+            else if (is_turbo_3b) new_type = GGML_TYPE_TURBO_4B;
+            else if (is_turbo_4b && edge_layer) new_type = GGML_TYPE_TURBO_5B;
+        }
+        // ATTN output projection.
+        else if (category == tensor_category::ATTENTION_OUTPUT) {
+            if      (is_turbo_2b) new_type = GGML_TYPE_TURBO_3B;
+            else if (is_turbo_3b) new_type = GGML_TYPE_TURBO_4B;
+        }
+        // FFN_DOWN: most sensitive FFN tensor; promote edge layers only.
+        else if (category == tensor_category::FFN_DOWN && edge_layer) {
+            if      (is_turbo_2b) new_type = GGML_TYPE_TURBO_4B;
+            else if (is_turbo_3b) new_type = GGML_TYPE_TURBO_4B;
+            else if (is_turbo_4b) new_type = GGML_TYPE_TURBO_5B;
+        }
     }
 
     return new_type;
@@ -1301,7 +1371,8 @@ llama_model_quantize_params llama_model_quantize_default_params() {
         /*.imatrix                     =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,
         /*.tensor_type                 =*/ nullptr,
-        /*.prune_layers                =*/ nullptr
+        /*.prune_layers                =*/ nullptr,
+        /*.codebook_file               =*/ nullptr,
     };
 
     return result;

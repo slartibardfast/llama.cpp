@@ -414,6 +414,7 @@ extern "C" {
         const struct llama_model_kv_override * kv_overrides;        // pointer to kv overrides
         const struct llama_model_tensor_override * tt_overrides;    // pointer to tensor overrides
         const int32_t * prune_layers;                               // pointer to layer indices to prune
+        const char * codebook_file;                                 // path to GGUF with turbo.codebook.* tensors (NULL = published Gaussian); used by TURBO_*B quantizers and copied into the output GGUF
     } llama_model_quantize_params;
 
     typedef struct llama_logit_bias {

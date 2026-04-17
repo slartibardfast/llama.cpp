@@ -716,8 +716,21 @@ static const turbo_config_t TURBO_4B_S_CONFIG = {
 static const turbo_config_t TURBO_5B_CONFIG = {
     NULL, 32, 5, TURBO_5B_CENT_MAX, TURBO_5B_BLOCK_SIZE, TURBO_5B_BYTES };
 
+/* Per-bitrate quantize-time overrides (bits 2..5 → index 0..3). NULL means
+   "use the published default". Written by turbo_set_quantize_codebook. */
+static const float * g_turbo_quantize_override[4] = { NULL, NULL, NULL, NULL };
+
+void turbo_set_quantize_codebook(int bits, const float * centroids) {
+    if (bits < 2 || bits > 5) return;
+    g_turbo_quantize_override[bits - 2] = centroids;
+}
+
 /* Resolve codebook pointer (can't use array address in static initializer) */
 static const float * turbo_get_codebook(const turbo_config_t * cfg) {
+    if (cfg->bits >= 2 && cfg->bits <= 5) {
+        const float * ov = g_turbo_quantize_override[cfg->bits - 2];
+        if (ov) return ov;
+    }
     switch (cfg->bits) {
         case 2: return turbo_codebook_2bit;
         case 3: return turbo_codebook_3bit;

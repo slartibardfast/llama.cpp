@@ -254,6 +254,14 @@ extern const float turbo_codebook_2bit[4];
 extern const float turbo_codebook_3bit[8];
 extern const float turbo_codebook_5bit[32];
 
+/* Quantize-time codebook override. Set a custom Lloyd-Max codebook (e.g.
+   imatrix-weighted centroids from the llama-turbo-codebook tool) before
+   invoking quantize_row_turbo_*_ref, and clear with bits>=2..5 / NULL to
+   restore the published Gaussian defaults. The override is process-wide
+   and applies to CPU quantize paths only; GPU inference uses a separate
+   per-device storage buffer populated from GGUF codebook tensors. */
+void turbo_set_quantize_codebook(int bits, const float * centroids);
+
 /* Quantize / dequantize API for weight tensors */
 void quantize_row_turbo_2b_ref  (const float * GGML_RESTRICT x, block_turbo_2b   * GGML_RESTRICT y, int64_t k);
 void dequantize_row_turbo_2b    (const block_turbo_2b   * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
