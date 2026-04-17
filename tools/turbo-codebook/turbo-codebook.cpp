@@ -274,6 +274,23 @@ static void collect_post_rht(
 /* ================================================================
  * Compute MSE for a codebook on data
  * ================================================================ */
+/* Scale a codebook so max(|centroid|) == cent_max. Lloyd-Max on
+ * max-abs-normalized samples produces centroids in [-1, 1]; the quantizer
+ * expects centroids in [-cent_max, cent_max] (matching the per-bitrate
+ * published convention from tq_codebook.c). This rescale preserves the
+ * optimal Lloyd-Max solution because MSE is invariant under uniform
+ * scaling of both data and centroids. */
+static void rescale_to_cent_max(float * cb, int n, float cent_max) {
+    float mx = 0.0f;
+    for (int i = 0; i < n; i++) {
+        float a = fabsf(cb[i]);
+        if (a > mx) mx = a;
+    }
+    if (mx <= 0.0f) return;
+    const float s = cent_max / mx;
+    for (int i = 0; i < n; i++) cb[i] *= s;
+}
+
 static double compute_mse(const std::vector<float> & data, const float * cb, int n_cb) {
     double mse = 0;
     for (float v : data) {
@@ -520,6 +537,19 @@ int main(int argc, char ** argv) {
     fprintf(stderr, "  3-bit   %.8f    %.8f    %+.2f%%\n", mse3g, mse3e, 100*(1-mse3e/mse3g));
     fprintf(stderr, "  4-bit   %.8f    %.8f    %+.2f%%\n", mse4g, mse4e, 100*(1-mse4e/mse4g));
     fprintf(stderr, "  5-bit   %.8f    %.8f    %+.2f%%\n", mse5g, mse5e, 100*(1-mse5e/mse5g));
+
+    /* Rescale centroids to the per-bitrate cent_max convention expected by
+     * the quantizer. Lloyd-Max was run on max-abs-normalized samples, so the
+     * centroids land in [-1, 1]; the quantizer's block normalization
+     * (inv_std = cent_max / max_abs) assumes centroids in [-cent_max, cent_max].
+     * Scaling both data and centroids by the same factor preserves the
+     * Lloyd-Max optimum, so this is correctness-neutral for the MSE comparison
+     * above (which is done in [-1, 1] space) while producing on-disk codebooks
+     * in the canonical published range. */
+    rescale_to_cent_max(cb2, 4, 1.5104f);
+    rescale_to_cent_max(cb3, 8, 2.1520f);
+    rescale_to_cent_max(cb4, 16, 2.7326f);  /* matches TURBO_KV_4B_CENT_MAX */
+    rescale_to_cent_max(cb5, 32, 1.9956f);
 
     /* Print codebooks */
     auto print_cb = [](const char * name, const float * cb, int n) {

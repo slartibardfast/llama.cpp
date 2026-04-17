@@ -254,12 +254,19 @@ extern const float turbo_codebook_2bit[4];
 extern const float turbo_codebook_3bit[8];
 extern const float turbo_codebook_5bit[32];
 
-/* Quantize-time codebook override. Set a custom Lloyd-Max codebook (e.g.
+/* Runtime codebook override. Set a custom Lloyd-Max codebook (e.g.
    imatrix-weighted centroids from the llama-turbo-codebook tool) before
-   invoking quantize_row_turbo_*_ref, and clear with bits>=2..5 / NULL to
-   restore the published Gaussian defaults. The override is process-wide
-   and applies to CPU quantize paths only; GPU inference uses a separate
-   per-device storage buffer populated from GGUF codebook tensors. */
+   invoking the quantize/dequant paths, and clear with NULL to restore the
+   published Gaussian defaults. Affects both CPU quantize (index assignment)
+   and CPU dequant/vec_dot (reconstruction) — GPU dequant uses a separate
+   per-device storage buffer populated from the GGUF codebook tensors.
+
+   Centroids MUST be in [-cent_max, cent_max] range, matching the per-bitrate
+   published convention (2-bit: 1.5104, 3-bit: 2.1520, 4-bit: 2.7326,
+   5-bit: 1.9956). The llama-turbo-codebook tool rescales its Lloyd-Max
+   output to this convention before writing. A codebook at a different scale
+   will produce garbage because quantize_block_turbo normalizes each block
+   to [-cent_max, cent_max] before codebook lookup. */
 void turbo_set_quantize_codebook(int bits, const float * centroids);
 
 /* Quantize / dequantize API for weight tensors */

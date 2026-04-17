@@ -716,36 +716,29 @@ static const turbo_config_t TURBO_4B_S_CONFIG = {
 static const turbo_config_t TURBO_5B_CONFIG = {
     NULL, 32, 5, TURBO_5B_CENT_MAX, TURBO_5B_BLOCK_SIZE, TURBO_5B_BYTES };
 
-/* Per-bitrate overrides (bits 2..5 → index 0..3). Used by both quantize
-   (to pick centroids during index assignment) and dequant/vec_dot (to
-   reconstruct values from stored indices). NULL means "use published
-   default". The centroids are copied into a process-lifetime static
-   buffer so callers don't need to keep their storage alive — the loader
-   would otherwise risk the codebook vector going out of scope before
-   inference dispatches run.
-   cent_max = max(|centroid|) is cached so the block-level scale factor
-   (cent_max / max_abs) matches the codebook's actual dynamic range,
-   not the hardcoded published value. */
+/* Per-bitrate codebook overrides (bits 2..5 → index 0..3). Used by both
+   quantize (to pick centroids during index assignment) and dequant/vec_dot
+   (to reconstruct values from stored indices). NULL means "use published
+   default". Centroids are copied into a process-lifetime static buffer so
+   callers don't need to keep their storage alive — the loader would
+   otherwise risk the codebook vector going out of scope before inference
+   dispatches run. Custom codebooks MUST be in [-cent_max, cent_max] range
+   (same convention as the published Gaussian tables); the turbo-codebook
+   tool rescales its Lloyd-Max output before writing to satisfy this. */
 static float         g_turbo_override_storage[4][32];
 static const float * g_turbo_quantize_override[4] = { NULL, NULL, NULL, NULL };
-static float         g_turbo_quantize_override_cent_max[4] = { 0, 0, 0, 0 };
 
 void turbo_set_quantize_codebook(int bits, const float * centroids) {
     if (bits < 2 || bits > 5) return;
     const int idx = bits - 2;
     const int n = 1 << bits;
     if (centroids) {
-        float mx = 0;
         for (int i = 0; i < n; i++) {
             g_turbo_override_storage[idx][i] = centroids[i];
-            float a = fabsf(centroids[i]);
-            if (a > mx) mx = a;
         }
         g_turbo_quantize_override[idx] = g_turbo_override_storage[idx];
-        g_turbo_quantize_override_cent_max[idx] = (mx > 0) ? mx : 1.0f;
     } else {
         g_turbo_quantize_override[idx] = NULL;
-        g_turbo_quantize_override_cent_max[idx] = 0.0f;
     }
 }
 
@@ -764,17 +757,6 @@ static const float * turbo_get_codebook(const turbo_config_t * cfg) {
     }
 }
 
-/* Resolve the cent_max scale factor used for per-block normalization. If a
-   custom codebook is active for this bitrate we derive cent_max from it
-   (max absolute centroid); otherwise fall back to the published value. */
-static float turbo_get_cent_max(const turbo_config_t * cfg) {
-    if (cfg->bits >= 2 && cfg->bits <= 5) {
-        const float ov = g_turbo_quantize_override_cent_max[cfg->bits - 2];
-        if (ov > 0) return ov;
-    }
-    return cfg->cent_max;
-}
-
 /* --- Generic row-wise quantize/dequant --- */
 
 static void quantize_row_turbo_ref(const float * x, void * y, int64_t k,
@@ -782,12 +764,11 @@ static void quantize_row_turbo_ref(const float * x, void * y, int64_t k,
     const float * cb = turbo_get_codebook(cfg);
     GGML_ASSERT(k % cfg->block_size == 0);
     const int64_t nb = k / cfg->block_size;
-    const float cent_max = turbo_get_cent_max(cfg);
     for (int64_t b = 0; b < nb; b++) {
         quantize_block_turbo(
             x + b * cfg->block_size,
             (uint8_t *)y + b * cfg->block_bytes,
-            cfg->block_size, cb, cfg->n_levels, cfg->bits, cent_max);
+            cfg->block_size, cb, cfg->n_levels, cfg->bits, cfg->cent_max);
     }
 }
 
@@ -898,7 +879,6 @@ static size_t quantize_turbo_generic(
         quantize_row_turbo_ref(src, dst, nrows * n_per_row, cfg);
     } else {
         char * qrow = (char *)dst;
-        const float cent_max = turbo_get_cent_max(cfg);
         for (int64_t row = 0; row < nrows; row++) {
             GGML_ASSERT(n_per_row % cfg->block_size == 0);
             const int64_t nb = n_per_row / cfg->block_size;
@@ -906,7 +886,7 @@ static size_t quantize_turbo_generic(
                 quantize_block_turbo_weighted(
                     src + b * cfg->block_size,
                     (uint8_t *)qrow + b * cfg->block_bytes,
-                    cfg->block_size, cb, cfg->n_levels, cfg->bits, cent_max,
+                    cfg->block_size, cb, cfg->n_levels, cfg->bits, cfg->cent_max,
                     quant_weights + b * cfg->block_size);
             }
             src += n_per_row;
