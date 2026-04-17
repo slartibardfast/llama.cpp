@@ -166,7 +166,12 @@ static void usage(const char * executable) {
     printf("                                      WARNING: this is an advanced option, use with care.\n");
     printf("  --dry-run\n");
     printf("                                      calculate and show the final quantization size without performing quantization\n");
-    printf("                                      example: llama-quantize --dry-run model-f32.gguf Q4_K\n\n");
+    printf("                                      example: llama-quantize --dry-run model-f32.gguf Q4_K\n");
+    printf("  --codebook codebook.gguf\n");
+    printf("                                      for TURBO_*B quant types: use the Lloyd-Max centroids in this GGUF\n");
+    printf("                                      (tensors named 'turbo.codebook.{2,3,4,5}bit') in place of the published Gaussian defaults,\n");
+    printf("                                      and embed them in the output so inference can apply them.\n");
+    printf("                                      generate with llama-turbo-codebook --imatrix imatrix.gguf model.gguf -o codebook.gguf\n\n");
     printf("note: --include-weights and --exclude-weights cannot be used together\n\n");
     printf("-----------------------------------------------------------------------------\n");
     printf(" allowed quantization types\n");
