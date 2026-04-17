@@ -569,6 +569,12 @@ int main(int argc, char ** argv) {
             }
         } else if (strcmp(argv[arg_idx], "--keep-split") == 0) {
             params.keep_split = true;
+        } else if (strcmp(argv[arg_idx], "--codebook") == 0) {
+            if (arg_idx < argc-1) {
+                params.codebook_file = argv[++arg_idx];
+            } else {
+                usage(argv[0]);
+            }
         } else {
             usage(argv[0]);
         }

@@ -19,6 +19,14 @@ static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
 static const size_t GiB = 1024*MiB;
 
+// Tensor names that live inside quantized GGUFs for runtime metadata but
+// are NOT part of any model architecture (e.g. TURBO_*B Lloyd-Max codebook
+// centroids). Kept out of weights_map so they don't inflate the n_tensors
+// count that llama_model::load_tensors verifies against n_created.
+static bool is_reserved_aux_tensor(const std::string & name) {
+    return name.rfind("turbo.codebook.", 0) == 0;
+}
+
 const char * llama_file_version_name(llama_fver version) {
     switch (version) {
         case GGUF_FILE_VERSION_V1: return "GGUF V1 (support until nov 2023)";
@@ -579,6 +587,10 @@ llama_model_loader::llama_model_loader(
         // so we build a unified tensors index for weights.
         for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur; cur = ggml_get_next_tensor(ctx, cur)) {
             std::string tensor_name = std::string(cur->name);
+            if (is_reserved_aux_tensor(tensor_name)) {
+                codebook_weights_map.emplace(tensor_name, llama_tensor_weight(files.back().get(), 0, metadata, cur));
+                continue;
+            }
             // make sure there is no duplicated tensor names
             if (weights_map.find(tensor_name) != weights_map.end()) {
                 throw std::runtime_error(format("invalid model: tensor '%s' is duplicated", ggml_get_name(cur)));
@@ -645,6 +657,10 @@ llama_model_loader::llama_model_loader(
                 // Save tensors data offset info of the shard.
                 for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur; cur = ggml_get_next_tensor(ctx, cur)) {
                     std::string tensor_name = std::string(cur->name);
+                    if (is_reserved_aux_tensor(tensor_name)) {
+                        codebook_weights_map.emplace(tensor_name, llama_tensor_weight(files.back().get(), idx, ctx_gguf.get(), cur));
+                        continue;
+                    }
                     // make sure there is no duplicated tensor names
                     if (weights_map.find(tensor_name) != weights_map.end()) {
                         throw std::runtime_error(format("invalid model: tensor '%s' is duplicated", ggml_get_name(cur)));
@@ -689,6 +705,10 @@ llama_model_loader::llama_model_loader(
         // Save tensors data offset info of the main file.
         for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur; cur = ggml_get_next_tensor(ctx, cur)) {
             std::string tensor_name = std::string(cur->name);
+            if (is_reserved_aux_tensor(tensor_name)) {
+                codebook_weights_map.emplace(tensor_name, llama_tensor_weight(files.back().get(), 0, metadata, cur));
+                continue;
+            }
             // make sure there is no duplicated tensor names
             if (weights_map.find(tensor_name) != weights_map.end()) {
                 throw std::runtime_error(format("invalid model: tensor '%s' is duplicated", ggml_get_name(cur)));
@@ -1415,21 +1435,22 @@ void llama_model_loader::apply_turbo_codebooks() const {
     for (int i = 0; i < 4; i++) {
         const int bits = i + 2;
         const size_t n_centroids = (size_t)1 << bits;
-        const auto * w = get_weight(names[i]);
-        if (!w) continue;
-        if ((size_t)ggml_nelements(w->tensor) != n_centroids || w->tensor->type != GGML_TYPE_F32) {
+        auto it = codebook_weights_map.find(names[i]);
+        if (it == codebook_weights_map.end()) continue;
+        const llama_tensor_weight & w = it->second;
+        if ((size_t)ggml_nelements(w.tensor) != n_centroids || w.tensor->type != GGML_TYPE_F32) {
             fprintf(stderr, "%s: skipping malformed %s (nel=%ld, type=%s)\n",
-                    __func__, names[i], (long)ggml_nelements(w->tensor),
-                    ggml_type_name(w->tensor->type));
+                    __func__, names[i], (long)ggml_nelements(w.tensor),
+                    ggml_type_name(w.tensor->type));
             continue;
         }
         std::vector<float> centroids(n_centroids);
-        if (use_mmap) {
-            const auto & mapping = mappings.at(w->idx);
-            memcpy(centroids.data(), (const uint8_t *)mapping->addr() + w->offs, n_centroids * sizeof(float));
+        if (use_mmap && w.idx < mappings.size() && mappings.at(w.idx)) {
+            const auto & mapping = mappings.at(w.idx);
+            memcpy(centroids.data(), (const uint8_t *)mapping->addr() + w.offs, n_centroids * sizeof(float));
         } else {
-            const auto & file = files.at(w->idx);
-            file->seek(w->offs, SEEK_SET);
+            const auto & file = files.at(w.idx);
+            file->seek(w.offs, SEEK_SET);
             file->read_raw(centroids.data(), n_centroids * sizeof(float));
         }
         for (auto hook : hooks) {

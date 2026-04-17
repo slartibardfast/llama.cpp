@@ -87,6 +87,11 @@ struct llama_model_loader {
     llama_mmaps mappings;
 
     std::map<std::string, llama_tensor_weight, weight_name_comparer> weights_map;
+    // Separate map for "turbo.codebook.*" tensors embedded in quantized GGUFs.
+    // These are runtime metadata for the TURBO_*B quantizers, not model
+    // weights — they live outside weights_map so llama_model::load_tensors
+    // doesn't count them toward n_tensors / n_created.
+    std::unordered_map<std::string, llama_tensor_weight> codebook_weights_map;
     std::unordered_map<std::string, llama_model_kv_override> kv_overrides;
     const llama_model_tensor_buft_override * tensor_buft_overrides;
 

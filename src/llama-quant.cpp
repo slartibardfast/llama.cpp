@@ -3,6 +3,9 @@
 #include "llama-model-loader.h"
 #include "llama-ext.h"
 
+#include "ggml-turbo-kv.h"
+#include "gguf.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -454,12 +457,19 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
                      ftype == LLAMA_FTYPE_MOSTLY_IQ1_M) {
                 new_type = GGML_TYPE_Q5_K;
             }
-            else if (ftype == LLAMA_FTYPE_MOSTLY_TURBO_2B || ftype == LLAMA_FTYPE_MOSTLY_TURBO_3B ||
-                     ftype == LLAMA_FTYPE_MOSTLY_TURBO_4B || ftype == LLAMA_FTYPE_MOSTLY_TURBO_5B) {
-                // TURBO_*B: output tensor is always outlier-sensitive (Unsloth-style).
-                // Q6_K is the standard high-precision fallback used across llama.cpp
-                // mixes; the small extra bpw cost is well worth the PPL gain.
+            else if (ftype == LLAMA_FTYPE_MOSTLY_TURBO_2B || ftype == LLAMA_FTYPE_MOSTLY_TURBO_3B) {
+                // UD-Q2_K_XL / UD-Q3_K_XL: output tensor → Q6_K.
                 new_type = GGML_TYPE_Q6_K;
+            }
+            else if (ftype == LLAMA_FTYPE_MOSTLY_TURBO_4B) {
+                // UD-Q4_K_XL: output → Q8_0 (higher precision than Q6_K for
+                // the 4-bit base, reflecting that the output tensor's per-token
+                // cost scales with quality loss at mid bpw).
+                new_type = GGML_TYPE_Q8_0;
+            }
+            else if (ftype == LLAMA_FTYPE_MOSTLY_TURBO_5B) {
+                // UD-Q5_K style: output → Q8_0.
+                new_type = GGML_TYPE_Q8_0;
             }
             else if (new_type != GGML_TYPE_Q8_0) {
                 new_type = GGML_TYPE_Q6_K;
@@ -491,11 +501,12 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
                 new_type = GGML_TYPE_Q4_K;
             }
             else if (ftype == LLAMA_FTYPE_MOSTLY_TURBO_2B || ftype == LLAMA_FTYPE_MOSTLY_TURBO_3B) {
-                // Token embedding is highly sensitive at low bitrates — promote
-                // directly to a robust quant instead of bumping within TURBO.
-                new_type = GGML_TYPE_Q6_K;
+                // UD-Q2_K_XL / UD-Q3_K_XL: token_embd → Q4_K (~4.5bpw).
+                // Use TURBO_4B — same bpw band, keeps RHT+codebook in use.
+                new_type = GGML_TYPE_TURBO_4B;
             }
             else if (ftype == LLAMA_FTYPE_MOSTLY_TURBO_4B) {
+                // UD-Q4_K_XL: token_embd → Q6_K.
                 new_type = GGML_TYPE_Q6_K;
             }
         }
@@ -669,17 +680,22 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
         ++qs.i_ffn_up;
     }
 
-    // Unsloth-style outlier protection for TURBO_*B (applied on top of the
-    // category-specific logic above). Sensitive tensors (attention projections,
-    // first/last FFN_DOWN layers) are promoted within the TURBO family so that
-    // bulk weights stay at the requested bitrate while critical paths retain
-    // extra precision. Output and token_embedding are handled separately (above)
-    // via Q6_K — the standard llama.cpp pattern for outlier-sensitive heads.
+    // Unsloth Dynamic 2.0-style outlier protection for TURBO_*B.
     //
-    // Layer selection follows the same rule as use_more_bits(): first 12.5% +
-    // last 12.5% + every 3rd in the middle. Layer index is parsed from the
-    // tensor name (blk.N.*) to avoid off-by-one issues with the stateful
-    // qs counters.
+    // Target bitrates come from Unsloth's public UD-IQ1_S / UD-Q2_K_XL /
+    // UD-Q3_K_XL / UD-Q4_K_XL GGUFs (per-layer KLD sensitivity analysis vs
+    // F16 baseline), but the promoted types use our TURBO_*B quants where
+    // their bpw matches (TURBO_4B ≈ Q4_K, TURBO_5B ≈ Q5_K) and fall back to
+    // Q6_K / Q8_0 for the very-high-precision tensors where we don't have a
+    // matching TURBO level. This keeps the RHT+codebook pipeline in use for
+    // as many bumped tensors as possible while matching Dynamic 2.0's
+    // per-tensor precision budget.
+    //
+    // Base-quant → Unsloth-dynamic mapping we're reproducing:
+    //   TURBO_2B  ~ Q2_K  → UD-Q2_K_XL style
+    //   TURBO_3B  ~ Q3_K  → UD-Q3_K_XL style
+    //   TURBO_4B  ~ Q4_K  → UD-Q4_K_XL style
+    //   TURBO_5B  ~ Q5_K  → light protection (already high-precision)
     const bool is_turbo_2b = (ftype == LLAMA_FTYPE_MOSTLY_TURBO_2B);
     const bool is_turbo_3b = (ftype == LLAMA_FTYPE_MOSTLY_TURBO_3B);
     const bool is_turbo_4b = (ftype == LLAMA_FTYPE_MOSTLY_TURBO_4B);
@@ -689,38 +705,47 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
         sscanf(name.c_str(), "blk.%d.", &i_layer);
         const bool edge_layer = (i_layer >= 0 && n_layer > 0) &&
                                 (i_layer < n_layer/8 || i_layer >= 7*n_layer/8);
+        const bool is_mtp_head = name.find(".nextn.eh_proj.weight") != std::string::npos;
 
-        // ATTN_V (value projection): most sensitive after the output tensor.
-        if (category == tensor_category::ATTENTION_V || category == tensor_category::ATTENTION_KV_B) {
-            if      (is_turbo_2b) new_type = GGML_TYPE_TURBO_4B;
-            else if (is_turbo_3b) new_type = GGML_TYPE_TURBO_5B;
-            else if (is_turbo_4b && edge_layer) new_type = GGML_TYPE_TURBO_5B;
+        // MTP spec-decode head: UD leaves prediction heads at Q6_K (no TURBO_6B).
+        if (is_mtp_head) {
+            new_type = GGML_TYPE_Q6_K;
         }
-        // ATTN_K: identity preservation matters for RoPE mixing.
+        // ATTN_V (value): most sensitive attention projection in UD.
+        // UD-Q2_K: Q5_K → TURBO_5B; UD-Q3_K: Q6_K; UD-Q4_K edge: Q6_K.
+        else if (category == tensor_category::ATTENTION_V || category == tensor_category::ATTENTION_KV_B) {
+            if      (is_turbo_2b) new_type = GGML_TYPE_TURBO_5B;
+            else if (is_turbo_3b) new_type = GGML_TYPE_Q6_K;
+            else if (is_turbo_4b && edge_layer) new_type = GGML_TYPE_Q6_K;
+        }
+        // ATTN_K: UD-Q2_K/Q3_K bump to Q5_K → TURBO_5B.
         else if (category == tensor_category::ATTENTION_K) {
-            if      (is_turbo_2b) new_type = GGML_TYPE_TURBO_4B;
-            else if (is_turbo_3b) new_type = GGML_TYPE_TURBO_4B;
+            if      (is_turbo_2b) new_type = GGML_TYPE_TURBO_5B;
+            else if (is_turbo_3b) new_type = GGML_TYPE_TURBO_5B;
         }
-        // ATTN_Q: less sensitive than K/V but benefits at 2b.
+        // ATTN_Q: UD-Q2_K bumps to Q4_K → TURBO_4B.
         else if (category == tensor_category::ATTENTION_Q) {
-            if (is_turbo_2b) new_type = GGML_TYPE_TURBO_3B;
+            if (is_turbo_2b) new_type = GGML_TYPE_TURBO_4B;
         }
-        // ATTN_QKV (fused): protect at all low bitrates.
+        // ATTN_QKV fused: follow V/K pattern.
         else if (category == tensor_category::ATTENTION_QKV) {
-            if      (is_turbo_2b) new_type = GGML_TYPE_TURBO_4B;
-            else if (is_turbo_3b) new_type = GGML_TYPE_TURBO_4B;
-            else if (is_turbo_4b && edge_layer) new_type = GGML_TYPE_TURBO_5B;
+            if      (is_turbo_2b) new_type = GGML_TYPE_TURBO_5B;
+            else if (is_turbo_3b) new_type = GGML_TYPE_TURBO_5B;
+            else if (is_turbo_4b && edge_layer) new_type = GGML_TYPE_Q6_K;
         }
-        // ATTN output projection.
+        // ATTN output projection: UD consistently bumps this.
+        // UD-Q2_K/Q3_K: Q5_K → TURBO_5B.
         else if (category == tensor_category::ATTENTION_OUTPUT) {
-            if      (is_turbo_2b) new_type = GGML_TYPE_TURBO_3B;
-            else if (is_turbo_3b) new_type = GGML_TYPE_TURBO_4B;
+            if      (is_turbo_2b) new_type = GGML_TYPE_TURBO_5B;
+            else if (is_turbo_3b) new_type = GGML_TYPE_TURBO_5B;
         }
-        // FFN_DOWN: most sensitive FFN tensor; promote edge layers only.
+        // FFN_DOWN: UD promotes edge layers (first/last 12.5% + every 3rd middle).
+        // UD-Q2_K edge: Q4_K → TURBO_4B; UD-Q3_K edge: Q5_K → TURBO_5B;
+        // UD-Q4_K edge: Q6_K.
         else if (category == tensor_category::FFN_DOWN && edge_layer) {
             if      (is_turbo_2b) new_type = GGML_TYPE_TURBO_4B;
-            else if (is_turbo_3b) new_type = GGML_TYPE_TURBO_4B;
-            else if (is_turbo_4b) new_type = GGML_TYPE_TURBO_5B;
+            else if (is_turbo_3b) new_type = GGML_TYPE_TURBO_5B;
+            else if (is_turbo_4b) new_type = GGML_TYPE_Q6_K;
         }
     }
 
@@ -964,6 +989,47 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
     model.load_hparams(ml);
     model.load_stats  (ml);
 
+    // Custom codebook support: if --codebook PATH was provided, load the 4
+    // centroid tensors (turbo.codebook.{2,3,4,5}bit) from that GGUF and apply
+    // them to the CPU quantize path. The same tensors are also copied into
+    // the output GGUF so the model loader can upload them to the Vulkan
+    // per-device buffer at inference time (ggml_backend_vk_set_turbo_codebook).
+    std::vector<std::vector<float>> custom_codebooks(4);
+    bool has_custom_codebook = false;
+    if (params->codebook_file) {
+        struct gguf_init_params p = { /*.no_alloc =*/ false, /*.ctx =*/ nullptr };
+        struct ggml_context * cb_tmp_ctx = nullptr;
+        struct gguf_init_params p2 = { /*.no_alloc =*/ false, /*.ctx =*/ &cb_tmp_ctx };
+        struct gguf_context * cb_ctx = gguf_init_from_file(params->codebook_file, p2);
+        if (!cb_ctx) {
+            throw std::runtime_error(format("failed to open codebook file '%s'", params->codebook_file));
+        }
+        const char * names[4] = {
+            "turbo.codebook.2bit",
+            "turbo.codebook.3bit",
+            "turbo.codebook.4bit",
+            "turbo.codebook.5bit",
+        };
+        for (int i = 0; i < 4; i++) {
+            const int bits = i + 2;
+            const size_t n = (size_t)1 << bits;
+            struct ggml_tensor * t = ggml_get_tensor(cb_tmp_ctx, names[i]);
+            if (!t) continue;
+            if ((size_t)ggml_nelements(t) != n || t->type != GGML_TYPE_F32) {
+                throw std::runtime_error(format("codebook tensor '%s' malformed (nel=%ld, type=%s)",
+                    names[i], (long)ggml_nelements(t), ggml_type_name(t->type)));
+            }
+            custom_codebooks[i].assign((const float *)t->data, (const float *)t->data + n);
+            turbo_set_quantize_codebook(bits, custom_codebooks[i].data());
+            has_custom_codebook = true;
+            LLAMA_LOG_INFO("%s: loaded custom codebook for TURBO_%dB (%zu centroids)\n",
+                __func__, bits, n);
+        }
+        gguf_free(cb_ctx);
+        ggml_free(cb_tmp_ctx);
+        (void)p; // silence unused
+    }
+
     quantize_state_impl qs(model, params);
 
     if (params->only_copy) {
@@ -1132,6 +1198,34 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
             gguf_set_val_u16(ctx_outs[i].get(), ml.llm_kv(LLM_KV_SPLIT_NO).c_str(), i);
             gguf_set_val_u16(ctx_outs[i].get(), ml.llm_kv(LLM_KV_SPLIT_COUNT).c_str(), n_split);
             gguf_set_val_i32(ctx_outs[i].get(), ml.llm_kv(LLM_KV_SPLIT_TENSORS_COUNT).c_str(), (int32_t)tensors.size());
+        }
+    }
+
+    // If a custom codebook was loaded, register its tensors in split 0 so
+    // their metadata lives in the output GGUF. Their raw data is appended to
+    // the file immediately after the main quantize loop.
+    struct ggml_context * cb_output_ctx = nullptr;
+    std::vector<struct ggml_tensor *> cb_output_tensors;
+    if (has_custom_codebook) {
+        struct ggml_init_params p_ctx = {
+            /*.mem_size   =*/ ggml_tensor_overhead() * 8 + 1024,
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+        cb_output_ctx = ggml_init(p_ctx);
+        const char * cb_names[4] = {
+            "turbo.codebook.2bit",
+            "turbo.codebook.3bit",
+            "turbo.codebook.4bit",
+            "turbo.codebook.5bit",
+        };
+        for (int i = 0; i < 4; i++) {
+            if (custom_codebooks[i].empty()) continue;
+            struct ggml_tensor * t = ggml_new_tensor_1d(cb_output_ctx, GGML_TYPE_F32, custom_codebooks[i].size());
+            ggml_set_name(t, cb_names[i]);
+            t->data = custom_codebooks[i].data();
+            gguf_add_tensor(ctx_outs[0].get(), t);
+            cb_output_tensors.push_back(t);
         }
     }
 
@@ -1333,8 +1427,24 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         } // no --dry-run
     } // main loop
 
+    // Write the custom codebook tensor bytes at the end of split 0 so they
+    // land at the offsets recorded in the ctx_outs[0] metadata. Only makes
+    // sense when split 0 is the current (or only) split — if --keep-split
+    // was used with n_split > 1, the regular quantize loop may have moved on.
+    if (!params->dry_run && has_custom_codebook && cur_split == 0) {
+        for (auto * t : cb_output_tensors) {
+            const size_t n_bytes = ggml_nbytes(t);
+            fout.write((const char *)t->data, n_bytes);
+            zeros(fout, GGML_PAD(n_bytes, align) - n_bytes);
+        }
+    }
+
     if (!params->dry_run) {
         close_ofstream();
+    }
+
+    if (cb_output_ctx) {
+        ggml_free(cb_output_ctx);
     }
 
     LLAMA_LOG_INFO("%s: model size  = %8.2f MiB (%.2f BPW)\n", __func__, total_size_org/1024.0/1024.0, total_size_org*8.0/ml.n_elements);
