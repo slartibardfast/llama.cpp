@@ -4,6 +4,7 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
+#include "ggml-turbo-kv.h"
 #include "gguf.h"
 #include "llama-hparams.h"
 
@@ -1419,9 +1420,9 @@ void llama_model_loader::apply_turbo_codebooks() const {
             hooks.push_back(reinterpret_cast<set_turbo_codebook_t>(fn));
         }
     }
-    if (hooks.empty()) {
-        return;
-    }
+    // Note: we do not early-return when hooks is empty — the CPU path also
+    // needs the override (turbo_set_quantize_codebook) regardless of which
+    // backends are registered.
 
     // For each per-bitrate codebook tensor present in the GGUF, read it and
     // forward to every backend hook. Tensors are named turbo.codebook.Nbit
@@ -1456,6 +1457,10 @@ void llama_model_loader::apply_turbo_codebooks() const {
         for (auto hook : hooks) {
             hook(bits, centroids.data());
         }
+        // Apply to the CPU dequant/vec_dot path too. The override is a
+        // process-wide global copied internally, so the centroids vector
+        // here can go out of scope after this call.
+        turbo_set_quantize_codebook(bits, centroids.data());
         fprintf(stderr, "%s: applied %zu-centroid codebook %s\n",
                 __func__, n_centroids, names[i]);
     }

@@ -716,27 +716,35 @@ static const turbo_config_t TURBO_4B_S_CONFIG = {
 static const turbo_config_t TURBO_5B_CONFIG = {
     NULL, 32, 5, TURBO_5B_CENT_MAX, TURBO_5B_BLOCK_SIZE, TURBO_5B_BYTES };
 
-/* Per-bitrate quantize-time overrides (bits 2..5 → index 0..3). NULL means
-   "use the published default". Written by turbo_set_quantize_codebook.
-   When an override is present we also cache its cent_max = max(|centroid|)
-   so the block-level scale factor (cent_max / max_abs) matches the
-   codebook's actual dynamic range, not the hardcoded published value. */
+/* Per-bitrate overrides (bits 2..5 → index 0..3). Used by both quantize
+   (to pick centroids during index assignment) and dequant/vec_dot (to
+   reconstruct values from stored indices). NULL means "use published
+   default". The centroids are copied into a process-lifetime static
+   buffer so callers don't need to keep their storage alive — the loader
+   would otherwise risk the codebook vector going out of scope before
+   inference dispatches run.
+   cent_max = max(|centroid|) is cached so the block-level scale factor
+   (cent_max / max_abs) matches the codebook's actual dynamic range,
+   not the hardcoded published value. */
+static float         g_turbo_override_storage[4][32];
 static const float * g_turbo_quantize_override[4] = { NULL, NULL, NULL, NULL };
 static float         g_turbo_quantize_override_cent_max[4] = { 0, 0, 0, 0 };
 
 void turbo_set_quantize_codebook(int bits, const float * centroids) {
     if (bits < 2 || bits > 5) return;
     const int idx = bits - 2;
-    g_turbo_quantize_override[idx] = centroids;
+    const int n = 1 << bits;
     if (centroids) {
-        const int n = 1 << bits;
         float mx = 0;
         for (int i = 0; i < n; i++) {
+            g_turbo_override_storage[idx][i] = centroids[i];
             float a = fabsf(centroids[i]);
             if (a > mx) mx = a;
         }
+        g_turbo_quantize_override[idx] = g_turbo_override_storage[idx];
         g_turbo_quantize_override_cent_max[idx] = (mx > 0) ? mx : 1.0f;
     } else {
+        g_turbo_quantize_override[idx] = NULL;
         g_turbo_quantize_override_cent_max[idx] = 0.0f;
     }
 }
