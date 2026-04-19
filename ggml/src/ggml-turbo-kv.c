@@ -818,53 +818,16 @@ static void quantize_block_turbo_weighted(
     const float * codebook, int n_levels, int bits, float cent_max,
     const float * weights)
 {
-    uint16_t * p_norm    = (uint16_t *)(dst + 0);
-    uint16_t * p_inv_std = (uint16_t *)(dst + 2);
-    uint8_t  * qs        = dst + 4;
-
-    float norm_sq = 0.0f;
-    for (int i = 0; i < block_size; i++) norm_sq += src[i] * src[i];
-    const float norm = sqrtf(norm_sq);
-    *p_norm = turbo_kv_fp32_to_fp16(norm);
-
-    float rotated[256];
-    const float inv_norm = (norm > 1e-10f) ? (1.0f / norm) : 0.0f;
-    for (int i = 0; i < block_size; i++) rotated[i] = src[i] * inv_norm;
-    turbo_kv_rht_forward(rotated, block_size, TURBO_KV_DEFAULT_SEED);
-
-    float max_abs = 0.0f;
-    for (int i = 0; i < block_size; i++) {
-        float a = fabsf(rotated[i]);
-        if (a > max_abs) max_abs = a;
-    }
-    if (max_abs < 1e-10f) max_abs = 1.0f;
-
-    /* Weighted codebook selection at the default scale.
-     *
-     * Note: per-element nearest-centroid is invariant to a per-element weight
-     * (weight is a positive scalar, doesn't change argmin_c |x-c|). The only
-     * way imatrix can improve per-block quantization is via:
-     *   (a) scale selection — tried 5-candidate search, regresses 4B; removed
-     *   (b) mixed precision per-element — would need bit-width variance
-     *
-     * Keeping the weighted path as "same as unweighted but reads weights"
-     * so that future per-group scale optimization can be added here without
-     * changing the pipeline. Currently identical to the unweighted path. */
+    /* Weights are currently ignored: per-element nearest-centroid is invariant
+     * to a per-element positive scalar weight (doesn't change argmin_c |x-c|).
+     * The only ways imatrix could improve per-block quantization are scale
+     * selection (tried 5-candidate search, regresses 4B) or mixed precision
+     * (needs bit-width variance). Until one of those is re-introduced, the
+     * weighted path must produce bits identical to the unweighted path — in
+     * particular it must take the E8P lattice branch for bits==2. Delegating
+     * to quantize_block_turbo guarantees this by construction. */
     (void)weights;
-    const float best_inv_std = cent_max / max_abs;
-    *p_inv_std = turbo_kv_fp32_to_fp16(best_inv_std);
-
-    const int qs_bytes = (block_size * bits + 7) / 8;
-    memset(qs, 0, qs_bytes);
-    for (int i = 0; i < block_size; i++) {
-        float x = rotated[i] * best_inv_std;
-        int best = 0; float bd = fabsf(x - codebook[0]);
-        for (int c = 1; c < n_levels; c++) {
-            float d = fabsf(x - codebook[c]);
-            if (d < bd) { bd = d; best = c; }
-        }
-        turbo_pack_bits(qs, i, best, bits);
-    }
+    quantize_block_turbo(src, dst, block_size, codebook, n_levels, bits, cent_max);
 }
 
 /* --- imatrix-aware ggml_quantize_chunk wrappers (generic) --- */

@@ -488,6 +488,61 @@ static bool test_bitrate_ladder() {
 }
 
 /* ================================================================
+ * Test 11: weighted-vs-bulk bit-identity across the ladder
+ *
+ * The imatrix-aware quantize path (`quant_weights != NULL`) is expected to
+ * produce bit-identical output to the bulk path while imatrix weights are
+ * still ignored at the block level (current code: `(void)weights;` in
+ * quantize_block_turbo_weighted). A divergence here indicates the two
+ * paths encode differently — the specific historical bug was that the
+ * bulk path used the E8P lattice for bits==2 while the weighted path
+ * fell through to scalar Lloyd-Max, producing garbage on imatrix quants.
+ * ================================================================ */
+static bool test_weighted_bulk_identity() {
+    fprintf(stderr, "\n=== Test 11: weighted-vs-bulk bit-identity ===\n");
+    bool all_pass = true;
+    const int64_t nrows = 4;
+    const int64_t n_per_row = 256; /* spans 2 blocks at 128-elem block_size */
+    const int64_t nelem = nrows * n_per_row;
+
+    std::vector<float> input(nelem);
+    uint32_t seed = 2026;
+    for (int64_t i = 0; i < nelem; i++) input[i] = det_gauss(&seed);
+
+    std::vector<float> dummy_w(nelem, 1.0f);
+
+    struct { const char * name;
+             size_t (*fn)(const float*, void*, int64_t, int64_t, const float*);
+             size_t bytes_per_row; } cases[] = {
+        {"turbo_2b",   quantize_turbo_2b,   (size_t)(n_per_row / TURBO_2B_BLOCK_SIZE)   * TURBO_2B_BYTES},
+        {"turbo_3b",   quantize_turbo_3b,   (size_t)(n_per_row / TURBO_3B_BLOCK_SIZE)   * TURBO_3B_BYTES},
+        {"turbo_4b",   quantize_turbo_4b,   (size_t)(n_per_row / TURBO_4B_BLOCK_SIZE)   * TURBO_4B_BYTES},
+        {"turbo_5b",   quantize_turbo_5b,   (size_t)(n_per_row / TURBO_5B_BLOCK_SIZE)   * TURBO_5B_BYTES},
+    };
+
+    for (auto & tc : cases) {
+        std::vector<uint8_t> out_bulk    (tc.bytes_per_row * nrows, 0);
+        std::vector<uint8_t> out_weighted(tc.bytes_per_row * nrows, 0);
+        tc.fn(input.data(), out_bulk.data(),     nrows, n_per_row, NULL);
+        tc.fn(input.data(), out_weighted.data(), nrows, n_per_row, dummy_w.data());
+        int first_diff = -1;
+        for (size_t i = 0; i < out_bulk.size(); i++) {
+            if (out_bulk[i] != out_weighted[i]) { first_diff = (int)i; break; }
+        }
+        bool pass = (first_diff < 0);
+        if (pass) {
+            fprintf(stderr, "  %-10s: %zu bytes identical | PASS\n", tc.name, out_bulk.size());
+        } else {
+            size_t row = first_diff / tc.bytes_per_row;
+            fprintf(stderr, "  %-10s: diverge at byte %d (row %zu) bulk=0x%02x weighted=0x%02x | FAIL\n",
+                tc.name, first_diff, row, out_bulk[first_diff], out_weighted[first_diff]);
+        }
+        all_pass &= pass;
+    }
+    return all_pass;
+}
+
+/* ================================================================
  * Main
  * ================================================================ */
 int main() {
@@ -518,6 +573,9 @@ int main() {
 
     /* Test 10: full bitrate ladder (2B/3B/5B) */
     run(test_bitrate_ladder,     "bitrate_ladder");
+
+    /* Test 11: imatrix/non-imatrix bit-identity (weights currently ignored) */
+    run(test_weighted_bulk_identity, "weighted_bulk_identity");
 
     fprintf(stderr, "\n================================================\n");
     fprintf(stderr, "Results: %d passed, %d failed\n", pass, fail);
