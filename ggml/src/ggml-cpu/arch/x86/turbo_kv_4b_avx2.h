@@ -27,7 +27,11 @@
  * _mm256_shuffle_epi8 (VPSHUFB) can look up all 32 indices at once.
  * ============================================================ */
 
-static int8_t turbo_kv_4b_avx2_cb_i8[16] = {0};
+/* 32 bytes: 16 int8 centroids duplicated across both 128-bit lanes so a
+ * single _mm256_loadu_si256 + _mm256_shuffle_epi8 does correct lookups
+ * in BOTH lanes. VPSHUFB treats each 128-bit lane independently, so the
+ * upper lane needs its own copy of the table. */
+static int8_t turbo_kv_4b_avx2_cb_i8[32] = {0};
 static int    turbo_kv_4b_avx2_cb_i8_init = 0;
 
 static inline void turbo_kv_4b_avx2_init_codebook(void) {
@@ -37,7 +41,8 @@ static inline void turbo_kv_4b_avx2_init_codebook(void) {
         int q = (int)(v >= 0.0f ? v + 0.5f : v - 0.5f);
         if (q < -127) q = -127;
         if (q >  127) q =  127;
-        turbo_kv_4b_avx2_cb_i8[j] = (int8_t) q;
+        turbo_kv_4b_avx2_cb_i8[j]      = (int8_t) q;
+        turbo_kv_4b_avx2_cb_i8[j + 16] = (int8_t) q;
     }
     turbo_kv_4b_avx2_cb_i8_init = 1;
 }
