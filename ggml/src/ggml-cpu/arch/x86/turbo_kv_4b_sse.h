@@ -154,6 +154,26 @@ static inline float ggml_vec_dot_turbo_kv_4b_sse_inner(
     return mse_dot;
 }
 
+/* ============================================================
+ * SSE block-level wrapper
+ *
+ * Extracts norm/inv_std, computes per-block scale, calls inner kernel.
+ * ============================================================ */
+static inline float turbo_kv_4b_sse_single_block_dot(
+    const block_turbo_kv_4b * block,
+    const float * q_rot_block,
+    int dim_in_block)
+{
+    const float norm = turbo_kv_fp16_to_fp32(block->norm);
+    float inv_std = turbo_kv_fp16_to_fp32(block->inv_std_fp16);
+    if (inv_std < 1e-10f) inv_std = sqrtf((float) dim_in_block);
+    const float scale = 1.0f / inv_std;
+    const float per_block_scale = (127.0f / TURBO_KV_4B_CENT_MAX) * scale;
+
+    return norm * ggml_vec_dot_turbo_kv_4b_sse_inner(
+        q_rot_block, block->mse_indices, per_block_scale, dim_in_block);
+}
+
 #define GGML_TURBO_KV_4B_HAVE_SSE 1
 
 #endif /* __SSE4_1__ && __SSSE3__ */

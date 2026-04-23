@@ -246,6 +246,9 @@ static void ggml_vec_dot_tq_kv_1b_f32(int n, float * GGML_RESTRICT s, size_t bs,
  * __SSE4_1__/__SSSE3__; on Westmere or newer x86 with -march=native we get
  * the fast path, otherwise this file's cpu trait for TURBO_KV_4B falls back
  * to the scalar ggml_vec_dot_turbo_kv_4b_f32 from ggml-base. */
+#if defined(__AVX2__)
+#include "arch/x86/turbo_kv_4b_avx2.h"
+#endif
 #if defined(GGML_CPU_HAVE_DOWNLEVEL_X86)
 #include "arch/x86/turbo_kv_4b_sse.h"
 #endif
@@ -257,19 +260,47 @@ static void ggml_vec_dot_turbo_kv_4b_f32_cpu(
 {
     GGML_UNUSED(bs); GGML_UNUSED(bx); GGML_UNUSED(by); GGML_UNUSED(nrc);
 
-    /* Delegate to the batched kernel with valid_count=1. The batched kernel
-     * rotates Q once per call — for the vec_dot path this is one rotation
-     * per K position (same overhead as before). But when the FA special
-     * case in ops.cpp calls turbo_kv_4b_attention_multi directly with
-     * valid_count=N, the rotation runs once per thread per head, not once
-     * per K position. So this wrapper is a correct fallback, not the hot path. */
-    turbo_kv_4b_attention_multi(
-        (const float *) vy,
-        (const block_turbo_kv_4b *) vx,
-        s,
-        /*valid_count=*/1,
-        /*head_dim=*/n,
-        /*k_stride_blocks=*/0);
+#if defined(GGML_TURBO_KV_4B_HAVE_AVX2) || defined(GGML_TURBO_KV_4B_HAVE_SSE)
+    /* Structure mirrors the scalar ggml_vec_dot_turbo_kv_4b_f32 in
+     * ggml-turbo-kv.c: pre-rotate query once per call, then loop per-block
+     * summing single_block_dot outputs. The SIMD win is in the per-block
+     * inner kernel (VPSHUFB-based codebook lookup), not in the outer loop. */
+    const float * q_raw = (const float *) vy;
+    const block_turbo_kv_4b * blocks = (const block_turbo_kv_4b *) vx;
+
+    float q_rot[4 * TURBO_KV_BLOCK_SIZE];
+    int rot_n = n;
+    if (rot_n > 4 * TURBO_KV_BLOCK_SIZE) rot_n = 4 * TURBO_KV_BLOCK_SIZE;
+    turbo_kv_rotate_query(q_raw, q_rot, rot_n);
+
+    float total = 0.0f;
+    int d = 0, b = 0;
+    while (d + TURBO_KV_BLOCK_SIZE <= rot_n) {
+#if defined(GGML_TURBO_KV_4B_HAVE_AVX2)
+        total += turbo_kv_4b_avx2_single_block_dot(
+            &blocks[b], q_rot + d, TURBO_KV_BLOCK_SIZE);
+#else
+        total += turbo_kv_4b_sse_single_block_dot(
+            &blocks[b], q_rot + d, TURBO_KV_BLOCK_SIZE);
+#endif
+        d += TURBO_KV_BLOCK_SIZE;
+        b++;
+    }
+    if (d < rot_n) {
+#if defined(GGML_TURBO_KV_4B_HAVE_AVX2)
+        total += turbo_kv_4b_avx2_single_block_dot(
+            &blocks[b], q_rot + d, rot_n - d);
+#else
+        total += turbo_kv_4b_sse_single_block_dot(
+            &blocks[b], q_rot + d, rot_n - d);
+#endif
+    }
+    *s = total;
+#else
+    /* No SIMD: the scalar reference (ggml-base) handles rotation and the
+     * per-block loop already. */
+    ggml_vec_dot_turbo_kv_4b_f32(n, s, bs, vx, bx, vy, by, nrc);
+#endif
 }
 
 static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
