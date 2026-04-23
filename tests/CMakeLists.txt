@@ -280,6 +280,13 @@ target_link_libraries(test-turbo-4b-codebook PRIVATE ggml-base ggml)
 add_executable(test-turbo-4b-e8p test-turbo-4b-e8p.cpp)
 target_link_libraries(test-turbo-4b-e8p PRIVATE ggml-base)
 
+# TurboQuant PBT: property-based tests from turbo-kv-4b.allium
+add_executable(test-turbo-kv-pbt test-turbo-kv-pbt.cpp)
+target_link_libraries(test-turbo-kv-pbt PRIVATE ggml-base
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../rapidcheck/build/librapidcheck.a)
+target_include_directories(test-turbo-kv-pbt PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../rapidcheck/include)
+
 add_executable(test-split-k-attention test-split-k-attention.cpp)
 
 add_executable(test-split-k-graph test-split-k-graph.cpp)

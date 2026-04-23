@@ -7830,6 +7830,18 @@ size_t ggml_quantize_chunk(
         case GGML_TYPE_TURBO_4B:   result = quantize_turbo_4b  (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_TURBO_4B_S: result = quantize_turbo_4b_s(src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_TURBO_5B:   result = quantize_turbo_5b  (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_TURBO_KV_4B: {
+            /* KV cache type — no imatrix path; just loop quantize_row_turbo_kv_4b_ref. */
+            const float * row_src = src + start;
+            char        * row_dst = (char *) dst + start_row * row_size;
+            for (int64_t r = 0; r < nrows; r++) {
+                quantize_row_turbo_kv_4b_ref(
+                    row_src + r * n_per_row,
+                    (block_turbo_kv_4b *) (row_dst + r * row_size),
+                    n_per_row);
+            }
+            result = nrows * row_size;
+        } break;
         case GGML_TYPE_F16:
             {
                 size_t elemsize = sizeof(ggml_fp16_t);
