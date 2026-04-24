@@ -107,6 +107,7 @@ public:
                      uint32_t   n_swa,
                llama_swa_type   swa_type,
                      uint32_t   residual_window, // fp16 rolling-tail size for TURBO_KV caches (0 = disabled)
+                    ggml_type   residual_window_type_k, // overlay dtype (F16 or BF16). Ignored when residual_window == 0.
         const layer_filter_cb & filter,
         const  layer_reuse_cb & reuse);
 
@@ -290,6 +291,11 @@ private:
     // fp16 in k_window_fp16 buffers rather than being quantised into k/k_rope.
     // Only meaningful for TURBO_KV_* K types; ignored by fp16/fp32 K caches.
     const uint32_t residual_window = 0;
+
+    // Overlay dtype — F16 or BF16. Resolved at context init from the user's
+    // cparam (which may be GGML_TYPE_COUNT = auto). Governs both the
+    // allocation type of k_window_fp16 and the cast inside cpy_k_window.
+    const ggml_type residual_window_type_k = GGML_TYPE_F16;
 
     // env: LLAMA_ATTN_ROT_DISABLE
     bool attn_rot_k = false;

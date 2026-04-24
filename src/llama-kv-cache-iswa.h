@@ -27,6 +27,7 @@ public:
                      uint32_t   n_ubatch,
                      uint32_t   n_pad,
                      uint32_t   residual_window, // fp16 rolling-tail size; applies only to the non-SWA base cache
+                    ggml_type   residual_window_type_k, // overlay dtype (F16/BF16)
         const layer_filter_cb & filter,
         const  layer_reuse_cb & reuse);
 

@@ -20,6 +20,7 @@ llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
                  uint32_t   n_ubatch,
                  uint32_t   n_pad,
                  uint32_t   residual_window,
+                ggml_type   residual_window_type_k,
                             /* recurrent */
                 ggml_type   type_r,
                 ggml_type   type_s,
@@ -46,6 +47,7 @@ llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
         n_ubatch,
         n_pad,
         residual_window,
+        residual_window_type_k,
         filter_attn == nullptr ?
             [&](int32_t il) { return !hparams.is_recurrent(il); }
             : filter_attn,

@@ -90,11 +90,14 @@ llama_kv_cache::llama_kv_cache(
                  uint32_t   n_swa,
            llama_swa_type   swa_type,
                  uint32_t   residual_window,
+                ggml_type   residual_window_type_k,
     const layer_filter_cb & filter,
     const  layer_reuse_cb & reuse) :
     model(model), hparams(model.hparams), v_trans(v_trans), type_k_static_(type_k_static),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa),
-    residual_window(residual_window), swa_type(swa_type) {
+    residual_window(residual_window),
+    residual_window_type_k(residual_window_type_k == GGML_TYPE_COUNT ? GGML_TYPE_F16 : residual_window_type_k),
+    swa_type(swa_type) {
 
     // Block-quantized V types can't use the transposed layout: the scatter-write
     // reshapes to [1, N] (violates blck_size alignment), and the transposed read
@@ -269,14 +272,14 @@ llama_kv_cache::llama_kv_cache(
         ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, type_v, n_embd_v_gqa, kv_size, n_stream) : nullptr;
         has_v && ggml_format_name(v, "cache_v_l%d", il);
 
-        // fp16 rolling-tail buffer for TURBO_KV residual-window caches.
-        // Allocated only when the cache was constructed with
-        // residual_window > 0 AND the layer has a K cache slot. Type is
-        // always F16 — the window stores pre-quantisation data by design.
+        // Residual-window overlay buffer for TURBO_KV caches. Allocated
+        // only when residual_window > 0 AND the layer has a K cache slot.
+        // Dtype is F16 or BF16 per residual_window_type_k (set at context
+        // init to match the model's native K activation range).
         ggml_tensor * k_window_fp16_t = nullptr;
         if (residual_window > 0 && has_k) {
-            k_window_fp16_t = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, n_embd_k_gqa, residual_window, n_stream);
-            ggml_format_name(k_window_fp16_t, "cache_k_window_fp16_l%d", il);
+            k_window_fp16_t = ggml_new_tensor_3d(ctx, residual_window_type_k, n_embd_k_gqa, residual_window, n_stream);
+            ggml_format_name(k_window_fp16_t, "cache_k_window_l%d", il);
         }
 
         std::vector<ggml_tensor *> k_stream;
@@ -1421,7 +1424,10 @@ ggml_tensor * llama_kv_cache::get_k_static(ggml_context * ctx, int32_t il, uint3
             ggml_row_size(ks->type, n_stat_gqa*kv_size)*sinfo.s0);
 }
 
-// split K: write the rope portion of k_cur to k_rope cache
+// residual window: write k_cur into the per-layer overlay buffer. The
+// destination dtype (F16 or BF16) was chosen at cache construction to
+// match the model's native K activation range — ggml_set_rows performs
+// the fp32->dest cast so BF16-native models cannot overflow.
 ggml_tensor * llama_kv_cache::cpy_k_window(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_window_idxs, int32_t il, const slot_info & sinfo) const {
     GGML_UNUSED(sinfo);
 
@@ -1445,13 +1451,11 @@ ggml_tensor * llama_kv_cache::cpy_k_window(ggml_context * ctx, ggml_tensor * k_c
     GGML_ASSERT(ggml_row_size(k_cur->type, n_embd_head) == k_cur->nb[1]);
 
     // merge [head_dim, n_head, n_tokens] -> [n_embd_gqa, n_tokens].
-    // Follows the shape pattern from cpy_k; ggml_set_rows internally
-    // handles the fp32 -> fp16 conversion required by the destination.
     k_cur = ggml_view_2d(ctx, k_cur, n_embd_gqa, n_tokens, k_cur->nb[2], 0);
 
-    // flatten k_window_fp16 [n_embd_gqa, residual_window, n_stream]
-    // -> [n_embd_gqa, residual_window * n_stream] so global indices
-    // from k_window_idxs address directly into it.
+    // flatten k_window [n_embd_gqa, residual_window, n_stream] ->
+    // [n_embd_gqa, residual_window * n_stream] so global indices from
+    // k_window_idxs address directly into it.
     const int64_t n_stream = k_win->ne[2];
     ggml_tensor * k_win_flat = k_win;
     if (n_stream > 1) {

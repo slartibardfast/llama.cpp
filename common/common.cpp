@@ -1482,6 +1482,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.type_v        = params.cache_type_v;
 
     cparams.residual_window = params.residual_window;
+    cparams.residual_window_type_k = params.residual_window_type_k;
 
     return cparams;
 }

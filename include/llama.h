@@ -367,6 +367,12 @@ extern "C" {
                                       // N > 0 = last N tokens stay in fp16, older tokens are quantized.
                                       // Clamped to n_ctx at init with a warning. [EXPERIMENTAL]
 
+        enum ggml_type residual_window_type_k; // dtype of the rolling-tail K buffer.
+                                      // GGML_TYPE_COUNT = auto (inherit from model's native K
+                                      // projection dtype; BF16 models get BF16 overlays, else F16).
+                                      // Only F16 and BF16 are supported; other types reject at init.
+                                      // Ignored when residual_window == 0. [EXPERIMENTAL]
+
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted
         // currently works only with CPU execution

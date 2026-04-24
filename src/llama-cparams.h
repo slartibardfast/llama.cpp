@@ -25,6 +25,10 @@ struct llama_cparams {
                               // `residual_window` tokens stay in fp16 and bypass quantization.
                               // Only meaningful when type_k or type_v is a TURBO_KV_* quantized
                               // type; ignored otherwise. Spec: turbo_kv_residual_window.allium.
+
+    enum ggml_type residual_window_type_k; // resolved dtype of the rolling-tail K buffer. Always
+                                           // one of GGML_TYPE_F16 or GGML_TYPE_BF16 after context
+                                           // init (auto-selection has already happened by then).
     // These hyperparameters are not exposed in GGUF, because all
     // existing YaRN models use the same values for them.
     float yarn_ext_factor;

@@ -552,6 +552,7 @@ struct common_params {
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
     uint32_t  residual_window = 128; // fp16 rolling tail for TURBO_KV quantised caches.
                                      // 0 = disabled. Only meaningful when cache_type_k/v is a TURBO_KV_* type.
+    ggml_type residual_window_type_k = GGML_TYPE_COUNT; // overlay dtype: F16, BF16, or COUNT=auto (BF16 on BF16-native models, else F16).
 
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 

@@ -2055,6 +2055,25 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_RESIDUAL_WINDOW"));
     add_opt(common_arg(
+        {"--cache-residual-window-type"}, "TYPE",
+        "dtype of the residual-window overlay buffer: auto|f16|bf16 (default: auto).\n"
+        "auto inherits from the model's native K projection dtype (BF16 for BF16-native\n"
+        "models, else F16). Use bf16 explicitly when the model was trained in BF16 but\n"
+        "stored as a different GGUF type (Q8_0, IQ3_XXS, etc.) to prevent overlay\n"
+        "overflow on heads with wide K dynamic range.",
+        [](common_params & params, const std::string & value) {
+            if (value == "auto" || value == "AUTO") {
+                params.residual_window_type_k = GGML_TYPE_COUNT;
+            } else if (value == "f16" || value == "F16") {
+                params.residual_window_type_k = GGML_TYPE_F16;
+            } else if (value == "bf16" || value == "BF16") {
+                params.residual_window_type_k = GGML_TYPE_BF16;
+            } else {
+                throw std::invalid_argument("--cache-residual-window-type must be auto|f16|bf16");
+            }
+        }
+    ).set_env("LLAMA_ARG_CACHE_RESIDUAL_WINDOW_TYPE"));
+    add_opt(common_arg(
         {"--hellaswag"},
         "compute HellaSwag score over random tasks from datafile supplied with -f",
         [](common_params & params) {

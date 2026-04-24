@@ -176,6 +176,51 @@ llama_context::llama_context(
         cparams.residual_window = cparams.n_ctx;
     }
 
+    // Resolve residual_window_type_k. The overlay must hold the activation
+    // range the model was trained at. Signals (in order of trust):
+    //   1. Any wk tensor is stored BF16 → BF16-native, use BF16.
+    //   2. All wk tensors are stored F16 → F16-native, use F16.
+    //   3. Any wk tensor is quantised (Q8_0, IQ3_XXS, ...) → source dtype
+    //      is unknown; default to BF16 as a strict-upgrade safe choice
+    //      (BF16 covers the fp16 range and the bf16 range).
+    // The user can override via params.residual_window_type_k.
+    {
+        enum ggml_type user_rw_type_k = params.residual_window_type_k;
+        if (user_rw_type_k == GGML_TYPE_COUNT) {
+            bool any_bf16      = false;
+            bool any_quantised = false;
+            bool any_f16       = false;
+            for (const auto & layer : model.layers) {
+                if (!layer.wk) continue;
+                switch (layer.wk->type) {
+                    case GGML_TYPE_BF16: any_bf16 = true; break;
+                    case GGML_TYPE_F16:  any_f16  = true; break;
+                    case GGML_TYPE_F32:  any_f16  = true; break; // fp32-stored → F16 overlay is exact
+                    default:             any_quantised = true; break;
+                }
+            }
+            if (any_bf16) {
+                cparams.residual_window_type_k = GGML_TYPE_BF16;
+            } else if (any_quantised && !any_f16) {
+                cparams.residual_window_type_k = GGML_TYPE_BF16;
+            } else {
+                cparams.residual_window_type_k = GGML_TYPE_F16;
+            }
+        } else if (user_rw_type_k == GGML_TYPE_F16 || user_rw_type_k == GGML_TYPE_BF16) {
+            cparams.residual_window_type_k = user_rw_type_k;
+        } else {
+            LLAMA_LOG_WARN("%s: residual_window_type_k=%s not supported (only F16/BF16); "
+                           "falling back to F16\n", __func__, ggml_type_name(user_rw_type_k));
+            cparams.residual_window_type_k = GGML_TYPE_F16;
+        }
+
+        if (cparams.residual_window > 0) {
+            LLAMA_LOG_INFO("%s: residual_window=%u, overlay dtype=%s\n",
+                __func__, cparams.residual_window,
+                ggml_type_name(cparams.residual_window_type_k));
+        }
+    }
+
     // initialized later
     cparams.pipeline_parallel = false;
 
@@ -2991,6 +3036,9 @@ llama_context_params llama_context_default_params() {
                                                 // TURBO_KV caches. Ignored when
                                                 // type_k/type_v is not a
                                                 // TURBO_KV_* type.
+        /*.residual_window_type_k      =*/ GGML_TYPE_COUNT, // auto: inherit from
+                                                // model's native K projection
+                                                // dtype at context init.
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,

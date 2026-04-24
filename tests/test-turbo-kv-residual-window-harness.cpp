@@ -15,6 +15,8 @@
  *   --rw N            residual_window value (default 0)
  *   --ctx N           n_ctx (default 512)
  *   --type-k NAME     K cache type: f16 | f32 | turbo_kv_4b (default f16)
+ *   --rw-type-k NAME  residual-window overlay dtype: auto | f16 | bf16
+ *                     (default auto — inherit from model's native K dtype)
  *   --append N        run N incremental decode() calls with a dummy
  *                     token each to exercise the KV-cache write path
  *                     (default 0 — skip decode, init-only smoke)
@@ -62,10 +64,12 @@ int main(int argc, char ** argv) {
     }
 
     const char * model_path = argv[1];
-    uint32_t  rw      = 0;
-    uint32_t  n_ctx   = 512;
-    ggml_type type_k  = GGML_TYPE_F16;
-    std::string type_k_name = "f16";
+    uint32_t  rw             = 0;
+    uint32_t  n_ctx          = 512;
+    ggml_type type_k         = GGML_TYPE_F16;
+    std::string type_k_name  = "f16";
+    ggml_type rw_type_k      = GGML_TYPE_COUNT; // auto
+    std::string rw_type_k_name = "auto";
     int append_n = 0;
     bool verbose = false;
 
@@ -84,6 +88,18 @@ int main(int argc, char ** argv) {
             type_k = parse_type_k(type_k_name.c_str());
             if (type_k == GGML_TYPE_COUNT) {
                 fprintf(stderr, "unknown --type-k value: %s\n", type_k_name.c_str());
+                return 1;
+            }
+        } else if (strcmp(a, "--rw-type-k") == 0 && i + 1 < argc) {
+            rw_type_k_name = argv[++i];
+            if (rw_type_k_name == "auto") {
+                rw_type_k = GGML_TYPE_COUNT;
+            } else if (rw_type_k_name == "f16") {
+                rw_type_k = GGML_TYPE_F16;
+            } else if (rw_type_k_name == "bf16") {
+                rw_type_k = GGML_TYPE_BF16;
+            } else {
+                fprintf(stderr, "unknown --rw-type-k value: %s (auto|f16|bf16)\n", rw_type_k_name.c_str());
                 return 1;
             }
         } else if (strcmp(a, "--append") == 0 && i + 1 < argc) {
@@ -121,11 +137,12 @@ int main(int argc, char ** argv) {
     }
 
     llama_context_params cparams = llama_context_default_params();
-    cparams.n_ctx           = n_ctx;
-    cparams.n_batch         = n_ctx;      /* safe default for PP */
-    cparams.n_ubatch        = n_ctx;
-    cparams.type_k          = type_k;
-    cparams.residual_window = rw;
+    cparams.n_ctx                  = n_ctx;
+    cparams.n_batch                = n_ctx;      /* safe default for PP */
+    cparams.n_ubatch               = n_ctx;
+    cparams.type_k                 = type_k;
+    cparams.residual_window        = rw;
+    cparams.residual_window_type_k = rw_type_k;
 
     llama_context * ctx = llama_init_from_model(model, cparams);
     if (!ctx) {
@@ -163,8 +180,8 @@ int main(int argc, char ** argv) {
         llama_batch_free(batch);
     }
 
-    fprintf(stdout, "HARNESS_OK rw=%u ctx=%u type_k=%s decoded=%d\n",
-        rw, (uint32_t) llama_n_ctx(ctx), type_k_name.c_str(), decoded);
+    fprintf(stdout, "HARNESS_OK rw=%u ctx=%u type_k=%s rw_type_k=%s decoded=%d\n",
+        rw, (uint32_t) llama_n_ctx(ctx), type_k_name.c_str(), rw_type_k_name.c_str(), decoded);
 
     llama_free(ctx);
     llama_model_free(model);
