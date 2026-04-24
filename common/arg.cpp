@@ -393,12 +393,19 @@ const std::vector<ggml_type> kv_cache_types = {
 };
 
 static ggml_type kv_cache_type_from_str(const std::string & s) {
+    if (s == "auto" || s == "AUTO") {
+        return GGML_TYPE_COUNT; // signals auto-native resolution at context init
+    }
     for (const auto & type : kv_cache_types) {
         if (ggml_type_name(type) == s) {
             return type;
         }
     }
     throw std::runtime_error("Unsupported cache type: " + s);
+}
+
+static const char * kv_cache_type_name_or_auto(ggml_type t) {
+    return t == GGML_TYPE_COUNT ? "auto" : ggml_type_name(t);
 }
 
 static std::string get_all_kv_cache_types() {
@@ -2008,11 +2015,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"-ctk", "--cache-type-k"}, "TYPE",
         string_format(
-            "KV cache data type for K (use type1:type2 for split K by RoPE boundary)\n"
-            "allowed values: %s\n"
+            "KV cache data type for K (use type1:type2 for split K by RoPE boundary).\n"
+            "'auto' inherits the model's native float type (BF16 for BF16-native models,\n"
+            "else F16). Quantised types are respected verbatim.\n"
+            "allowed values: auto, %s\n"
             "(default: %s)",
             get_all_kv_cache_types().c_str(),
-            ggml_type_name(params.cache_type_k)
+            kv_cache_type_name_or_auto(params.cache_type_k)
         ),
         [](common_params & params, const std::string & value) {
             auto colon = value.find(':');
@@ -2028,11 +2037,12 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"-ctv", "--cache-type-v"}, "TYPE",
         string_format(
-            "KV cache data type for V\n"
-            "allowed values: %s\n"
+            "KV cache data type for V. 'auto' inherits the model's native float type\n"
+            "(same rule as --cache-type-k).\n"
+            "allowed values: auto, %s\n"
             "(default: %s)",
             get_all_kv_cache_types().c_str(),
-            ggml_type_name(params.cache_type_v)
+            kv_cache_type_name_or_auto(params.cache_type_v)
         ),
         [](common_params & params, const std::string & value) {
             params.cache_type_v = kv_cache_type_from_str(value);
@@ -3605,11 +3615,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"-ctkd", "--cache-type-k-draft"}, "TYPE",
         string_format(
-            "KV cache data type for K for the draft model\n"
-            "allowed values: %s\n"
+            "KV cache data type for K for the draft model. 'auto' inherits native float.\n"
+            "allowed values: auto, %s\n"
             "(default: %s)",
             get_all_kv_cache_types().c_str(),
-            ggml_type_name(params.speculative.cache_type_k)
+            kv_cache_type_name_or_auto(params.speculative.cache_type_k)
         ),
         [](common_params & params, const std::string & value) {
             params.speculative.cache_type_k = kv_cache_type_from_str(value);
@@ -3618,11 +3628,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"-ctvd", "--cache-type-v-draft"}, "TYPE",
         string_format(
-            "KV cache data type for V for the draft model\n"
-            "allowed values: %s\n"
+            "KV cache data type for V for the draft model. 'auto' inherits native float.\n"
+            "allowed values: auto, %s\n"
             "(default: %s)",
             get_all_kv_cache_types().c_str(),
-            ggml_type_name(params.speculative.cache_type_v)
+            kv_cache_type_name_or_auto(params.speculative.cache_type_v)
         ),
         [](common_params & params, const std::string & value) {
             params.speculative.cache_type_v = kv_cache_type_from_str(value);

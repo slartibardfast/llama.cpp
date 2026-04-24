@@ -358,9 +358,12 @@ extern "C" {
         ggml_backend_sched_eval_callback cb_eval;
         void * cb_eval_user_data;
 
-        enum ggml_type type_k;        // data type for K cache (or rope dims if split) [EXPERIMENTAL]
+        enum ggml_type type_k;        // data type for K cache (or rope dims if split).
+                                      // GGML_TYPE_COUNT = auto: inherit model's native float
+                                      // (BF16 for BF16-native models, else F16). Quantised
+                                      // types (Q8_0, turbo_kv_4b, ...) are respected verbatim. [EXPERIMENTAL]
         enum ggml_type type_k_static; // split K: type for static (non-RoPE) dims. GGML_TYPE_COUNT = no split [EXPERIMENTAL]
-        enum ggml_type type_v;        // data type for V cache [EXPERIMENTAL]
+        enum ggml_type type_v;        // data type for V cache. GGML_TYPE_COUNT = auto (same rule as type_k). [EXPERIMENTAL]
 
         uint32_t residual_window;     // fp16 rolling-tail size on TURBO_KV quantized KV caches.
                                       // 0 = disabled (all positions quantized).

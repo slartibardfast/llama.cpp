@@ -342,8 +342,8 @@ struct common_params_speculative {
     int32_t n_ctx        = 0;  // draft context size
     int32_t n_gpu_layers = -1; // number of layers to store in VRAM for the draft model (-1 - use default)
 
-    ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
-    ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
+    ggml_type cache_type_k = GGML_TYPE_COUNT; // draft K cache dtype. COUNT = auto (native float).
+    ggml_type cache_type_v = GGML_TYPE_COUNT; // draft V cache dtype. COUNT = auto (native float).
 
     struct cpu_params cpuparams;
     struct cpu_params cpuparams_batch;
@@ -547,9 +547,9 @@ struct common_params {
 
     bool single_turn       = false; // single turn chat conversation
 
-    ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for K (or rope dims if split)
+    ggml_type cache_type_k = GGML_TYPE_COUNT; // K cache dtype. COUNT = auto (native float: BF16 for BF16-native models, else F16). Explicit types respected.
     ggml_type cache_type_k_static = GGML_TYPE_COUNT; // split K: type for static (non-RoPE) dims. COUNT = no split
-    ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
+    ggml_type cache_type_v = GGML_TYPE_COUNT; // V cache dtype. COUNT = auto (same rule as cache_type_k).
     uint32_t  residual_window = 128; // fp16 rolling tail for TURBO_KV quantised caches.
                                      // 0 = disabled. Only meaningful when cache_type_k/v is a TURBO_KV_* type.
     ggml_type residual_window_type_k = GGML_TYPE_COUNT; // overlay dtype: F16, BF16, or COUNT=auto (BF16 on BF16-native models, else F16).
