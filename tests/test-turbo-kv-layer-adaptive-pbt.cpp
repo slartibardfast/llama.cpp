@@ -10,7 +10,7 @@
  * base K/V bit-widths from turbo_kv_asymmetric. [TONBI-V3]
  * measurement shows this lifts K4/V2 top-1 agreement 94% → 99%
  * on Llama 3.2 class models. The port applies TURBO_KV_4B
- * uniformly across all layers. See PHASE26 Tier 2.1.
+ * uniformly across all layers. See the layer-adaptive spec.
  *
  * When layer-adaptive ships (per-layer metadata OR a second
  * higher-bit ggml type registered alongside TURBO_KV_4B):
@@ -63,7 +63,7 @@ static void fail(const char * obligation_id, const char * reason) {
 }
 
 static constexpr const char * SKIP_NOT_IMPLEMENTED =
-    "layer-adaptive not implemented in port (PHASE26 Tier 2.1)";
+    "layer-adaptive not implemented in port";
 
 /* ----------------------------------------------------------------
  * config-default.{protected_layers, protected_bits, n_layers}
@@ -178,7 +178,7 @@ int main() {
     fprintf(stdout,
         "=== test-turbo-kv-layer-adaptive-pbt ===\n"
         "Spec: turbo_kv_layer_adaptive.allium\n"
-        "Port status: layer-adaptive NOT implemented (PHASE26 Tier 2.1)\n"
+        "Port status: layer-adaptive NOT implemented\n"
         "12 obligations — implementation-dependent ones SKIP.\n\n");
 
     obligation_config_default_protected_layers();

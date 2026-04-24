@@ -7,7 +7,7 @@
  * Status: feature not yet implemented in this port. The residual
  * window is a sibling improvement on top of TURBO_KV_4B that keeps
  * the most recent N tokens in fp16 uncompressed and quantises only
- * the older tail. See PHASE26.md Tier 1.1 for motivation and the
+ * the older tail. See the residual-window spec for motivation and the
  * 9B PPL regression evidence.
  *
  * This file establishes the full obligation list against the spec
@@ -100,7 +100,7 @@ static void fail(const char * obligation_id, const char * reason) {
  * window API yet). Listing the missing pieces once here keeps the
  * per-test reason strings short.
  *
- * What the port is missing (per PHASE26 T1.1 / weed 2026-04-24):
+ * What the port is missing (per the residual-window spec / weed 2026-04-24):
  *   - No residual_window cache config on llama_context or the
  *     KV-cache struct in src/.
  *   - No fp16 side-buffer allocation for recent tokens.
@@ -113,7 +113,7 @@ static void fail(const char * obligation_id, const char * reason) {
  * ================================================================ */
 
 static constexpr const char * SKIP_NOT_IMPLEMENTED =
-    "residual_window not implemented in port (PHASE26 Tier 1.1)";
+    "residual_window not implemented in port";
 
 /* ================================================================
  * OBLIGATION: entity-fields.{Tensor, FloatRow, QuantizedHead}
@@ -375,7 +375,7 @@ int main() {
     fprintf(stdout,
         "=== test-turbo-kv-residual-window-pbt ===\n"
         "Spec: turbo_kv_residual_window.allium\n"
-        "Port status: residual_window NOT implemented (PHASE26 Tier 1.1)\n"
+        "Port status: residual_window NOT implemented\n"
         "22 obligations — every implementation-dependent one SKIPs.\n\n");
 
     obligation_entity_fields_Tensor();

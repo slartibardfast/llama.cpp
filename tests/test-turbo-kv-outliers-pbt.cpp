@@ -12,7 +12,7 @@
  * [QUANT.CPP] ships this as block_tq_turbo_kv_4bo (96 B / 128 elem,
  * +24 B over 4b) and block_tq_turbo_kv_3bo (80 B / 128 elem,
  * +24 B over 3b). Port has no TURBO_KV_4BO / TURBO_KV_3BO types.
- * See PHASE26 Tier 2.2 (highest implementation cost of the four
+ * See the outlier-handling spec (highest implementation cost of the four
  * sibling improvements — "about the same effort as adding a whole
  * new precision tier").
  *
@@ -64,7 +64,7 @@ static void fail(const char * obligation_id, const char * reason) {
 }
 
 static constexpr const char * SKIP_NOT_IMPLEMENTED =
-    "outlier handling not implemented in port (PHASE26 Tier 2.2)";
+    "outlier handling not implemented in port";
 
 /* ----------------------------------------------------------------
  * entity-fields.{Tensor, OutlierEntry, QuantizedHeadWithOutliers}
@@ -193,7 +193,7 @@ int main() {
     fprintf(stdout,
         "=== test-turbo-kv-outliers-pbt ===\n"
         "Spec: turbo_kv_outliers.allium\n"
-        "Port status: outlier handling NOT implemented (PHASE26 Tier 2.2)\n"
+        "Port status: outlier handling NOT implemented\n"
         "16 obligations — implementation-dependent ones SKIP.\n\n");
 
     obligation_entity_fields_Tensor();

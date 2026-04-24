@@ -9,7 +9,7 @@
  * [TONBI-V3] measurement supports K4/V2 + protected layers at
  * cosine 0.9997, 99% top-1 agreement, 3.6x compression. The port
  * shares one ggml type (TURBO_KV_4B) between K and V — at 9B in
- * production V is still F16 entirely. See PHASE26.md Tier 1.2 for
+ * production V is still F16 entirely. See the asymmetric-K/V spec for
  * motivation.
  *
  * When asymmetric K/V ships (either as a second ggml type pair or
@@ -67,7 +67,7 @@ static void fail(const char * obligation_id, const char * reason) {
 }
 
 static constexpr const char * SKIP_NOT_IMPLEMENTED =
-    "asymmetric K/V not implemented in port (PHASE26 Tier 1.2)";
+    "asymmetric K/V not implemented in port";
 
 /* ----------------------------------------------------------------
  * entity-fields.{Tensor, QuantizedHead}
@@ -200,7 +200,7 @@ int main() {
     fprintf(stdout,
         "=== test-turbo-kv-asymmetric-pbt ===\n"
         "Spec: turbo_kv_asymmetric.allium\n"
-        "Port status: asymmetric K/V NOT implemented (PHASE26 Tier 1.2)\n"
+        "Port status: asymmetric K/V NOT implemented\n"
         "14 obligations — implementation-dependent ones SKIP.\n\n");
 
     obligation_entity_fields_Tensor();
