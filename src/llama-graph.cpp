@@ -467,6 +467,13 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
 
     mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
 
+    if (self_kq_mask_pass_a) {
+        mctx->set_input_kq_mask_pass_a(self_kq_mask_pass_a, ubatch, cparams.causal_attn);
+    }
+    if (self_kq_mask_pass_b) {
+        mctx->set_input_kq_mask_pass_b(self_kq_mask_pass_b, ubatch, cparams.causal_attn);
+    }
+
     if (self_k_rot) {
         mctx->set_input_k_rot(self_k_rot);
     }
@@ -600,6 +607,13 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
     }
 
     mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
+
+    if (inp_attn->self_kq_mask_pass_a) {
+        mctx->get_attn()->set_input_kq_mask_pass_a(inp_attn->self_kq_mask_pass_a, ubatch, cparams.causal_attn);
+    }
+    if (inp_attn->self_kq_mask_pass_b) {
+        mctx->get_attn()->set_input_kq_mask_pass_b(inp_attn->self_kq_mask_pass_b, ubatch, cparams.causal_attn);
+    }
 
     if (inp_attn->self_k_rot) {
         mctx->get_attn()->set_input_k_rot(inp_attn->self_k_rot);
@@ -2023,6 +2037,121 @@ ggml_tensor * llm_graph_context::build_attn_mha(
     return cur;
 }
 
+// Online-softmax merge of two ggml_flash_attn_ext_lse outputs. Each
+// input has shape [DV+2, H, N, ne3]: rows [0..DV) hold unscaled VKQ,
+// row DV holds M (max exponent), row DV+1 holds S (sum of
+// exponentials). Returns [DV, H, N, ne3] equal to a single FA over
+// the union of the two input mask supports.
+//
+// Covered numerically by tests/test-flash-attn-lse-merge.cpp including
+// the empty-pass handover corner (M clamped to -1e30 before the
+// elementwise max to avoid NaN from (-inf + +inf)).
+static ggml_tensor * build_fa_lse_merge(
+        ggml_context * ctx,
+        ggml_tensor  * lse_a,
+        ggml_tensor  * lse_b) {
+    GGML_ASSERT(lse_a->type == GGML_TYPE_F32);
+    GGML_ASSERT(lse_b->type == GGML_TYPE_F32);
+    GGML_ASSERT(lse_a->ne[0] == lse_b->ne[0]);
+    GGML_ASSERT(lse_a->ne[0] >= 3);
+
+    const int64_t DV  = lse_a->ne[0] - 2;
+    const int64_t H   = lse_a->ne[1];
+    const int64_t N   = lse_a->ne[2];
+    const int64_t ne3 = lse_a->ne[3];
+    const size_t  es  = ggml_element_size(lse_a);
+
+    auto slice = [&](ggml_tensor * src, int64_t row_offset, int64_t rows) {
+        ggml_tensor * v = ggml_view_4d(ctx, src,
+                rows, H, N, ne3,
+                src->nb[1], src->nb[2], src->nb[3],
+                row_offset * es);
+        return ggml_cont(ctx, v);
+    };
+
+    ggml_tensor * VKQ_a = slice(lse_a, 0,      DV);
+    ggml_tensor * VKQ_b = slice(lse_b, 0,      DV);
+    ggml_tensor * M_a   = slice(lse_a, DV,     1);
+    ggml_tensor * M_b   = slice(lse_b, DV,     1);
+    ggml_tensor * S_a   = slice(lse_a, DV + 1, 1);
+    ggml_tensor * S_b   = slice(lse_b, DV + 1, 1);
+
+    const float M_FLOOR = -1.0e30f;
+    M_a = ggml_clamp(ctx, M_a, M_FLOOR, INFINITY);
+    M_b = ggml_clamp(ctx, M_b, M_FLOOR, INFINITY);
+
+    ggml_tensor * M_new = ggml_scale(ctx,
+            ggml_add(ctx, ggml_add(ctx, M_a, M_b),
+                          ggml_abs(ctx, ggml_sub(ctx, M_a, M_b))),
+            0.5f);
+
+    ggml_tensor * sa = ggml_exp(ctx, ggml_sub(ctx, M_a, M_new));
+    ggml_tensor * sb = ggml_exp(ctx, ggml_sub(ctx, M_b, M_new));
+
+    ggml_tensor * S_new = ggml_add(ctx,
+            ggml_mul(ctx, sa, S_a),
+            ggml_mul(ctx, sb, S_b));
+
+    ggml_tensor * VKQ = ggml_add(ctx,
+            ggml_mul(ctx, VKQ_a, sa),
+            ggml_mul(ctx, VKQ_b, sb));
+
+    return ggml_div(ctx, VKQ, S_new);
+}
+
+ggml_tensor * llm_graph_context::build_attn_mha_two_pass(
+         ggml_tensor * q,
+         ggml_tensor * k,
+         ggml_tensor * v,
+         ggml_tensor * kq_mask_a,
+         ggml_tensor * kq_mask_b,
+               float   kq_scale,
+                 int   il) const {
+    GGML_ASSERT(cparams.flash_attn && "two-pass read path requires flash_attn");
+    GGML_ASSERT(kq_mask_a && kq_mask_b);
+
+    const bool v_trans = v->nb[1] > v->nb[2];
+    const auto n_stream = k->ne[3];
+
+    q = ggml_view_4d(ctx0, q, q->ne[0], q->ne[1], q->ne[2]/n_stream, n_stream,
+                     q->nb[1], q->nb[2], q->nb[3]/n_stream, 0);
+
+    q = ggml_permute(ctx0, q, 0, 2, 1, 3);
+    k = ggml_permute(ctx0, k, 0, 2, 1, 3);
+    v = ggml_permute(ctx0, v, 0, 2, 1, 3);
+
+    if (v_trans) {
+        v = ggml_transpose(ctx0, v);
+    }
+    if (k->type == GGML_TYPE_F32) {
+        k = ggml_cast(ctx0, k, GGML_TYPE_F16);
+    }
+    if (v->type == GGML_TYPE_F32) {
+        v = ggml_cast(ctx0, v, GGML_TYPE_F16);
+    }
+
+    const float max_bias = hparams.f_max_alibi_bias;
+    const float logit_sc = hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f;
+
+    ggml_tensor * lse_a = ggml_flash_attn_ext_lse(ctx0, q, k, v, kq_mask_a, kq_scale, max_bias, logit_sc);
+    ggml_tensor * lse_b = ggml_flash_attn_ext_lse(ctx0, q, k, v, kq_mask_b, kq_scale, max_bias, logit_sc);
+    ggml_flash_attn_ext_set_prec(lse_a, GGML_PREC_F32);
+    ggml_flash_attn_ext_set_prec(lse_b, GGML_PREC_F32);
+    // Name must start with LLAMA_TENSOR_NAME_FATTN "-" so the auto-FA
+    // device-mismatch probe in llama_context::sched_reserve can parse
+    // the layer index. cb() already appends "-<il>".
+    cb(lse_a, LLAMA_TENSOR_NAME_FATTN, il);
+    cb(lse_b, LLAMA_TENSOR_NAME_FATTN, il);
+
+    ggml_tensor * cur = build_fa_lse_merge(ctx0, lse_a, lse_b);
+    cb(cur, "fattn_merge", il);
+
+    cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
+
+    ggml_build_forward_expand(gf, cur);
+    return cur;
+}
+
 llm_graph_input_attn_no_cache * llm_graph_context::build_attn_inp_no_cache() const {
     auto inp = std::make_unique<llm_graph_input_attn_no_cache>(hparams, cparams);
 
@@ -2116,6 +2245,21 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
 
         inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams);
         inp->self_kq_mask_cnv = cparams.flash_attn ? ggml_cast(ctx0, inp->self_kq_mask, GGML_TYPE_F16) : inp->self_kq_mask;
+
+        // Residual-window two-pass masks. Allocated whenever the cache
+        // has a residual window; consumed by build_attn only when it
+        // dispatches the two-pass read path. Same shape and cast rules
+        // as the base kq_mask.
+        if (mctx_cur->has_residual_window()) {
+            inp->self_kq_mask_pass_a = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams);
+            inp->self_kq_mask_pass_a_cnv = cparams.flash_attn
+                ? ggml_cast(ctx0, inp->self_kq_mask_pass_a, GGML_TYPE_F16)
+                : inp->self_kq_mask_pass_a;
+            inp->self_kq_mask_pass_b = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams);
+            inp->self_kq_mask_pass_b_cnv = cparams.flash_attn
+                ? ggml_cast(ctx0, inp->self_kq_mask_pass_b, GGML_TYPE_F16)
+                : inp->self_kq_mask_pass_b;
+        }
     }
 
     inp->self_k_rot = mctx_cur->build_input_k_rot(ctx0);
@@ -2269,7 +2413,28 @@ ggml_tensor * llm_graph_context::build_attn(
         }
     }
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
+    // Residual-window two-pass read-path dispatch. In this iteration
+    // both passes still read from the main K/V cache — pass_a over the
+    // "old" range (positions older than residual_window) and pass_b over
+    // the "recent" range. The two masks partition the base kq_mask, so
+    // the merged result must equal a single-pass FA numerically. This
+    // proves out the dispatch/merge wiring before the follow-up commit
+    // swaps pass_b's K for the overlay.
+    const bool overlay_two_pass =
+        cparams.flash_attn &&
+        mctx_cur->has_residual_window() &&
+        inp->self_kq_mask_pass_a_cnv != nullptr &&
+        inp->self_kq_mask_pass_b_cnv != nullptr &&
+        kq_b == nullptr &&
+        sinks == nullptr &&
+        v_mla == nullptr;
+
+    ggml_tensor * cur = overlay_two_pass
+        ? build_attn_mha_two_pass(q, k, v,
+              inp->self_kq_mask_pass_a_cnv,
+              inp->self_kq_mask_pass_b_cnv,
+              kq_scale, il)
+        : build_attn_mha(q, k, v, kq_b, kq_mask, sinks, v_mla, kq_scale, il);
     cb(cur, "kqv_out", il);
 
     if (inp->self_v_rot) {

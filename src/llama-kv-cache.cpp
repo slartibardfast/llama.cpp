@@ -1923,6 +1923,14 @@ static void set_input_kq_mask_impl(const args_set_input_kq_mask & args, float * 
 }
 
 void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
+    // When the graph builder picks the two-pass read path, it builds
+    // inp->self_kq_mask but never references it from any graph output —
+    // the scheduler then skips allocating a backing buffer. Skip the
+    // population rather than dereferencing a null buffer.
+    if (dst->buffer == nullptr) {
+        return;
+    }
+
     const uint32_t n_tokens = ubatch->n_tokens;
 
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
@@ -1959,6 +1967,86 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
     //const int64_t t_end = ggml_time_us();
 
     //LLAMA_LOG_ERROR("%s: kq mask time: %0.3f ms\n", __func__, (t_end - t_start)/1000.0);
+}
+
+// Partition the base kq_mask over stored-position vs query-position into
+// two halves for the residual-window two-pass read path. Cells visible in
+// the base mask (data == 0) flip to -INFINITY in one pass or the other
+// depending on whether p0 > p1 - residual_window (recent) or <= (old).
+// Cells masked in the base stay -INFINITY in both. No attempt to handle
+// SWA / ALiBi / 2D MRoPE here — those are asserted off in
+// turbo_kv_residual_window.allium's invariants and the callers only
+// activate this path when the overlay is live.
+void llama_kv_cache::set_input_kq_mask_pass_a(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
+    GGML_ASSERT(residual_window > 0);
+
+    // First fill the dst with the base mask.
+    set_input_kq_mask(dst, ubatch, causal_attn);
+
+    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+    float * data = (float *) dst->data;
+
+    const int64_t n_kv     = dst->ne[0];
+    const int64_t n_stream = dst->ne[3];
+    const int64_t n_tps    = ubatch->n_tokens / n_stream;
+
+    const int32_t rw = (int32_t) residual_window;
+
+    for (int64_t s = 0; s < n_stream; ++s) {
+        for (int64_t ii = 0; ii < n_tps; ++ii) {
+            const int64_t i = s * n_tps + ii;
+            const llama_seq_id seq_id = ubatch->seq_id[i][0];
+            const auto & cells = v_cells.at(seq_to_stream[seq_id]);
+            const llama_pos p1 = ubatch->pos[i];
+            const uint64_t idst = n_kv * i;
+
+            for (int64_t j = 0; j < n_kv; ++j) {
+                if (data[idst + j] == -INFINITY) continue;
+                if (cells.is_empty(j))           continue;
+                const llama_pos p0 = cells.pos_get(j);
+                // Pass A sees old positions only. Mask out cells within the
+                // recent window.
+                if (p0 > p1 - rw) {
+                    data[idst + j] = -INFINITY;
+                }
+            }
+        }
+    }
+}
+
+void llama_kv_cache::set_input_kq_mask_pass_b(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
+    GGML_ASSERT(residual_window > 0);
+
+    set_input_kq_mask(dst, ubatch, causal_attn);
+
+    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+    float * data = (float *) dst->data;
+
+    const int64_t n_kv     = dst->ne[0];
+    const int64_t n_stream = dst->ne[3];
+    const int64_t n_tps    = ubatch->n_tokens / n_stream;
+
+    const int32_t rw = (int32_t) residual_window;
+
+    for (int64_t s = 0; s < n_stream; ++s) {
+        for (int64_t ii = 0; ii < n_tps; ++ii) {
+            const int64_t i = s * n_tps + ii;
+            const llama_seq_id seq_id = ubatch->seq_id[i][0];
+            const auto & cells = v_cells.at(seq_to_stream[seq_id]);
+            const llama_pos p1 = ubatch->pos[i];
+            const uint64_t idst = n_kv * i;
+
+            for (int64_t j = 0; j < n_kv; ++j) {
+                if (data[idst + j] == -INFINITY) continue;
+                if (cells.is_empty(j))           continue;
+                const llama_pos p0 = cells.pos_get(j);
+                // Pass B sees recent positions only. Mask out old cells.
+                if (p0 <= p1 - rw) {
+                    data[idst + j] = -INFINITY;
+                }
+            }
+        }
+    }
 }
 
 void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {
@@ -2897,6 +2985,14 @@ void llama_kv_cache_context::set_input_v_idxs(ggml_tensor * dst, const llama_uba
 
 void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
     kv->set_input_kq_mask(dst, ubatch, causal_attn);
+}
+
+void llama_kv_cache_context::set_input_kq_mask_pass_a(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
+    kv->set_input_kq_mask_pass_a(dst, ubatch, causal_attn);
+}
+
+void llama_kv_cache_context::set_input_kq_mask_pass_b(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
+    kv->set_input_kq_mask_pass_b(dst, ubatch, causal_attn);
 }
 
 void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {

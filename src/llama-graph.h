@@ -303,12 +303,24 @@ public:
 
     ggml_tensor * get_kq_mask() const { return self_kq_mask_cnv; }
 
+    // Residual-window two-pass masks. Non-null only when the owning cache
+    // has a residual window and this graph is built for the overlay read
+    // path. Shape matches self_kq_mask_cnv.
+    ggml_tensor * get_kq_mask_pass_a() const { return self_kq_mask_pass_a_cnv; }
+    ggml_tensor * get_kq_mask_pass_b() const { return self_kq_mask_pass_b_cnv; }
+
     ggml_tensor * self_k_idxs = nullptr; // I64 [n_batch]
     ggml_tensor * self_v_idxs = nullptr; // I64 [n_batch] or [n_batch*n_embd_v_gqa]
     ggml_tensor * self_k_window_idxs = nullptr; // I64 [n_batch] — fp16 rolling-tail slot per token
 
     ggml_tensor * self_kq_mask     = nullptr; // F32 [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_cnv = nullptr; //     [n_kv, n_batch/n_stream, 1, n_stream]
+
+    // Two-pass read-path masks, see comment on get_kq_mask_pass_*.
+    ggml_tensor * self_kq_mask_pass_a     = nullptr;
+    ggml_tensor * self_kq_mask_pass_a_cnv = nullptr;
+    ggml_tensor * self_kq_mask_pass_b     = nullptr;
+    ggml_tensor * self_kq_mask_pass_b_cnv = nullptr;
 
     // note: assumes v_rot^2 == I
     ggml_tensor * self_k_rot = nullptr;
@@ -897,6 +909,25 @@ struct llm_graph_context {
                   float   kq_scale,
                     int   il,
             ggml_tensor * kq_pre = nullptr) const; // pre-computed Q@K^T scores (split attention)
+
+    // Two-pass flash-attention with online-softmax merge. Runs
+    // ggml_flash_attn_ext_lse twice — once with kq_mask_a, once with
+    // kq_mask_b — over the same q/k/v, then combines the outputs so the
+    // result equals a single ggml_flash_attn_ext over (kq_mask_a |
+    // kq_mask_b). Used by the residual-window read path:
+    //   pass_a covers "old" positions (main cache attendees further back
+    //   than residual_window), pass_b covers the recent overlay range.
+    // In this iteration pass_b reads the same main K/V as pass_a; the
+    // overlay-K swap lands in a follow-up commit. Requires flash-attn
+    // enabled; asserts on anything else.
+    ggml_tensor * build_attn_mha_two_pass(
+            ggml_tensor * q,
+            ggml_tensor * k,
+            ggml_tensor * v,
+            ggml_tensor * kq_mask_a,
+            ggml_tensor * kq_mask_b,
+                  float   kq_scale,
+                    int   il) const;
 
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 

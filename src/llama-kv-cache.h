@@ -242,6 +242,23 @@ public:
     void set_input_k_shift(ggml_tensor * dst) const;
 
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+
+    // Residual-window two-pass read-path masks. Shape [n_kv, n_tps, 1,
+    // n_stream], identical to the base kq_mask. Only valid when
+    // has_residual_window(); caller must guard.
+    //   pass_a: main-cache attending to positions OUTSIDE the last
+    //           residual_window (old tail). Cells with stored position
+    //           p0 > p1 - residual_window are -inf in addition to the
+    //           base causal/seq mask.
+    //   pass_b: main-cache attending to positions INSIDE the last
+    //           residual_window (recent head). Cells with stored
+    //           position p0 <= p1 - residual_window are -inf.
+    // Together the two masks partition the base kq_mask (each visible
+    // cell is unmasked in exactly one of the two passes, masked-out
+    // cells are -inf in both).
+    void set_input_kq_mask_pass_a(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+    void set_input_kq_mask_pass_b(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_rot(ggml_tensor * dst) const;
@@ -472,6 +489,11 @@ public:
 
     void set_input_k_shift   (ggml_tensor * dst) const;
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+
+    // Residual-window two-pass masks (see llama_kv_cache).
+    void set_input_kq_mask_pass_a(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+    void set_input_kq_mask_pass_b(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_rot(ggml_tensor * dst) const;
