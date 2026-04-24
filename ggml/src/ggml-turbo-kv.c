@@ -88,6 +88,26 @@ static inline int turbo_kv_random_sign(uint32_t seed, int idx) {
     return (h & 1u) ? 1 : -1;
 }
 
+/* Precomputed sign-bit mask table for the one seed everyone uses in practice
+ * (TURBO_KV_DEFAULT_SEED = 0x12345678u, see header). Indexed by element
+ * position within a TURBO_KV_BLOCK_SIZE-sized RHT. Eliminates the 128 scalar
+ * calls to turbo_kv_random_sign on the hot path.
+ *
+ * 32-byte alignment lets the AVX2 path use _mm256_load_ps against the table
+ * directly — no copy into a stack buffer.
+ *
+ * Populated at shared-library load time via __attribute__((constructor)),
+ * so the hot path has no init branch to check. */
+static uint32_t turbo_kv_signmask_default[TURBO_KV_BLOCK_SIZE] __attribute__((aligned(32)));
+
+__attribute__((constructor))
+static void turbo_kv_init_signmask_default(void) {
+    for (int i = 0; i < TURBO_KV_BLOCK_SIZE; i++) {
+        turbo_kv_signmask_default[i] =
+            turbo_kv_random_sign(TURBO_KV_DEFAULT_SEED, i) < 0 ? 0x80000000u : 0u;
+    }
+}
+
 /* ============================================================
  * In-place Walsh-Hadamard butterfly (unnormalized).
  *
@@ -147,6 +167,50 @@ static void walsh_hadamard_sse(float * data, int n) {
 }
 #endif
 
+#ifdef __AVX2__
+/* AVX2 Walsh-Hadamard butterfly. n must be power of 2, >= 4.
+ * Identical arithmetic to walsh_hadamard_sse but widens stages with
+ * stride >= 8 to 256-bit. Fp32 add/sub of each (u,v) pair produces
+ * identical results across any vector width — no re-association. */
+static void walsh_hadamard_avx2(float * data, int n) {
+    /* Stages 1 and 2 (strides 1 and 2) fit naturally in 128-bit — the
+     * cross-lane shuffles needed to widen them to 256-bit would undo
+     * the gain. Reuse the SSE patterns. */
+    for (int i = 0; i < n; i += 4) {
+        __m128 a = _mm_loadu_ps(&data[i]);
+        _mm_storeu_ps(&data[i], _mm_unpacklo_ps(_mm_hadd_ps(a, a),
+                                                 _mm_hsub_ps(a, a)));
+    }
+    for (int i = 0; i < n; i += 4) {
+        __m128 a  = _mm_loadu_ps(&data[i]);
+        __m128 lo = _mm_movelh_ps(a, a);
+        __m128 hi = _mm_movehl_ps(a, a);
+        _mm_storeu_ps(&data[i], _mm_shuffle_ps(_mm_add_ps(lo, hi),
+                                                _mm_sub_ps(lo, hi),
+                                                _MM_SHUFFLE(1, 0, 1, 0)));
+    }
+    /* Stage 3 (stride 4): 2*len=8, one 128-bit butterfly pair per block. */
+    if (n < 8) return;
+    for (int i = 0; i < n; i += 8) {
+        __m128 u = _mm_loadu_ps(&data[i + 0]);
+        __m128 v = _mm_loadu_ps(&data[i + 4]);
+        _mm_storeu_ps(&data[i + 0], _mm_add_ps(u, v));
+        _mm_storeu_ps(&data[i + 4], _mm_sub_ps(u, v));
+    }
+    /* Stages 4+ (stride >= 8): 256-bit AVX2 butterfly, contiguous. */
+    for (int len = 8; len < n; len <<= 1) {
+        for (int i = 0; i < n; i += (len << 1)) {
+            for (int j = 0; j < len; j += 8) {
+                __m256 u = _mm256_loadu_ps(&data[i + j]);
+                __m256 v = _mm256_loadu_ps(&data[i + j + len]);
+                _mm256_storeu_ps(&data[i + j],       _mm256_add_ps(u, v));
+                _mm256_storeu_ps(&data[i + j + len], _mm256_sub_ps(u, v));
+            }
+        }
+    }
+}
+#endif
+
 /* Round n down to the nearest power of 2 (n2 <= n, n2 is a power of 2). */
 static inline int turbo_kv_pow2_floor(int n) {
     int n2 = 1;
@@ -154,36 +218,150 @@ static inline int turbo_kv_pow2_floor(int n) {
     return n2;
 }
 
-void turbo_kv_rht_forward(float * data, int n, uint32_t seed) {
-    if (!data || n <= 0) return;
-    const int n2 = turbo_kv_pow2_floor(n);
-
-#ifdef __SSE4_1__
-    /* Vectorized sign flip + scale: XOR sign bits, mul by 1/sqrt(n2) */
-    if (n2 >= 4) {
-        for (int i = 0; i < n2; i += 4) {
-            __m128 d = _mm_loadu_ps(&data[i]);
-            uint32_t smask[4] __attribute__((aligned(16)));
-            for (int k = 0; k < 4; k++) {
-                smask[k] = turbo_kv_random_sign(seed, i+k) < 0 ? 0x80000000u : 0;
+/* Sign-flip pass of the RHT. XORs the sign bit of data[i] per seed + index.
+ * Exposed as a standalone helper so fused callers (quantize prepare_block)
+ * can substitute a combined normalize+sign-flip pass and then call the
+ * body below directly.
+ *
+ * Fast path: when seed == TURBO_KV_DEFAULT_SEED and n <= block size, the
+ * sign mask is precomputed (see turbo_kv_signmask_default). This is the
+ * only seed used by the in-tree pipeline; any other seed falls through to
+ * the per-index scalar compute. */
+static inline void turbo_kv_rht_sign_flip(float * data, int n, uint32_t seed) {
+    const int use_table = (seed == TURBO_KV_DEFAULT_SEED) && (n <= TURBO_KV_BLOCK_SIZE);
+#ifdef __AVX2__
+    if (n >= 8) {
+        if (use_table) {
+            const uint32_t * mtab = turbo_kv_signmask_default;
+            for (int i = 0; i < n; i += 8) {
+                _mm256_storeu_ps(&data[i], _mm256_xor_ps(
+                    _mm256_loadu_ps(&data[i]),
+                    _mm256_load_ps((const float*)(mtab + i))));
             }
-            _mm_storeu_ps(&data[i], _mm_xor_ps(d, _mm_load_ps((const float*)smask)));
+        } else {
+            for (int i = 0; i < n; i += 8) {
+                uint32_t smask[8] __attribute__((aligned(32)));
+                for (int k = 0; k < 8; k++) {
+                    smask[k] = turbo_kv_random_sign(seed, i+k) < 0 ? 0x80000000u : 0;
+                }
+                _mm256_storeu_ps(&data[i], _mm256_xor_ps(
+                    _mm256_loadu_ps(&data[i]),
+                    _mm256_load_ps((const float*)smask)));
+            }
         }
-        walsh_hadamard_sse(data, n2);
-        const __m128 vscale = _mm_set1_ps(1.0f / sqrtf((float) n2));
-        for (int i = 0; i < n2; i += 4) {
+        return;
+    }
+#endif
+#ifdef __SSE4_1__
+    if (n >= 4) {
+        if (use_table) {
+            const uint32_t * mtab = turbo_kv_signmask_default;
+            for (int i = 0; i < n; i += 4) {
+                _mm_storeu_ps(&data[i], _mm_xor_ps(
+                    _mm_loadu_ps(&data[i]),
+                    _mm_load_ps((const float*)(mtab + i))));
+            }
+        } else {
+            for (int i = 0; i < n; i += 4) {
+                uint32_t smask[4] __attribute__((aligned(16)));
+                for (int k = 0; k < 4; k++) {
+                    smask[k] = turbo_kv_random_sign(seed, i+k) < 0 ? 0x80000000u : 0;
+                }
+                _mm_storeu_ps(&data[i], _mm_xor_ps(
+                    _mm_loadu_ps(&data[i]),
+                    _mm_load_ps((const float*)smask)));
+            }
+        }
+        return;
+    }
+#endif
+    for (int i = 0; i < n; i++) {
+        data[i] *= (float) turbo_kv_random_sign(seed, i);
+    }
+}
+
+/* WHT + scale step of the RHT. Caller must have already applied the sign
+ * flip (or a fused equivalent) to data. */
+static inline void turbo_kv_rht_forward_body(float * data, int n) {
+    const float scale_f = 1.0f / sqrtf((float) n);
+#ifdef __AVX2__
+    if (n >= 8) {
+        walsh_hadamard_avx2(data, n);
+        const __m256 vscale = _mm256_set1_ps(scale_f);
+        for (int i = 0; i < n; i += 8) {
+            _mm256_storeu_ps(&data[i], _mm256_mul_ps(_mm256_loadu_ps(&data[i]), vscale));
+        }
+        return;
+    }
+#endif
+#ifdef __SSE4_1__
+    if (n >= 4) {
+        walsh_hadamard_sse(data, n);
+        const __m128 vscale = _mm_set1_ps(scale_f);
+        for (int i = 0; i < n; i += 4) {
             _mm_storeu_ps(&data[i], _mm_mul_ps(_mm_loadu_ps(&data[i]), vscale));
         }
         return;
     }
 #endif
-    for (int i = 0; i < n2; i++) {
-        data[i] *= (float) turbo_kv_random_sign(seed, i);
+    walsh_hadamard(data, n);
+    for (int i = 0; i < n; i++) {
+        data[i] *= scale_f;
     }
-    walsh_hadamard(data, n2);
-    const float scale = 1.0f / sqrtf((float) n2);
-    for (int i = 0; i < n2; i++) {
-        data[i] *= scale;
+}
+
+void turbo_kv_rht_forward(float * data, int n, uint32_t seed) {
+    if (!data || n <= 0) return;
+    const int n2 = turbo_kv_pow2_floor(n);
+    turbo_kv_rht_sign_flip(data, n2, seed);
+    turbo_kv_rht_forward_body(data, n2);
+}
+
+/* Fused Step 2 + Step 3 sign-flip for quantize_block_turbo_kv_4b.
+ * Writes rotated_out[i] = (src[i] * inv_norm) with the sign bit
+ * conditionally flipped by the RHT mask. Single pass over src.
+ * Slack elements (dim..block_size) are zero-padded (zeros come
+ * out unchanged under the XOR-sign flip).
+ *
+ * Caller follows with turbo_kv_rht_forward_body(rotated_out, block_size)
+ * to complete the RHT.  Equivalent to:
+ *   for i: rotated_out[i] = src[i] * inv_norm;
+ *   turbo_kv_rht_sign_flip(rotated_out, block_size, seed);
+ * but walks rotated_out only once instead of twice. */
+static inline void turbo_kv_fused_normalize_and_sign_flip(
+    const float * src, float * rotated_out, int dim,
+    float inv_norm, uint32_t seed)
+{
+    const int use_table = (seed == TURBO_KV_DEFAULT_SEED) && (dim <= TURBO_KV_BLOCK_SIZE);
+    int i = 0;
+#ifdef __AVX2__
+    const __m256 vinv = _mm256_set1_ps(inv_norm);
+    if (use_table) {
+        const uint32_t * mtab = turbo_kv_signmask_default;
+        for (; i + 7 < dim; i += 8) {
+            __m256 v = _mm256_mul_ps(_mm256_loadu_ps(src + i), vinv);
+            _mm256_storeu_ps(rotated_out + i,
+                _mm256_xor_ps(v, _mm256_load_ps((const float*)(mtab + i))));
+        }
+    } else {
+        for (; i + 7 < dim; i += 8) {
+            __m256 v = _mm256_mul_ps(_mm256_loadu_ps(src + i), vinv);
+            uint32_t smask[8] __attribute__((aligned(32)));
+            for (int k = 0; k < 8; k++) {
+                smask[k] = turbo_kv_random_sign(seed, i+k) < 0 ? 0x80000000u : 0;
+            }
+            _mm256_storeu_ps(rotated_out + i,
+                _mm256_xor_ps(v, _mm256_load_ps((const float*)smask)));
+        }
+    }
+#endif
+    for (; i < dim; i++) {
+        const float s = (float) turbo_kv_random_sign(seed, i);
+        rotated_out[i] = src[i] * inv_norm * s;
+    }
+    /* Slack zero-padding: zero XOR sign-mask = zero, so we just write zero. */
+    for (; i < TURBO_KV_BLOCK_SIZE; i++) {
+        rotated_out[i] = 0.0f;
     }
 }
 
@@ -191,6 +369,24 @@ void turbo_kv_rht_inverse(float * data, int n, uint32_t seed) {
     if (!data || n <= 0) return;
     const int n2 = turbo_kv_pow2_floor(n);
 
+#ifdef __AVX2__
+    if (n2 >= 8) {
+        const __m256 vscale = _mm256_set1_ps(1.0f / sqrtf((float) n2));
+        for (int i = 0; i < n2; i += 8) {
+            _mm256_storeu_ps(&data[i], _mm256_mul_ps(_mm256_loadu_ps(&data[i]), vscale));
+        }
+        walsh_hadamard_avx2(data, n2);
+        for (int i = 0; i < n2; i += 8) {
+            __m256 d = _mm256_loadu_ps(&data[i]);
+            uint32_t smask[8] __attribute__((aligned(32)));
+            for (int k = 0; k < 8; k++) {
+                smask[k] = turbo_kv_random_sign(seed, i+k) < 0 ? 0x80000000u : 0;
+            }
+            _mm256_storeu_ps(&data[i], _mm256_xor_ps(d, _mm256_load_ps((const float*)smask)));
+        }
+        return;
+    }
+#endif
 #ifdef __SSE4_1__
     if (n2 >= 4) {
         const __m128 vscale = _mm_set1_ps(1.0f / sqrtf((float) n2));
@@ -289,17 +485,15 @@ float turbo_kv_4b_prepare_block(
     const float norm = sqrtf((float) norm_sq_d);
     block->norm = norm;
 
-    /* Step 2: normalize to unit vector (slack zero-padded) */
+    /* Steps 2 + 3 sign-flip fused into a single pass over src:
+     * rotated_out[i] = (src[i] * inv_norm) with RHT sign bit flipped.
+     * Eliminates the separate normalize-then-read-back sweep over
+     * rotated_out. The WHT + scale finish the RHT. */
     const float inv_norm = (norm > 1e-10f) ? (1.0f / norm) : 0.0f;
-    for (int i = 0; i < dim; i++) {
-        rotated_out[i] = src[i] * inv_norm;
-    }
-    for (int i = dim; i < TURBO_KV_BLOCK_SIZE; i++) {
-        rotated_out[i] = 0.0f;
-    }
-
-    /* Step 3: RHT (in-place) */
-    turbo_kv_rht_forward(rotated_out, dim, TURBO_KV_DEFAULT_SEED);
+    const int n2 = turbo_kv_pow2_floor(TURBO_KV_BLOCK_SIZE);
+    turbo_kv_fused_normalize_and_sign_flip(
+        src, rotated_out, dim, inv_norm, TURBO_KV_DEFAULT_SEED);
+    turbo_kv_rht_forward_body(rotated_out, n2);
 
     /* Step 4: compute max_abs and per-block inv_std. Max is associative
      * for non-NaN fp32, so SIMD reduction is bit-exact with the scalar
@@ -317,12 +511,13 @@ float turbo_kv_4b_prepare_block(
             const __m256 abs_v = _mm256_and_ps(v, sign_clear);
             max_vec = _mm256_max_ps(max_vec, abs_v);
         }
-        /* Horizontal max of 8 lanes. */
-        float tmp[8];
-        _mm256_storeu_ps(tmp, max_vec);
-        for (int k = 0; k < 8; k++) {
-            if (tmp[k] > max_abs) max_abs = tmp[k];
-        }
+        /* In-register horizontal max: 8 → 4 → 2 → 1 via shuffle + max cascade. */
+        __m128 hi  = _mm256_extractf128_ps(max_vec, 1);
+        __m128 lo  = _mm256_castps256_ps128(max_vec);
+        __m128 m4  = _mm_max_ps(lo, hi);                       /* 4 lanes */
+        __m128 m2  = _mm_max_ps(m4, _mm_movehl_ps(m4, m4));    /* 2 lanes */
+        __m128 m1  = _mm_max_ss(m2, _mm_shuffle_ps(m2, m2, 1));/* 1 lane  */
+        max_abs = _mm_cvtss_f32(m1);
         /* Scalar tail for dim not a multiple of 8. */
         for (; i < dim; i++) {
             const float a = fabsf(rotated_out[i]);
