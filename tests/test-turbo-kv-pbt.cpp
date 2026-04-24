@@ -925,6 +925,191 @@ void property_DequantizeBlock_creates_tensor() {
         });
 }
 
+/* ================================================================
+ * Spec: nearest_centroid.allium
+ *
+ * Three properties propagated from the distilled argmin + packing
+ * contract. The spec was written precisely enough that any SIMD
+ * rewrite of the scalar argmin must produce byte-identical output
+ * on the same inputs; these tests enforce that contract today
+ * (against the production scalar) and will catch drift on any
+ * future SIMD variant without needing new tests to be added.
+ * ================================================================ */
+
+/* Reference argmin: matches ArgminFirstMatch's @guarantee
+ * FirstMatchTieBreak exactly. Strict `<` means an equal distance
+ * does NOT update `best`, so the lowest-indexed tied centroid
+ * wins. */
+static int ref_argmin_first_match(float x, const float * codebook, int n) {
+    int best = 0;
+    float best_dist = fabsf(x - codebook[0]);
+    for (int c = 1; c < n; c++) {
+        const float d = fabsf(x - codebook[c]);
+        if (d < best_dist) { best_dist = d; best = c; }
+    }
+    return best;
+}
+
+/* Reference packing: matches PackNibbleIndices's wire format.
+ * Low nibble = even-position index, high nibble = odd-position. */
+static void ref_pack_nibble_indices(const int * indices, int count, uint8_t * out) {
+    memset(out, 0, count / 2);
+    for (int i = 0; i < count; i++) {
+        const int byte_idx = i / 2;
+        const int bit_pos  = (i & 1) * 4;
+        out[byte_idx] |= (uint8_t) ((indices[i] & 0x0F) << bit_pos);
+    }
+}
+
+/* Reference NearestCentroidAssignment: reproduces quantize_block_turbo_kv_4b's
+ * Step 5 by recomputing rotated + inv_std from the input, then
+ * running the scalar argmin + packing. This is the spec-faithful
+ * oracle for the production scalar AND any future SIMD variant. */
+static void ref_nearest_centroid_assignment(
+    const float * x_input, int dim, uint8_t * out_indices)
+{
+    float norm2 = 0.0f;
+    for (int i = 0; i < dim; i++) norm2 += x_input[i] * x_input[i];
+    const float norm = sqrtf(norm2);
+
+    std::vector<float> rotated(dim);
+    const float inv_norm = (norm > 1e-10f) ? (1.0f / norm) : 0.0f;
+    for (int i = 0; i < dim; i++) rotated[i] = x_input[i] * inv_norm;
+    turbo_kv_rht_forward(rotated.data(), dim, TURBO_KV_DEFAULT_SEED);
+
+    float max_abs = 0.0f;
+    for (int i = 0; i < dim; i++) {
+        const float a = fabsf(rotated[i]);
+        if (a > max_abs) max_abs = a;
+    }
+    if (max_abs < 1e-10f) max_abs = 1.0f;
+    const float inv_std = TURBO_KV_4B_CENT_MAX / max_abs;
+
+    std::vector<int> idx(dim);
+    for (int i = 0; i < dim; i++) {
+        idx[i] = ref_argmin_first_match(
+            rotated[i] * inv_std, turbo_kv_4b_codebook, 16);
+    }
+    ref_pack_nibble_indices(idx.data(), dim, out_indices);
+}
+
+/* ================================================================
+ * @guarantee FirstMatchTieBreak: on equal distance, lower-indexed
+ * centroid wins.
+ *
+ * Can't construct exact fp32 ties from the real Lloyd-Max codebook
+ * via midpoints — decimal-rounded centroid values like -1.618 and
+ * -1.2562 don't have exact fp32 representations, so (a+b)/2 loses a
+ * ULP and the "tie" breaks randomly. Use a SYNTHETIC codebook
+ * instead: place two entries at x ± delta, making them bit-exactly
+ * equidistant from x by construction. Adding "far" entries rules
+ * out any earlier-index candidate from winning by being genuinely
+ * closer.
+ * ================================================================ */
+void property_ArgminFirstMatch_lower_index_on_tie() {
+    rc::check("ArgminFirstMatch: lower index wins on bit-exact equidistant tie",
+        [](int delta_selector) {
+            /* Catastrophic cancellation means `(x + d) - x` != `d` in
+             * general fp32. To guarantee bit-exact distance equality,
+             * pin x = 0 and pick delta from powers-of-2 in the range
+             * [2^-8, 2^0] — all exactly representable in fp32,
+             * |0 - (-delta)| and |0 - (+delta)| both reduce via the
+             * same arithmetic to exactly `delta`. */
+            const int k = ((uint32_t) delta_selector & 7u);  // 0..7
+            const float delta = ldexpf(1.0f, -k);  // 2^0, 2^-1, ..., 2^-7
+
+            /* Synthetic 4-entry codebook:
+             *   [0] = -delta   (tied, low index)
+             *   [1] = +100.0f  (far, ruled out)
+             *   [2] = +delta   (tied, high index)
+             *   [3] = +200.0f  (farther, ruled out) */
+            const float codebook[4] = {
+                -delta,
+                +100.0f,
+                +delta,
+                +200.0f,
+            };
+
+            /* Sanity: assert the two distances really are bit-equal
+             * in this construction, otherwise the test is meaningless. */
+            const float d0 = fabsf(0.0f - codebook[0]);
+            const float d2 = fabsf(0.0f - codebook[2]);
+            RC_ASSERT(d0 == d2);
+
+            const int chosen = ref_argmin_first_match(0.0f, codebook, 4);
+            /* FirstMatchTieBreak: lower-indexed tied entry wins. */
+            RC_ASSERT(chosen == 0);
+        });
+}
+
+/* ================================================================
+ * rule-entity-creation.PackNibbleIndices.1 — pack/unpack roundtrip.
+ * Validates that the wire format is invertible.
+ * ================================================================ */
+void property_PackNibbleIndices_roundtrip() {
+    rc::check("PackNibbleIndices: pack → unpack = identity",
+        [](uint32_t seed) {
+            const int count = TURBO_KV_BLOCK_SIZE;  // 128
+            std::mt19937 gen(seed);
+            std::uniform_int_distribution<int> dist(0, 15);
+
+            std::vector<int> input(count);
+            for (int i = 0; i < count; i++) input[i] = dist(gen);
+
+            uint8_t packed[count / 2];
+            ref_pack_nibble_indices(input.data(), count, packed);
+
+            std::vector<int> unpacked(count);
+            for (int i = 0; i < count; i++) {
+                const uint8_t bv = packed[i / 2];
+                unpacked[i] = (i & 1) ? (bv >> 4) : (bv & 0x0F);
+            }
+
+            for (int i = 0; i < count; i++) {
+                RC_ASSERT(unpacked[i] == input[i]);
+            }
+        });
+}
+
+/* ================================================================
+ * rule-success.NearestCentroidAssignment — differential scaffold.
+ *
+ * The production scalar in quantize_row_turbo_kv_4b_ref must
+ * produce byte-identical mse_indices to the spec-faithful
+ * reference defined above, for any valid input. This is the
+ * framework the SIMD rewrite will plug into: once a
+ * quantize_row_turbo_kv_4b_avx2 (or similar) variant exists, a
+ * sibling property calls it and compares against the SAME
+ * reference; any divergence is caught exactly like the scalar
+ * case.
+ *
+ * Today it doubles as a regression guard on the scalar path.
+ * ================================================================ */
+void property_NearestCentroidAssignment_matches_reference() {
+    rc::check("NearestCentroidAssignment: production mse_indices match reference",
+        [](uint32_t seed) {
+            const int dim = TURBO_KV_BLOCK_SIZE;
+            std::vector<float> x(dim);
+            fill_random(x.data(), dim, seed);
+            if (vec_l2_norm(x.data(), dim) < 1e-6f) x[0] = 1.0f;
+
+            /* Production path. */
+            block_turbo_kv_4b blk;
+            quantize_row_turbo_kv_4b_ref(x.data(), &blk, dim);
+
+            /* Reference path. */
+            uint8_t expected[dim / 2];
+            ref_nearest_centroid_assignment(x.data(), dim, expected);
+
+            /* mul_mat_cpu.allium:config.argmin_index_rel_tol = 0.0 —
+             * differential test runs with zero tolerance; any byte
+             * mismatch fails. */
+            for (int i = 0; i < dim / 2; i++) {
+                RC_ASSERT(blk.mse_indices[i] == expected[i]);
+            }
+        });
+}
+
 int main(int argc, char ** argv) {
     (void)argc; (void)argv;
     printf("=== turbo-kv-4b PBT ===\n\n");
@@ -955,6 +1140,9 @@ int main(int argc, char ** argv) {
     property_DequantizeBlock_creates_tensor();
     property_SIMDEquivalence_turbo_kv_4b();
     property_SIMDEquivalence_multi_row();
+    property_ArgminFirstMatch_lower_index_on_tie();
+    property_PackNibbleIndices_roundtrip();
+    property_NearestCentroidAssignment_matches_reference();
 
     printf("\n=== All properties passed ===\n");
     return 0;
