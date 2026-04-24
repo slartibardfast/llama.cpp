@@ -310,18 +310,19 @@ target_include_directories(test-turbo-kv-backend-pbt PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src)
 
 # TurboQuant residual-window PBT: propagated from
-# turbo_kv_residual_window.allium. Establishes the full 22-obligation
-# coverage list against the spec. Residual window is not yet
-# implemented in the port (PHASE26 Tier 1.1 — primary driver of the
-# 9B IQ3_XXS PPL regression), so implementation-dependent obligations
-# SKIP today. Builds and runs green; converts SKIPs to rc::check
-# calls as the feature lands.
+# turbo_kv_residual_window.allium. 23 propagated obligations, mixed
+# implemented (real assertions on the overlay write path, config
+# defaults, auto-dtype resolution, clamp invariant, peek surface) and
+# aspirational (SKIP — the attention read path that consults the
+# overlay for recent positions is not yet implemented). Links against
+# llama for the public C API (llama_context_default_params,
+# llama_memory_residual_window_peek, ...).
 add_executable(test-turbo-kv-residual-window-pbt test-turbo-kv-residual-window-pbt.cpp)
-target_link_libraries(test-turbo-kv-residual-window-pbt PRIVATE ggml-base)
+target_link_libraries(test-turbo-kv-residual-window-pbt PRIVATE llama ggml-base)
 target_include_directories(test-turbo-kv-residual-window-pbt PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src)
 # rapidcheck linkage will be added when the first rc::check lands
-# (today the file is skip-only — see header comment).
+# (today the file is assertion-based — see header comment).
 
 # Residual-window integration harness: minimal llama_context-init
 # test. Emits a single HARNESS_OK line to stdout on success with
