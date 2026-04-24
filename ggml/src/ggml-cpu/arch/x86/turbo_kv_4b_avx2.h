@@ -195,6 +195,9 @@ static inline float turbo_kv_4b_avx2_single_block_dot(
 {
     const float norm    = block->norm;
     float       inv_std = block->inv_std;
+    /* Defensive clamp: turbo-kv-4b.allium's QuantizeBlock ensures
+     * block.inv_std > 0, so this branch is dead on spec-valid input.
+     * sqrtf is an arbitrary bounded sentinel for malformed blocks. */
     if (inv_std < 1e-10f) inv_std = sqrtf((float) dim_in_block);
     /* per_block_scale recovers an fp32 centroid from an int8 codebook
      * entry and divides by inv_std:

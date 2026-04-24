@@ -582,6 +582,11 @@ static void dequantize_block_turbo_kv_4b(const block_turbo_kv_4b * block, float 
 
     const float norm    = block->norm;
     float       inv_std = block->inv_std;
+    /* Defensive clamp: spec (turbo-kv-4b.allium DequantizeBlock) requires
+     * block.inv_std > 0, so this branch is unreachable on spec-valid input.
+     * The sqrtf(dim) substitute is an arbitrary bounded sentinel — it
+     * prevents 1/tiny → infinity on malformed blocks rather than attempting
+     * a meaningful recovery. */
     if (inv_std < 1e-10f) inv_std = sqrtf((float) dim);
     const float scale = 1.0f / inv_std;
 
@@ -731,6 +736,11 @@ static inline float turbo_kv_4b_single_block_dot(
 {
     const float norm    = block->norm;
     float       inv_std = block->inv_std;
+    /* Defensive clamp: the spec (mul_mat_cpu.allium VecDot via
+     * turbo-kv-4b.allium VectorDot) inherits block.inv_std > 0 from
+     * QuantizeBlock's ensures clause. Dead branch on spec-valid input;
+     * the sqrtf substitute is an arbitrary bounded sentinel to keep
+     * 1/inv_std finite on malformed blocks. */
     if (inv_std < 1e-10f) inv_std = sqrtf((float) dim_in_block);
     const float scale = 1.0f / inv_std;
 
