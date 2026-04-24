@@ -15,6 +15,9 @@
  *   --rw N            residual_window value (default 0)
  *   --ctx N           n_ctx (default 512)
  *   --type-k NAME     K cache type: f16 | f32 | turbo_kv_4b (default f16)
+ *   --append N        run N incremental decode() calls with a dummy
+ *                     token each to exercise the KV-cache write path
+ *                     (default 0 — skip decode, init-only smoke)
  *   --verbose         enable llama info logging to stderr
  *
  * Exit codes:
@@ -63,6 +66,7 @@ int main(int argc, char ** argv) {
     uint32_t  n_ctx   = 512;
     ggml_type type_k  = GGML_TYPE_F16;
     std::string type_k_name = "f16";
+    int append_n = 0;
     bool verbose = false;
 
     for (int i = 2; i < argc; ++i) {
@@ -82,6 +86,10 @@ int main(int argc, char ** argv) {
                 fprintf(stderr, "unknown --type-k value: %s\n", type_k_name.c_str());
                 return 1;
             }
+        } else if (strcmp(a, "--append") == 0 && i + 1 < argc) {
+            int v = atoi(argv[++i]);
+            if (v < 0) { fprintf(stderr, "--append must be >= 0\n"); return 1; }
+            append_n = v;
         } else if (strcmp(a, "--verbose") == 0) {
             verbose = true;
         } else {
@@ -127,8 +135,36 @@ int main(int argc, char ** argv) {
         return 3;
     }
 
-    fprintf(stdout, "HARNESS_OK rw=%u ctx=%u type_k=%s\n",
-        rw, (uint32_t) llama_n_ctx(ctx), type_k_name.c_str());
+    int decoded = 0;
+    if (append_n > 0) {
+        // Drive the KV-cache write path with append_n dummy tokens.
+        // Token id 0 is typically <unk> / BOS-ish but always exists in
+        // the vocabulary; we don't care about the logits — just that
+        // decode() commits to the cache without asserting.
+        llama_batch batch = llama_batch_init(1, /*embd=*/ 0, /*n_seq_max=*/ 1);
+        for (int i = 0; i < append_n; ++i) {
+            batch.n_tokens    = 1;
+            batch.token[0]    = 0;
+            batch.pos[0]      = i;
+            batch.n_seq_id[0] = 1;
+            batch.seq_id[0][0] = 0;
+            batch.logits[0]   = 0;
+
+            if (llama_decode(ctx, batch) != 0) {
+                fprintf(stderr, "decode failed at token %d\n", i);
+                llama_batch_free(batch);
+                llama_free(ctx);
+                llama_model_free(model);
+                llama_backend_free();
+                return 4;
+            }
+            decoded++;
+        }
+        llama_batch_free(batch);
+    }
+
+    fprintf(stdout, "HARNESS_OK rw=%u ctx=%u type_k=%s decoded=%d\n",
+        rw, (uint32_t) llama_n_ctx(ctx), type_k_name.c_str(), decoded);
 
     llama_free(ctx);
     llama_model_free(model);

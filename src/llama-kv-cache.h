@@ -182,6 +182,16 @@ public:
     ggml_tensor * cpy_k_rope  (ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const;
     ggml_tensor * cpy_k_static(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const;
 
+    // fp16 rolling-tail write: additionally store k_cur as fp16 into the
+    // per-layer window buffer at the slots given by k_window_idxs. Only
+    // meaningful when has_residual_window(); returns nullptr otherwise.
+    ggml_tensor * cpy_k_window(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_window_idxs, int32_t il, const slot_info & sinfo) const;
+
+    // whether the cache was constructed with residual_window > 0 (and
+    // therefore has the per-layer k_window_fp16 tensors allocated)
+    bool has_residual_window() const;
+    uint32_t get_residual_window() const;
+
     //
     // preparation API
     //
@@ -207,11 +217,21 @@ public:
     ggml_tensor * build_input_k_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const;
     ggml_tensor * build_input_v_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const;
 
+    // I64 [n_tokens] tensor of fp16-window slot indices per token. Only
+    // built when has_residual_window(); returns nullptr otherwise.
+    ggml_tensor * build_input_k_window_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const;
+
     ggml_tensor * build_input_k_rot(ggml_context * ctx) const;
     ggml_tensor * build_input_v_rot(ggml_context * ctx) const;
 
     void set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
     void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
+
+    // Populate k_window_idxs with per-token slot positions: for each
+    // token i, data[i] = s*residual_window + (ubatch.pos[i] %
+    // residual_window) where s is the stream index. No-op when
+    // has_residual_window() is false.
+    void set_input_k_window_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
 
     void set_input_k_shift(ggml_tensor * dst) const;
 
@@ -413,11 +433,20 @@ public:
     ggml_tensor * cpy_k_rope  (ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const;
     ggml_tensor * cpy_k_static(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const;
 
+    // fp16 rolling-tail overlay write. Only meaningful when
+    // has_residual_window(); returns nullptr otherwise so the caller
+    // can guard with a simple null-check.
+    ggml_tensor * cpy_k_window(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_window_idxs, int32_t il) const;
+
     // create destination indices for each head of the current batch for where it would be written in the KV cache
     // the indices address the global KV cache (not per stream) - this is not relevant for the user of this API, but
     //   helps understand the implementation logic of cpy_k and cpy_v
     ggml_tensor * build_input_k_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const;
     ggml_tensor * build_input_v_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const;
+    ggml_tensor * build_input_k_window_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const;
+
+    bool     has_residual_window() const;
+    uint32_t get_residual_window() const;
 
     ggml_tensor * build_input_k_rot(ggml_context * ctx) const;
     ggml_tensor * build_input_v_rot(ggml_context * ctx) const;
@@ -427,6 +456,7 @@ public:
     ggml_tensor * build_input_k_pos(ggml_context * ctx) const;
 
     void set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+    void set_input_k_window_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
     void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_shift   (ggml_tensor * dst) const;

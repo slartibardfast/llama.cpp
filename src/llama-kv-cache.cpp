@@ -1422,6 +1422,45 @@ ggml_tensor * llama_kv_cache::get_k_static(ggml_context * ctx, int32_t il, uint3
 }
 
 // split K: write the rope portion of k_cur to k_rope cache
+ggml_tensor * llama_kv_cache::cpy_k_window(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_window_idxs, int32_t il, const slot_info & sinfo) const {
+    GGML_UNUSED(sinfo);
+
+    if (residual_window == 0) {
+        return nullptr;
+    }
+
+    const int32_t ikv = map_layer_ids.at(il);
+    ggml_tensor * k_win = layers[ikv].k_window_fp16;
+    if (!k_win) {
+        // layer has no K slot (e.g. recurrent layer in a hybrid cache)
+        return nullptr;
+    }
+
+    const int64_t n_embd_head = k_cur->ne[0];
+    const int64_t n_head      = k_cur->ne[1];
+    const int64_t n_tokens    = k_cur->ne[2];
+
+    const int64_t n_embd_gqa = n_embd_head*n_head;
+
+    GGML_ASSERT(ggml_row_size(k_cur->type, n_embd_head) == k_cur->nb[1]);
+
+    // merge [head_dim, n_head, n_tokens] -> [n_embd_gqa, n_tokens].
+    // Follows the shape pattern from cpy_k; ggml_set_rows internally
+    // handles the fp32 -> fp16 conversion required by the destination.
+    k_cur = ggml_view_2d(ctx, k_cur, n_embd_gqa, n_tokens, k_cur->nb[2], 0);
+
+    // flatten k_window_fp16 [n_embd_gqa, residual_window, n_stream]
+    // -> [n_embd_gqa, residual_window * n_stream] so global indices
+    // from k_window_idxs address directly into it.
+    const int64_t n_stream = k_win->ne[2];
+    ggml_tensor * k_win_flat = k_win;
+    if (n_stream > 1) {
+        k_win_flat = ggml_reshape_2d(ctx, k_win, n_embd_gqa, residual_window * n_stream);
+    }
+
+    return ggml_set_rows(ctx, k_win_flat, k_cur, k_window_idxs);
+}
+
 ggml_tensor * llama_kv_cache::cpy_k_rope(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const {
     GGML_UNUSED(sinfo);
     GGML_ASSERT(is_split_k());
@@ -1479,6 +1518,28 @@ ggml_tensor * llama_kv_cache::build_input_k_idxs(ggml_context * ctx, const llama
     ggml_set_input(k_idxs);
 
     return k_idxs;
+}
+
+ggml_tensor * llama_kv_cache::build_input_k_window_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const {
+    if (residual_window == 0) {
+        return nullptr;
+    }
+
+    const uint32_t n_tokens = ubatch.n_tokens;
+
+    ggml_tensor * k_window_idxs = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_tokens);
+
+    ggml_set_input(k_window_idxs);
+
+    return k_window_idxs;
+}
+
+bool llama_kv_cache::has_residual_window() const {
+    return residual_window > 0;
+}
+
+uint32_t llama_kv_cache::get_residual_window() const {
+    return residual_window;
 }
 
 ggml_tensor * llama_kv_cache::build_input_v_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const {
@@ -1550,6 +1611,37 @@ void llama_kv_cache::set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ub
 
         for (uint32_t i = 0; i < sinfo.size(); ++i) {
             data[s*sinfo.size() + i] = offs + sinfo.idxs[s][i];
+        }
+    }
+}
+
+void llama_kv_cache::set_input_k_window_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const {
+    if (residual_window == 0 || dst == nullptr) {
+        return;
+    }
+
+    const uint32_t n_tokens = ubatch->n_tokens;
+    GGML_ASSERT(n_tokens == (int64_t) sinfo.size()*sinfo.n_stream());
+
+    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+    int64_t * data = (int64_t *) dst->data;
+
+    // The fp16 window is a ring buffer per stream. For token i at
+    // absolute position pos[i] in stream s, its window slot is
+    //   s * residual_window + (pos[i] % residual_window).
+    // Older positions get overwritten by newer ones as the window
+    // wraps — correct for the "overlay" design where the main K
+    // cache retains quantised copies of every position.
+    //
+    // ubatch.pos is laid out as pos[i] for i in [0, n_tokens).
+    for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+        const int64_t stream_offs = s * (int64_t) residual_window;
+
+        for (uint32_t ii = 0; ii < sinfo.size(); ++ii) {
+            const uint32_t i = s*sinfo.size() + ii;
+            const llama_pos pos = ubatch->pos[i];
+            const int64_t slot = (pos >= 0) ? (pos % (llama_pos) residual_window) : 0;
+            data[i] = stream_offs + slot;
         }
     }
 }
@@ -2709,6 +2801,18 @@ ggml_tensor * llama_kv_cache_context::cpy_v(ggml_context * ctx, ggml_tensor * v_
     return kv->cpy_v(ctx, v_cur, v_idxs, il, sinfos[i_cur]);
 }
 
+ggml_tensor * llama_kv_cache_context::cpy_k_window(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_window_idxs, int32_t il) const {
+    return kv->cpy_k_window(ctx, k_cur, k_window_idxs, il, sinfos[i_cur]);
+}
+
+bool llama_kv_cache_context::has_residual_window() const {
+    return kv->has_residual_window();
+}
+
+uint32_t llama_kv_cache_context::get_residual_window() const {
+    return kv->get_residual_window();
+}
+
 ggml_tensor * llama_kv_cache_context::cpy_k_rope(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const {
     return kv->cpy_k_rope(ctx, k_cur, k_idxs, il, sinfos[i_cur]);
 }
@@ -2719,6 +2823,10 @@ ggml_tensor * llama_kv_cache_context::cpy_k_static(ggml_context * ctx, ggml_tens
 
 ggml_tensor * llama_kv_cache_context::build_input_k_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const {
     return kv->build_input_k_idxs(ctx, ubatch);
+}
+
+ggml_tensor * llama_kv_cache_context::build_input_k_window_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const {
+    return kv->build_input_k_window_idxs(ctx, ubatch);
 }
 
 ggml_tensor * llama_kv_cache_context::build_input_v_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const {
@@ -2739,6 +2847,10 @@ void llama_kv_cache_context::set_input_k_shift(ggml_tensor * dst) const {
 
 void llama_kv_cache_context::set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const {
     kv->set_input_k_idxs(dst, ubatch, sinfos[i_cur]);
+}
+
+void llama_kv_cache_context::set_input_k_window_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+    kv->set_input_k_window_idxs(dst, ubatch, sinfos[i_cur]);
 }
 
 void llama_kv_cache_context::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const {

@@ -461,6 +461,10 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     mctx->set_input_k_idxs(self_k_idxs, ubatch);
     mctx->set_input_v_idxs(self_v_idxs, ubatch);
 
+    if (self_k_window_idxs) {
+        mctx->set_input_k_window_idxs(self_k_window_idxs, ubatch);
+    }
+
     mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
 
     if (self_k_rot) {
@@ -2103,6 +2107,9 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
         inp->self_k_idxs = mctx_cur->build_input_k_idxs(ctx0, ubatch);
         inp->self_v_idxs = mctx_cur->build_input_v_idxs(ctx0, ubatch);
 
+        // fp16 rolling-tail slots (nullptr when residual_window == 0)
+        inp->self_k_window_idxs = mctx_cur->build_input_k_window_idxs(ctx0, ubatch);
+
         inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams);
         inp->self_kq_mask_cnv = cparams.flash_attn ? ggml_cast(ctx0, inp->self_kq_mask, GGML_TYPE_F16) : inp->self_kq_mask;
     }
@@ -2190,6 +2197,17 @@ ggml_tensor * llm_graph_context::build_attn(
         } else {
             ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
         }
+
+        // fp16 rolling-tail overlay: additionally store k_cur as fp16 into
+        // the per-layer window buffer. No-op when residual_window == 0 or
+        // this layer has no K slot (cpy_k_window returns nullptr).
+        if (inp->self_k_window_idxs) {
+            ggml_tensor * cpy_win = mctx_cur->cpy_k_window(ctx0, k_cur, inp->self_k_window_idxs, il);
+            if (cpy_win) {
+                ggml_build_forward_expand(gf, cpy_win);
+            }
+        }
+
         ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
     }
 
