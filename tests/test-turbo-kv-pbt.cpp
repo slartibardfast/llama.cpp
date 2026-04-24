@@ -703,8 +703,8 @@ void property_TurboBlock_fields_after_quantize() {
             block_turbo_kv_4b blk;
             quantize_row_turbo_kv_4b_ref(x.data(), &blk, dim);
 
-            const float norm    = turbo_kv_fp16_to_fp32(blk.norm);
-            const float inv_std = turbo_kv_fp16_to_fp32(blk.inv_std_fp16);
+            const float norm    = blk.norm;
+            const float inv_std = blk.inv_std;
             RC_ASSERT(norm > 0.0f);
             RC_ASSERT(inv_std > 0.0f);
             for (int i = 0; i < dim; i++) {
@@ -836,11 +836,12 @@ void property_QuantizeBlock_creates_turbo_block() {
             block_turbo_kv_4b blk;
             quantize_row_turbo_kv_4b_ref(x.data(), &blk, dim);
 
-            /* ensures.norm = L2_norm(input) — check via fp16 round-trip. */
-            const float stored_norm = turbo_kv_fp16_to_fp32(blk.norm);
+            /* ensures.norm = L2_norm(input) — stored as fp32 with an fp64
+             * accumulator for sum-tree robustness. Relative error should be
+             * at fp32 precision (≤ ~1e-5 after single final rounding). */
+            const float stored_norm = blk.norm;
             const float norm_rel_err = fabsf(stored_norm - norm) / norm;
-            /* fp16 has ~3 decimal digits of precision → rel_err < 1e-3. */
-            RC_ASSERT(norm_rel_err < 1e-3f);
+            RC_ASSERT(norm_rel_err < 1e-4f);
 
             /* ensures.inv_std = cent_max / max_abs(RHT(normalize(input))).
              * Reproduce the fp32 intermediate value the code computed (same
@@ -858,10 +859,11 @@ void property_QuantizeBlock_creates_turbo_block() {
             if (max_abs < 1e-10f) max_abs = 1.0f;
             const float expected_inv_std = TURBO_KV_4B_CENT_MAX / max_abs;
 
-            const float stored_inv_std = turbo_kv_fp16_to_fp32(blk.inv_std_fp16);
+            const float stored_inv_std = blk.inv_std;
             const float inv_std_rel_err =
                 fabsf(stored_inv_std - expected_inv_std) / expected_inv_std;
-            RC_ASSERT(inv_std_rel_err < 1e-3f);
+            /* fp32 storage — a direct compare succeeds at fp32 precision. */
+            RC_ASSERT(inv_std_rel_err < 1e-5f);
 
             /* indices: the argmin property is already tested directly by
              * property_nearest_centroid_is_argmin. The spec's ensures clause
@@ -917,10 +919,10 @@ void property_DequantizeBlock_creates_tensor() {
              * multiplies by block.norm). We're not re-checking norm
              * preservation (property_reconstruction_preserves_norm...
              * covers that); we're asserting basic shape-creation correctness. */
-            const float norm = turbo_kv_fp16_to_fp32(blk.norm);
+            const float norm = blk.norm;
             for (int i = 0; i < dim; i++) {
                 RC_ASSERT(std::isfinite(out[i]));
-                /* Upper bound: 2*norm is generous (covers fp16 roundoff of
+                /* Upper bound: 2*norm is generous (covers fp32 roundoff of
                  * the inv_std factor and any reasonable codebook-scale
                  * overshoot). */
                 RC_ASSERT(fabsf(out[i]) <= 2.0f * norm + 1e-3f);

@@ -249,26 +249,45 @@ uint16_t turbo_kv_fp32_to_fp16(float f) {
  * seed, different norm clamp, etc.) don't need to be mirrored.
  *
  * Writes:
- *   block->norm, block->inv_std_fp16, block->residual_norm, block->_pad
+ *   block->norm (fp32), block->inv_std (fp32)
  *   rotated_out[0..TURBO_KV_BLOCK_SIZE-1] (filled; slack zero-padded)
- * Returns inv_std as fp32 (so the caller's Step 5 can use the full-
- * precision value, not the fp16 round-trip that would lose a ULP
- * and potentially flip argmin at tie boundaries).
+ * Returns inv_std as fp32 (same value as block->inv_std — provided as
+ * return value so the caller doesn't need to reload from memory).
  * ============================================================ */
 float turbo_kv_4b_prepare_block(
     const float * src, int dim, block_turbo_kv_4b * block, float * rotated_out)
 {
     if (dim > TURBO_KV_BLOCK_SIZE) dim = TURBO_KV_BLOCK_SIZE;
 
-    /* Step 1: L2 norm */
-    float norm_sq = 0.0f;
-    for (int i = 0; i < dim; i++) {
-        norm_sq += src[i] * src[i];
+    /* Step 1: L2 norm. fp64 accumulator absorbs sum-tree drift —
+     * scalar and SIMD paths both produce the same fp32 `norm` after
+     * the final round, which preserves the bit-exact differential-test
+     * invariant without forcing a specific summation order. See
+     * PHASE25 discussion. */
+    double norm_sq_d = 0.0;
+    {
+        int si = 0;
+#if defined(__AVX2__)
+        /* Accumulate sums of squares in two fp64 lanes (4 elements each). */
+        __m256d acc = _mm256_setzero_pd();
+        for (; si + 7 < dim; si += 8) {
+            const __m256 v = _mm256_loadu_ps(src + si);
+            const __m256d v_lo = _mm256_cvtps_pd(_mm256_castps256_ps128(v));
+            const __m256d v_hi = _mm256_cvtps_pd(_mm256_extractf128_ps(v, 1));
+            acc = _mm256_fmadd_pd(v_lo, v_lo, acc);
+            acc = _mm256_fmadd_pd(v_hi, v_hi, acc);
+        }
+        double tmp[4];
+        _mm256_storeu_pd(tmp, acc);
+        norm_sq_d = tmp[0] + tmp[1] + tmp[2] + tmp[3];
+#endif
+        for (; si < dim; si++) {
+            const double v = (double) src[si];
+            norm_sq_d += v * v;
+        }
     }
-    const float norm = sqrtf(norm_sq);
-    block->norm = turbo_kv_fp32_to_fp16(norm);
-    block->residual_norm = 0;
-    block->_pad = 0;
+    const float norm = sqrtf((float) norm_sq_d);
+    block->norm = norm;
 
     /* Step 2: normalize to unit vector (slack zero-padded) */
     const float inv_norm = (norm > 1e-10f) ? (1.0f / norm) : 0.0f;
@@ -318,7 +337,7 @@ float turbo_kv_4b_prepare_block(
 #endif
     if (max_abs < 1e-10f) max_abs = 1.0f;
     const float inv_std = TURBO_KV_4B_CENT_MAX / max_abs;
-    block->inv_std_fp16 = turbo_kv_fp32_to_fp16(inv_std);
+    block->inv_std = inv_std;
 
     return inv_std;
 }
@@ -366,8 +385,8 @@ void quantize_row_turbo_kv_4b_ref(const float * x, block_turbo_kv_4b * y, int64_
 static void dequantize_block_turbo_kv_4b(const block_turbo_kv_4b * block, float * dst, int dim) {
     if (dim > TURBO_KV_BLOCK_SIZE) dim = TURBO_KV_BLOCK_SIZE;
 
-    const float norm = turbo_kv_fp16_to_fp32(block->norm);
-    float inv_std = turbo_kv_fp16_to_fp32(block->inv_std_fp16);
+    const float norm    = block->norm;
+    float       inv_std = block->inv_std;
     if (inv_std < 1e-10f) inv_std = sqrtf((float) dim);
     const float scale = 1.0f / inv_std;
 
@@ -515,8 +534,8 @@ static inline float turbo_kv_4b_single_block_dot(
     const float * q_rot_block,
     int dim_in_block)
 {
-    const float norm = turbo_kv_fp16_to_fp32(block->norm);
-    float inv_std = turbo_kv_fp16_to_fp32(block->inv_std_fp16);
+    const float norm    = block->norm;
+    float       inv_std = block->inv_std;
     if (inv_std < 1e-10f) inv_std = sqrtf((float) dim_in_block);
     const float scale = 1.0f / inv_std;
 

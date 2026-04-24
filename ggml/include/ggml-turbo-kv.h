@@ -7,10 +7,8 @@
  * Block layout (72 bytes per 128 elements, 4.5 bpe):
  *
  *   struct block_turbo_kv_4b {
- *       uint16_t norm;            // fp16, ||x||_2 before normalization
- *       uint16_t residual_norm;   // unused (reserved for future composite residual)
- *       uint16_t inv_std_fp16;    // fp16, = 2.7326 / max(|rotated|), per block
- *       uint16_t _pad;            // alignment
+ *       float    norm;            // fp32, ||x||_2 before normalization
+ *       float    inv_std;         // fp32, = 2.7326 / max(|rotated|), per block
  *       uint8_t  mse_indices[64]; // 4-bit packed, 2 indices/byte, LSB-first
  *   };
  *
@@ -64,14 +62,17 @@ extern "C" {
 #define TURBO_KV_4B_CENT_MAX 2.7326f
 
 typedef struct {
-    uint16_t norm;            /* fp16, ||x||_2 of the original vector */
-    uint16_t residual_norm;   /* unused (kept for layout with future residual) */
-    uint16_t inv_std_fp16;    /* fp16, = CENT_MAX / max(|rotated|), per block */
-    uint16_t _pad;            /* alignment */
+    float    norm;            /* fp32, ||x||_2 of the original vector */
+    float    inv_std;         /* fp32, = CENT_MAX / max(|rotated|), per block */
     uint8_t  mse_indices[TURBO_KV_BLOCK_SIZE / 2]; /* 4-bit packed, 2 per byte */
 } block_turbo_kv_4b;
 
-/* Compile-time size check: 2+2+2+2+64 = 72 */
+/* Compile-time size check: 4+4+64 = 72.
+ * Earlier layout stored norm + inv_std as fp16 plus two 16-bit words
+ * (residual_norm reserved for future residual encoding, plus an
+ * alignment pad). Repacked to fp32 scales: same 72 bytes total,
+ * eliminates the fp16 round-trip (~1e-3 relative precision loss) on
+ * both per-block scales. See PHASE25 notes. */
 typedef char turbo_kv_4b_check_block_size
     [(sizeof(block_turbo_kv_4b) == TURBO_KV_4B_BYTES) ? 1 : -1];
 
@@ -118,12 +119,10 @@ void quantize_row_turbo_kv_4b_ref(const float * x, block_turbo_kv_4b * y, int64_
 void dequantize_row_turbo_kv_4b  (const block_turbo_kv_4b * x, float * y, int64_t k);
 
 /* Prepare one block: run steps 1-4 of the quantize pipeline
- * (L2 norm, normalize, RHT, max_abs → inv_std). Writes block->norm,
- * block->inv_std_fp16, block->residual_norm, block->_pad; fills
- * rotated_out[0..TURBO_KV_BLOCK_SIZE-1] with the rotated values
- * (zero-padded where dim < block size). Returns inv_std as fp32
- * for the caller's Step 5; don't round-trip through fp16 before
- * argmin or tie-break can flip.
+ * (L2 norm, normalize, RHT, max_abs → inv_std). Writes block->norm
+ * and block->inv_std (both fp32); fills rotated_out[0..TURBO_KV_BLOCK_SIZE-1]
+ * with the rotated values (zero-padded where dim < block size). Returns
+ * inv_std as fp32 for the caller's Step 5.
  *
  * Exposed so ggml-cpu's AVX2 argmin variant can share this prep
  * with the scalar ggml-base reference. The scalar

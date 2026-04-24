@@ -39,8 +39,8 @@ void main() {
     if (block_id >= p.ne / QUANT_K_TURBO_KV_4B) return;
 
     const uint tid = gl_SubgroupInvocationID;
-    const float norm = unpackHalf2x16(uint(data_a[block_id].norm)).x;
-    const float inv_std = unpackHalf2x16(uint(data_a[block_id].inv_std_fp16)).x;
+    const float norm    = data_a[block_id].norm;
+    const float inv_std = data_a[block_id].inv_std;
     const float rcp_inv_std = 1.0 / max(inv_std, 1e-10);
 
     float val0 = turbo_kv_unpack_byte(uint(data_a[block_id].mse_indices[tid / 2]),      tid,      rcp_inv_std);

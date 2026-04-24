@@ -67,11 +67,11 @@ int main() {
     block_turbo_kv_4b gpu_block;
     ggml_backend_tensor_get(cpy, &gpu_block, 0, sizeof(block_turbo_kv_4b));
 
-    // Compare
-    float cpu_norm = ggml_fp16_to_fp32(*(ggml_fp16_t*)&cpu_block.norm);
-    float gpu_norm = ggml_fp16_to_fp32(*(ggml_fp16_t*)&gpu_block.norm);
-    float cpu_inv = ggml_fp16_to_fp32(*(ggml_fp16_t*)&cpu_block.inv_std_fp16);
-    float gpu_inv = ggml_fp16_to_fp32(*(ggml_fp16_t*)&gpu_block.inv_std_fp16);
+    // Compare (fp32 fields, direct reads)
+    float cpu_norm = cpu_block.norm;
+    float gpu_norm = gpu_block.norm;
+    float cpu_inv  = cpu_block.inv_std;
+    float gpu_inv  = gpu_block.inv_std;
 
     fprintf(stderr, "  CPU: norm=%.4f inv_std=%.4f\n", cpu_norm, cpu_inv);
     fprintf(stderr, "  GPU: norm=%.4f inv_std=%.4f\n", gpu_norm, gpu_inv);

@@ -102,18 +102,19 @@ struct block_tq_v_4b_packed16
 
 struct block_turbo_kv_4b
 {
-    uint16_t norm;
-    uint16_t residual_norm;
-    uint16_t inv_std_fp16;
-    uint16_t _pad;
+    float norm;       // fp32, ||x||_2 of the original vector (was fp16 + residual_norm slot)
+    float inv_std;    // fp32, CENT_MAX / max(|rotated|)       (was fp16 + _pad slot)
     uint8_t mse_indices[64];
 };
 struct block_turbo_kv_4b_packed16
 {
-    uint16_t norm;
-    uint16_t residual_norm;
-    uint16_t inv_std_fp16;
-    uint16_t _pad;
+    // packed16 variant splits the fp32 scales into uint16 pairs so
+    // shader code that indexes by uint16 can still access them. Use
+    // uintBitsToFloat(uint(lo) | (uint(hi) << 16)) to reconstruct.
+    uint16_t norm_lo;
+    uint16_t norm_hi;
+    uint16_t inv_std_lo;
+    uint16_t inv_std_hi;
     uint16_t mse_indices[32];
 };
 

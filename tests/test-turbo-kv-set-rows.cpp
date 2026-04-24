@@ -56,7 +56,7 @@ int main() {
         block_turbo_kv_4b cpy_block;
         ggml_backend_tensor_get(cpy, &cpy_block, 0, sizeof(block_turbo_kv_4b));
 
-        fprintf(stderr, "  CPY norm=%04x inv_std=%04x\n", cpy_block.norm, cpy_block.inv_std_fp16);
+        fprintf(stderr, "  CPY norm=%.6f inv_std=%.6f\n", cpy_block.norm, cpy_block.inv_std);
         fprintf(stderr, "  CPY idx[0..3]: %02x %02x %02x %02x\n",
             cpy_block.mse_indices[0], cpy_block.mse_indices[1], cpy_block.mse_indices[2], cpy_block.mse_indices[3]);
 
@@ -110,7 +110,7 @@ int main() {
         block_turbo_kv_4b sr_block;
         ggml_backend_tensor_get(set, &sr_block, 0, sizeof(block_turbo_kv_4b));
 
-        fprintf(stderr, "  SR  norm=%04x inv_std=%04x\n", sr_block.norm, sr_block.inv_std_fp16);
+        fprintf(stderr, "  SR  norm=%.6f inv_std=%.6f\n", sr_block.norm, sr_block.inv_std);
         fprintf(stderr, "  SR  idx[0..3]: %02x %02x %02x %02x\n",
             sr_block.mse_indices[0], sr_block.mse_indices[1], sr_block.mse_indices[2], sr_block.mse_indices[3]);
 

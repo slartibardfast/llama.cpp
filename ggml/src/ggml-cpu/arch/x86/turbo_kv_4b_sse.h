@@ -164,8 +164,8 @@ static inline float turbo_kv_4b_sse_single_block_dot(
     const float * q_rot_block,
     int dim_in_block)
 {
-    const float norm = turbo_kv_fp16_to_fp32(block->norm);
-    float inv_std = turbo_kv_fp16_to_fp32(block->inv_std_fp16);
+    const float norm    = block->norm;
+    float       inv_std = block->inv_std;
     if (inv_std < 1e-10f) inv_std = sqrtf((float) dim_in_block);
     /* Matches the contract in this file's top comment:
      *   per_block_scale = (CENT_MAX / 127) / inv_std

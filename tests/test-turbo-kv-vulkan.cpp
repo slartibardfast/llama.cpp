@@ -73,8 +73,8 @@ static bool test_metadata() {
     block_turbo_kv_4b block;
     quantize_row_turbo_kv_4b_ref(input.data(), &block, dim);
 
-    float norm = ggml_fp16_to_fp32(*(ggml_fp16_t*)&block.norm);
-    float inv_std = ggml_fp16_to_fp32(*(ggml_fp16_t*)&block.inv_std_fp16);
+    float norm    = block.norm;
+    float inv_std = block.inv_std;
 
     float actual_norm = 0;
     for (int i = 0; i < dim; i++) actual_norm += input[i] * input[i];

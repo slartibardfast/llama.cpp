@@ -33,8 +33,8 @@ void main() {
     const uint src_row = uint(data_b[row_idx]);
     const uint src_blk = src_row * (p.ne00 / QUANT_K_TURBO_KV_4B) + blk_in_row;
 
-    const float norm = unpackHalf2x16(uint(data_a[src_blk].norm)).x;
-    const float inv_std = unpackHalf2x16(uint(data_a[src_blk].inv_std_fp16)).x;
+    const float norm    = data_a[src_blk].norm;
+    const float inv_std = data_a[src_blk].inv_std;
     const float rcp_inv_std = 1.0 / max(inv_std, 1e-10);
 
     float val0 = turbo_kv_unpack_byte(uint(data_a[src_blk].mse_indices[tid / 2]),      tid,      rcp_inv_std);

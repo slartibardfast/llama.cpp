@@ -74,8 +74,3 @@ float turbo_kv_unpack_byte(uint byte_val, uint elem, float rcp_inv_std) {
     uint idx = (elem & 1u) == 0 ? (byte_val & 0xFu) : (byte_val >> 4);
     return TURBO_KV_CODEBOOK[idx] * rcp_inv_std;
 }
-
-// Pack norm/inv_std as uint16 (fp16 encoding)
-uint16_t turbo_kv_f32_to_fp16_bits(float x) {
-    return uint16_t(packHalf2x16(vec2(x, 0.0)) & 0xFFFFu);
-}
