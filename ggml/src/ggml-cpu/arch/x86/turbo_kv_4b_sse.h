@@ -167,8 +167,12 @@ static inline float turbo_kv_4b_sse_single_block_dot(
     const float norm = turbo_kv_fp16_to_fp32(block->norm);
     float inv_std = turbo_kv_fp16_to_fp32(block->inv_std_fp16);
     if (inv_std < 1e-10f) inv_std = sqrtf((float) dim_in_block);
-    const float scale = 1.0f / inv_std;
-    const float per_block_scale = (127.0f / TURBO_KV_4B_CENT_MAX) * scale;
+    /* Matches the contract in this file's top comment:
+     *   per_block_scale = (CENT_MAX / 127) / inv_std
+     * The inner kernel treats the codebook as int8 and this factor
+     * recovers the fp32 centroid and divides by inv_std in one
+     * multiply. See turbo_kv_4b_avx2.h for the algebraic derivation. */
+    const float per_block_scale = (TURBO_KV_4B_CENT_MAX / 127.0f) / inv_std;
 
     return norm * ggml_vec_dot_turbo_kv_4b_sse_inner(
         q_rot_block, block->mse_indices, per_block_scale, dim_in_block);

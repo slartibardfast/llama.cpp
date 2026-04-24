@@ -102,15 +102,25 @@ static inline float ggml_vec_dot_turbo_kv_4b_avx2_inner(
         const __m256i low_vals  = _mm256_shuffle_epi8(cb_ymm, low_nib);
         const __m256i high_vals = _mm256_shuffle_epi8(cb_ymm, high_nib);
 
-        /* Interleave: element [2*i] = low_vals[i], [2*i+1] = high_vals[i].
-         * _mm256_unpacklo_epi8 interleaves int8 from low/high halves. */
+        /* Interleave low/high nibble lookups back into element order.
+         * After the two VPSHUFBs, the CORRECT lookups for the 32
+         * elements of this iter all live in the LOWER 128-bit lanes of
+         * low_vals and high_vals:
+         *   low_vals  lower = codebook[even-pos nibbles] — elements
+         *     0, 2, ..., 30 (that's 16 lookups, one per byte of
+         *     bytes_16's lower lane).
+         *   high_vals lower = codebook[odd-pos nibbles] — elements
+         *     1, 3, ..., 31.
+         * The upper 128-bit lanes are wasted work (bytes_16's upper
+         * lane was zero, so they looked up codebook[0] 16 times).
+         * `unpacklo` reconstructs elements 0-15 in order; `unpackhi`
+         * reconstructs elements 16-31 in order. No need to touch the
+         * upper YMM lanes. */
         const __m128i lo_low  = _mm256_castsi256_si128(low_vals);
         const __m128i lo_high = _mm256_castsi256_si128(high_vals);
-        const __m128i hi_low  = _mm256_extracti128_si256(low_vals, 1);
-        const __m128i hi_high = _mm256_extracti128_si256(high_vals, 1);
 
         const __m128i inter_lo = _mm_unpacklo_epi8(lo_low, lo_high);
-        const __m128i inter_hi = _mm_unpacklo_epi8(hi_low, hi_high);
+        const __m128i inter_hi = _mm_unpackhi_epi8(lo_low, lo_high);
 
         /* Sign-extend int8 → int32 in four 4-element groups per 128-bit half.
          * _mm_cvtepi8_epi32 reads the low 4 bytes; we shift-right to get
@@ -185,8 +195,15 @@ static inline float turbo_kv_4b_avx2_single_block_dot(
     const float norm = turbo_kv_fp16_to_fp32(block->norm);
     float inv_std = turbo_kv_fp16_to_fp32(block->inv_std_fp16);
     if (inv_std < 1e-10f) inv_std = sqrtf((float) dim_in_block);
-    const float scale = 1.0f / inv_std;
-    const float per_block_scale = (127.0f / TURBO_KV_4B_CENT_MAX) * scale;
+    /* per_block_scale recovers an fp32 centroid from an int8 codebook
+     * entry and divides by inv_std:
+     *   codebook_fp32[i] = int8_cb[i] * (CENT_MAX / 127)
+     *   dequant[i]       = codebook_fp32[i] / inv_std
+     * so the inner kernel wants (CENT_MAX / 127) / inv_std. The
+     * reciprocal (127/CENT_MAX) scaling here would inflate scores by
+     * (127/CENT_MAX)^2 ~ 2160x — caught by the SIMDEquivalence PBT
+     * property against the ggml-base scalar path. */
+    const float per_block_scale = (TURBO_KV_4B_CENT_MAX / 127.0f) / inv_std;
 
     return norm * ggml_vec_dot_turbo_kv_4b_avx2_inner(
         q_rot_block, block->mse_indices, per_block_scale, dim_in_block);
