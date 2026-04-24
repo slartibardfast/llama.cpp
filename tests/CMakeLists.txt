@@ -288,7 +288,11 @@ add_executable(test-turbo-kv-pbt test-turbo-kv-pbt.cpp)
 target_link_libraries(test-turbo-kv-pbt PRIVATE ggml-base ggml-cpu
     ${CMAKE_CURRENT_SOURCE_DIR}/../../rapidcheck/build/librapidcheck.a)
 target_include_directories(test-turbo-kv-pbt PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../rapidcheck/include)
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../rapidcheck/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src)
+# -march=native so __AVX2__ is defined and the AVX2 differential
+# property in test-turbo-kv-pbt.cpp pulls in turbo_kv_4b_avx2.h.
+target_compile_options(test-turbo-kv-pbt PRIVATE -march=native)
 
 # Micro-benchmark for PHASE25 step 3 profiling — isolates
 # turbo_kv_4b_avx2_single_block_dot in a tight loop so `perf record`
@@ -310,6 +314,15 @@ target_compile_options(bench-turbo-kv-4b-avx2 PRIVATE -march=native)
 # it is already guarded on __SSE4_1__.
 add_executable(bench-turbo-kv-quantize bench-turbo-kv-quantize.cpp)
 target_link_libraries(bench-turbo-kv-quantize PRIVATE ggml-base)
+
+# AVX2 argmin head-to-head: same (rotated, inv_std) pool, scalar vs
+# AVX2 Step-5 only, reports ns/call and speedup. PHASE25 step 3
+# follow-up to measure the vectorized-argmin optimization target.
+add_executable(bench-turbo-kv-argmin bench-turbo-kv-argmin.cpp)
+target_link_libraries(bench-turbo-kv-argmin PRIVATE ggml-base)
+target_include_directories(bench-turbo-kv-argmin PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src)
+target_compile_options(bench-turbo-kv-argmin PRIVATE -march=native)
 
 add_executable(test-split-k-attention test-split-k-attention.cpp)
 

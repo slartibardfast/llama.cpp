@@ -17,6 +17,7 @@
 
 #include <immintrin.h>
 #include <math.h>
+#include <string.h>
 
 #include "ggml-turbo-kv.h"
 
@@ -207,6 +208,81 @@ static inline float turbo_kv_4b_avx2_single_block_dot(
 
     return norm * ggml_vec_dot_turbo_kv_4b_avx2_inner(
         q_rot_block, block->mse_indices, per_block_scale, dim_in_block);
+}
+
+/* ============================================================
+ * AVX2 nearest-centroid argmin + nibble-pack for the QUANTIZE path.
+ *
+ * Replaces the scalar Step 5 of quantize_block_turbo_kv_4b (the hot
+ * loop profiled at 2346 ns/call, 87x slower than vec_dot; see
+ * PHASE25 step 3). Contract: bit-exact output with the scalar
+ * reference, enforced by nearest_centroid.allium's
+ *   config.argmin_index_rel_tol = 0.0
+ * and the differential PBT property in test-turbo-kv-pbt.cpp.
+ *
+ * Design: 8-way data-parallel outer loop (process 8 input elements
+ * at once), 16-iteration scalar-shape inner loop over the codebook.
+ * This keeps the tie-break semantics trivially correct — each lane
+ * runs an independent scalar argmin with strict `<`; the only
+ * change vs the C code is that 8 lanes proceed in lockstep.
+ *
+ * Why not vectorize across the 16 codebook entries instead?
+ * Vectorizing inner-loop would need a pair-wise-min-with-
+ * lexicographic-tiebreak reduction, which is ~5-6 ops per pair and
+ * ~4 reduction steps (16 -> 8 -> 4 -> 2 -> 1). The 8-way outer path
+ * is simpler, its correctness proof is "same ops as scalar with 8
+ * lanes in parallel", and it still achieves significant speedup.
+ * ============================================================ */
+
+static inline void turbo_kv_4b_avx2_nearest_centroid_block(
+    const float * rotated, float inv_std, uint8_t * out_bytes)
+{
+    const __m256  vs       = _mm256_set1_ps(inv_std);
+    const __m256  sign_msk = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFFFFFF));
+
+    memset(out_bytes, 0, TURBO_KV_BLOCK_SIZE / 2);
+
+    for (int i = 0; i + 7 < TURBO_KV_BLOCK_SIZE; i += 8) {
+        /* Scale 8 rotated values by inv_std. Bit-exact per-lane vs
+         * the scalar `val = rotated[i] * inv_std`. */
+        const __m256 val = _mm256_mul_ps(_mm256_loadu_ps(rotated + i), vs);
+
+        /* Initialize running best with c=0. */
+        __m256 cb_c      = _mm256_set1_ps(turbo_kv_4b_codebook[0]);
+        __m256 best_dist = _mm256_and_ps(sign_msk,
+                                          _mm256_sub_ps(val, cb_c));
+        __m256i best_idx = _mm256_setzero_si256();
+
+        /* Inner scan over codebook[1..15]. Strict `<` comparison
+         * preserves first-match tie-break: equal distances don't
+         * update, so the lower-indexed tied entry wins. */
+        for (int c = 1; c < 16; c++) {
+            cb_c = _mm256_set1_ps(turbo_kv_4b_codebook[c]);
+            const __m256 dist = _mm256_and_ps(sign_msk,
+                                               _mm256_sub_ps(val, cb_c));
+            const __m256 lt_mask = _mm256_cmp_ps(dist, best_dist, _CMP_LT_OQ);
+            best_dist = _mm256_blendv_ps(best_dist, dist, lt_mask);
+            best_idx  = _mm256_blendv_epi8(
+                best_idx,
+                _mm256_set1_epi32(c),
+                _mm256_castps_si256(lt_mask));
+        }
+
+        /* Extract 8 winning indices and pack into 4 bytes of nibbles.
+         * The packing is kept scalar: 8 int32 loads + 8 byte-pack
+         * operations amortized over ~120 AVX2 ops in the argmin
+         * above — not a bottleneck. `__attribute__((aligned(32)))`
+         * lets us use the aligned store; same effect as C++11
+         * alignas but works in the C-compiled ggml-cpu tree. */
+        int32_t idx_arr[8] __attribute__((aligned(32)));
+        _mm256_store_si256((__m256i *) idx_arr, best_idx);
+        for (int k = 0; k < 8; k++) {
+            const int pos      = i + k;
+            const int byte_idx = pos / 2;
+            const int bit_pos  = (pos & 1) * 4;
+            out_bytes[byte_idx] |= (uint8_t) ((idx_arr[k] & 0x0F) << bit_pos);
+        }
+    }
 }
 
 #define GGML_TURBO_KV_4B_HAVE_AVX2 1

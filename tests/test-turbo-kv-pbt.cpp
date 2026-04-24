@@ -14,6 +14,9 @@
 #include "ggml-cpu.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
+#if defined(__AVX2__)
+#include "ggml-cpu/arch/x86/turbo_kv_4b_avx2.h"
+#endif
 #include <rapidcheck.h>
 #include <cmath>
 #include <cstdio>
@@ -1110,6 +1113,60 @@ void property_NearestCentroidAssignment_matches_reference() {
         });
 }
 
+#if defined(__AVX2__)
+/* ================================================================
+ * SIMD implementation of nearest_centroid.allium: byte-for-byte
+ * against the in-test scalar reference. Passes iff the AVX2 argmin
+ * matches the scalar at zero tolerance, which is what
+ * nearest_centroid.allium:config.argmin_index_rel_tol = 0.0 demands.
+ * ================================================================ */
+void property_AVX2_NearestCentroidAssignment_matches_reference() {
+    rc::check("AVX2 nearest_centroid block: byte-exact vs scalar reference",
+        [](uint32_t seed) {
+            const int dim = TURBO_KV_BLOCK_SIZE;
+            std::vector<float> x(dim);
+            fill_random(x.data(), dim, seed);
+            if (vec_l2_norm(x.data(), dim) < 1e-6f) x[0] = 1.0f;
+
+            /* Reproduce steps 1-4 of quantize_block_turbo_kv_4b: get
+             * rotated + inv_std to feed into the argmin step alone. */
+            const float norm = vec_l2_norm(x.data(), dim);
+            std::vector<float> rotated(dim);
+            const float inv_norm = 1.0f / norm;
+            for (int i = 0; i < dim; i++) rotated[i] = x[i] * inv_norm;
+            turbo_kv_rht_forward(rotated.data(), dim, TURBO_KV_DEFAULT_SEED);
+            float max_abs = 0.0f;
+            for (int i = 0; i < dim; i++) {
+                const float a = fabsf(rotated[i]);
+                if (a > max_abs) max_abs = a;
+            }
+            if (max_abs < 1e-10f) max_abs = 1.0f;
+            const float inv_std = TURBO_KV_4B_CENT_MAX / max_abs;
+
+            /* Scalar reference: the in-test spec-faithful oracle. */
+            uint8_t expected[dim / 2];
+            {
+                std::vector<int> idx(dim);
+                for (int i = 0; i < dim; i++) {
+                    idx[i] = ref_argmin_first_match(
+                        rotated[i] * inv_std, turbo_kv_4b_codebook, 16);
+                }
+                ref_pack_nibble_indices(idx.data(), dim, expected);
+            }
+
+            /* AVX2 under test. */
+            uint8_t actual[dim / 2];
+            turbo_kv_4b_avx2_nearest_centroid_block(
+                rotated.data(), inv_std, actual);
+
+            /* argmin_index_rel_tol = 0.0 — exact byte match required. */
+            for (int b = 0; b < dim / 2; b++) {
+                RC_ASSERT(actual[b] == expected[b]);
+            }
+        });
+}
+#endif  /* __AVX2__ */
+
 int main(int argc, char ** argv) {
     (void)argc; (void)argv;
     printf("=== turbo-kv-4b PBT ===\n\n");
@@ -1143,6 +1200,9 @@ int main(int argc, char ** argv) {
     property_ArgminFirstMatch_lower_index_on_tie();
     property_PackNibbleIndices_roundtrip();
     property_NearestCentroidAssignment_matches_reference();
+#if defined(__AVX2__)
+    property_AVX2_NearestCentroidAssignment_matches_reference();
+#endif
 
     printf("\n=== All properties passed ===\n");
     return 0;
