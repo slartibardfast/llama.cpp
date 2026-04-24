@@ -4296,7 +4296,16 @@ static void ggml_vk_load_shaders(vk_device& device) {
         ggml_vk_create_pipeline(device, device->pipeline_dequant[GGML_TYPE_TURBO_KV_4B],       "dequant_turbo_kv_4b",       dequant_turbo_kv_4b_len,       dequant_turbo_kv_4b_data,       "main", 2, sizeof(vk_op_unary_push_constants),  {128, 1, 1}, {ss, 1, 1}, 1, false, true, ss);
         ggml_vk_create_pipeline(device, device->pipeline_get_rows[GGML_TYPE_TURBO_KV_4B],      "get_rows_turbo_kv_4b",      get_rows_turbo_kv_4b_len,      get_rows_turbo_kv_4b_data,      "main", 3, sizeof(vk_op_binary_push_constants), {128, 1, 1}, {ss, 1, 1}, 1, false, true, ss);
         ggml_vk_create_pipeline(device, device->pipeline_get_rows_f32[GGML_TYPE_TURBO_KV_4B],  "get_rows_turbo_kv_4b_f32",  get_rows_turbo_kv_4b_f32_len,  get_rows_turbo_kv_4b_f32_data,  "main", 3, sizeof(vk_op_binary_push_constants), {128, 1, 1}, {ss, 1, 1}, 1, false, true, ss);
-        ggml_vk_create_pipeline(device, device->pipeline_cpy_f32_quant[GGML_TYPE_TURBO_KV_4B], "cpy_f32_turbo_kv_4b",       cpy_f32_turbo_kv_4b_len,       cpy_f32_turbo_kv_4b_data,       "main", 2, sizeof(vk_op_unary_push_constants),  {128, 1, 1}, {ss, 1, 1}, 1, false, true, ss);
+        // cpy_f32 -> turbo_kv_4b: the ggml CPY dispatch (ggml-vulkan.cpp
+        // GGML_OP_CPY branch) already pre-divides `ne` by ggml_blck_size(dst)
+        // when src is float and dst is quantized. So `elements` is already in
+        // block units by the time the dispatcher computes
+        // workgroups = CEIL_DIV(elements, wg_denoms). Using wg_denoms={1,1,1}
+        // here avoids a double division that would collapse multi-block
+        // dispatch to a single workgroup. Each workgroup processes exactly
+        // one 128-element block (the shader uses subgroup-cooperative
+        // reductions scoped to the workgroup).
+        ggml_vk_create_pipeline(device, device->pipeline_cpy_f32_quant[GGML_TYPE_TURBO_KV_4B], "cpy_f32_turbo_kv_4b",       cpy_f32_turbo_kv_4b_len,       cpy_f32_turbo_kv_4b_data,       "main", 2, sizeof(vk_op_unary_push_constants),  {1, 1, 1},   {ss, 1, 1}, 1, false, true, ss);
         ggml_vk_create_pipeline(device, device->pipeline_cpy_quant_f32[GGML_TYPE_TURBO_KV_4B], "cpy_turbo_kv_4b_f32",       cpy_turbo_kv_4b_f32_len,       cpy_turbo_kv_4b_f32_data,       "main", 2, sizeof(vk_op_unary_push_constants),  {128, 1, 1}, {ss, 1, 1}, 1, false, true, ss);
     }
 

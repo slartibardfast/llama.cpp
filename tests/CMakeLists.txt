@@ -294,6 +294,21 @@ target_include_directories(test-turbo-kv-pbt PRIVATE
 # property in test-turbo-kv-pbt.cpp pulls in turbo_kv_4b_avx2.h.
 target_compile_options(test-turbo-kv-pbt PRIVATE -march=native)
 
+# TurboQuant backend PBT: propagated from turbo_kv_4b_backend.allium.
+# Tests any registered non-CPU backend's quantize / dequantize /
+# get_rows / set_rows for TURBO_KV_4B against the CPU scalar reference
+# within the fp32 tolerance floor. Iterates over ggml_backend_dev_get()
+# at runtime so adding CUDA / ROCm / Metal to the build surfaces them
+# through enumeration without a file edit here. Links ggml (the full
+# backend library) so Vulkan / CUDA / etc. shader dispatch is
+# available.
+add_executable(test-turbo-kv-backend-pbt test-turbo-kv-backend-pbt.cpp)
+target_link_libraries(test-turbo-kv-backend-pbt PRIVATE ggml-base ggml
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../rapidcheck/build/librapidcheck.a)
+target_include_directories(test-turbo-kv-backend-pbt PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../rapidcheck/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src)
+
 # Micro-benchmark for PHASE25 step 3 profiling — isolates
 # turbo_kv_4b_avx2_single_block_dot in a tight loop so `perf record`
 # attribution lands on the kernel's hot instructions, not harness noise.
