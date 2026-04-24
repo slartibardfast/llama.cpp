@@ -342,6 +342,15 @@ target_link_libraries(test-turbo-kv-residual-window-harness PRIVATE llama ggml)
 add_executable(test-flash-attn-lse test-flash-attn-lse.cpp)
 target_link_libraries(test-flash-attn-lse PRIVATE ggml ggml-cpu ggml-base)
 
+# Online-softmax merge of two FA_LSE outputs. Builds the merge graph
+# from existing ggml ops (add/sub/abs/exp/mul/div/scale/clamp) and
+# verifies that combining two partial FA_LSE outputs over split key
+# ranges reproduces the single-pass FA result. Edge case: entire
+# first pass masked (-inf M, zero S) hands over cleanly to the
+# second pass. No new ggml kernel needed.
+add_executable(test-flash-attn-lse-merge test-flash-attn-lse-merge.cpp)
+target_link_libraries(test-flash-attn-lse-merge PRIVATE ggml ggml-cpu ggml-base)
+
 # TurboQuant asymmetric-K/V PBT: propagated from
 # turbo_kv_asymmetric.allium. PHASE26 Tier 1.2. Skip-stub today.
 add_executable(test-turbo-kv-asymmetric-pbt test-turbo-kv-asymmetric-pbt.cpp)
