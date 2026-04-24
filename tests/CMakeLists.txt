@@ -309,6 +309,20 @@ target_include_directories(test-turbo-kv-backend-pbt PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../../rapidcheck/include
     ${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src)
 
+# TurboQuant residual-window PBT: propagated from
+# turbo_kv_residual_window.allium. Establishes the full 22-obligation
+# coverage list against the spec. Residual window is not yet
+# implemented in the port (PHASE26 Tier 1.1 — primary driver of the
+# 9B IQ3_XXS PPL regression), so implementation-dependent obligations
+# SKIP today. Builds and runs green; converts SKIPs to rc::check
+# calls as the feature lands.
+add_executable(test-turbo-kv-residual-window-pbt test-turbo-kv-residual-window-pbt.cpp)
+target_link_libraries(test-turbo-kv-residual-window-pbt PRIVATE ggml-base)
+target_include_directories(test-turbo-kv-residual-window-pbt PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src)
+# rapidcheck linkage will be added when the first rc::check lands
+# (today the file is skip-only — see header comment).
+
 # TurboQuant attention PBT: propagated from turbo_kv_4b_attention.allium.
 # Compares GGML_OP_FLASH_ATTN_EXT output between the CPU scalar
 # reference and each registered non-CPU backend at the multi-block
