@@ -19,6 +19,12 @@ struct llama_cparams {
     float rope_freq_scale;
 
     uint32_t n_ctx_orig_yarn;
+
+    uint32_t residual_window; // size of the fp16 rolling tail on quantized KV caches (0 = disabled).
+                              // Quantized positions are the head of the sequence; the last
+                              // `residual_window` tokens stay in fp16 and bypass quantization.
+                              // Only meaningful when type_k or type_v is a TURBO_KV_* quantized
+                              // type; ignored otherwise. Spec: turbo_kv_residual_window.allium.
     // These hyperparameters are not exposed in GGUF, because all
     // existing YaRN models use the same values for them.
     float yarn_ext_factor;

@@ -2039,6 +2039,22 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_TYPE_V"));
     add_opt(common_arg(
+        {"--cache-residual-window"}, "N",
+        string_format(
+            "fp16 rolling-tail size for TURBO_KV quantised caches (0 = disabled).\n"
+            "The last N tokens stay in fp16; older tokens are quantised via the\n"
+            "chosen --cache-type-k/v. Clamped to n_ctx at init with a warning.\n"
+            "(default: %u)",
+            params.residual_window
+        ),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("--cache-residual-window must be >= 0");
+            }
+            params.residual_window = (uint32_t) value;
+        }
+    ).set_env("LLAMA_ARG_CACHE_RESIDUAL_WINDOW"));
+    add_opt(common_arg(
         {"--hellaswag"},
         "compute HellaSwag score over random tasks from datafile supplied with -f",
         [](common_params & params) {

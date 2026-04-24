@@ -165,6 +165,17 @@ llama_context::llama_context(
     cparams.op_offload = params.op_offload;
     cparams.kv_unified = params.kv_unified;
 
+    // Clamp residual_window to n_ctx with a warning: when the window covers
+    // the whole context, the full sequence fits in the fp16 tail and no
+    // positions are quantised — equivalent to running without TURBO_KV.
+    cparams.residual_window = params.residual_window;
+    if (cparams.residual_window > cparams.n_ctx) {
+        LLAMA_LOG_WARN("%s: residual_window=%u exceeds n_ctx=%u; clamping to n_ctx "
+                       "(no KV quantisation will occur until seq_len > n_ctx)\n",
+                       __func__, cparams.residual_window, cparams.n_ctx);
+        cparams.residual_window = cparams.n_ctx;
+    }
+
     // initialized later
     cparams.pipeline_parallel = false;
 
@@ -2976,6 +2987,10 @@ llama_context_params llama_context_default_params() {
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_k_static               =*/ GGML_TYPE_COUNT,
         /*.type_v                      =*/ GGML_TYPE_F16,
+        /*.residual_window             =*/ 128, // fp16 rolling-tail default for
+                                                // TURBO_KV caches. Ignored when
+                                                // type_k/type_v is not a
+                                                // TURBO_KV_* type.
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,

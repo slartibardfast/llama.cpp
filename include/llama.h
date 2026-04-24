@@ -362,6 +362,11 @@ extern "C" {
         enum ggml_type type_k_static; // split K: type for static (non-RoPE) dims. GGML_TYPE_COUNT = no split [EXPERIMENTAL]
         enum ggml_type type_v;        // data type for V cache [EXPERIMENTAL]
 
+        uint32_t residual_window;     // fp16 rolling-tail size on TURBO_KV quantized KV caches.
+                                      // 0 = disabled (all positions quantized).
+                                      // N > 0 = last N tokens stay in fp16, older tokens are quantized.
+                                      // Clamped to n_ctx at init with a warning. [EXPERIMENTAL]
+
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted
         // currently works only with CPU execution
