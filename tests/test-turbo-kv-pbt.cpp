@@ -806,6 +806,125 @@ void property_SIMDEquivalence_multi_row() {
         });
 }
 
+/* ================================================================
+ * Spec: rule QuantizeBlock @ensures TurboBlock.created(norm, inv_std, indices)
+ * (turbo-kv-4b.allium)
+ *
+ * Directly verifies the ensures clause fields after a quantize call.
+ * Overlaps with other tests at the composition level; value here is
+ * isolation — if a roundtrip test breaks, this narrows it to the
+ * quantize side.
+ *   * norm    = L2_norm(input), to fp16 round-trip precision.
+ *   * inv_std = cent_max / max_abs(RHT(normalize(input))), same.
+ *   * indices are the argmin values — cross-referenced to
+ *     property_nearest_centroid_is_argmin (already covers this),
+ *     not re-checked here.
+ * ================================================================ */
+void property_QuantizeBlock_creates_turbo_block() {
+    rc::check("QuantizeBlock ensures: TurboBlock.created(norm, inv_std, indices)",
+        [](uint32_t seed) {
+            const int dim = TURBO_KV_BLOCK_SIZE;
+            std::vector<float> x(dim);
+            fill_random(x.data(), dim, seed);
+            /* Spec requires L2_norm(tensor.data) > 0. */
+            float norm = vec_l2_norm(x.data(), dim);
+            if (norm < 1e-6f) { x[0] = 1.0f; norm = vec_l2_norm(x.data(), dim); }
+
+            block_turbo_kv_4b blk;
+            quantize_row_turbo_kv_4b_ref(x.data(), &blk, dim);
+
+            /* ensures.norm = L2_norm(input) — check via fp16 round-trip. */
+            const float stored_norm = turbo_kv_fp16_to_fp32(blk.norm);
+            const float norm_rel_err = fabsf(stored_norm - norm) / norm;
+            /* fp16 has ~3 decimal digits of precision → rel_err < 1e-3. */
+            RC_ASSERT(norm_rel_err < 1e-3f);
+
+            /* ensures.inv_std = cent_max / max_abs(RHT(normalize(input))).
+             * Reproduce the fp32 intermediate value the code computed (same
+             * trick as property_nearest_centroid_is_argmin), not the fp16
+             * round-trip which would introduce its own error. */
+            std::vector<float> rotated(dim);
+            const float inv_norm = 1.0f / norm;
+            for (int i = 0; i < dim; i++) rotated[i] = x[i] * inv_norm;
+            turbo_kv_rht_forward(rotated.data(), dim, TURBO_KV_DEFAULT_SEED);
+            float max_abs = 0.0f;
+            for (int i = 0; i < dim; i++) {
+                const float a = fabsf(rotated[i]);
+                if (a > max_abs) max_abs = a;
+            }
+            if (max_abs < 1e-10f) max_abs = 1.0f;
+            const float expected_inv_std = TURBO_KV_4B_CENT_MAX / max_abs;
+
+            const float stored_inv_std = turbo_kv_fp16_to_fp32(blk.inv_std_fp16);
+            const float inv_std_rel_err =
+                fabsf(stored_inv_std - expected_inv_std) / expected_inv_std;
+            RC_ASSERT(inv_std_rel_err < 1e-3f);
+
+            /* indices: the argmin property is already tested directly by
+             * property_nearest_centroid_is_argmin. The spec's ensures clause
+             * for QuantizeBlock just asserts an indices field exists on the
+             * created TurboBlock; bounds + correctness are covered by
+             * property_quantize_indices_in_bounds and
+             * property_nearest_centroid_is_argmin respectively. No
+             * duplicate check here. */
+        });
+}
+
+/* ================================================================
+ * Spec: rule DequantizeBlock @ensures Tensor.created(data: reconstructed,
+ * count: config.block_size) (turbo-kv-4b.allium)
+ *
+ * Verifies the creation semantics specifically: exactly block_size
+ * floats are written per block call, and nothing is written past the
+ * declared count. The norm-preservation property is tested elsewhere;
+ * this one isolates the "tensor created with the right shape" check.
+ * ================================================================ */
+void property_DequantizeBlock_creates_tensor() {
+    rc::check("DequantizeBlock ensures: Tensor.created(count: block_size)",
+        [](uint32_t seed) {
+            const int dim = TURBO_KV_BLOCK_SIZE;
+            std::vector<float> x(dim);
+            fill_random(x.data(), dim, seed);
+            if (vec_l2_norm(x.data(), dim) < 1e-6f) x[0] = 1.0f;
+
+            block_turbo_kv_4b blk;
+            quantize_row_turbo_kv_4b_ref(x.data(), &blk, dim);
+
+            /* Allocate a sentinel-padded buffer: block_size floats of real
+             * output, followed by 8 sentinel floats the dequant must not
+             * touch. If the code writes past block_size elements, the
+             * sentinels will differ from 0x42424242. */
+            const int pad = 8;
+            const uint32_t SENTINEL = 0x42424242u;
+            std::vector<uint32_t> raw(dim + pad);
+            for (int i = 0; i < dim + pad; i++) raw[i] = SENTINEL;
+            float * out = reinterpret_cast<float *>(raw.data());
+
+            dequantize_row_turbo_kv_4b(&blk, out, dim);
+
+            /* count: block_size — sentinel tail must be intact. */
+            for (int i = 0; i < pad; i++) {
+                RC_ASSERT(raw[dim + i] == SENTINEL);
+            }
+
+            /* data: reconstructed — every written float is finite and
+             * bounded. "Bounded" here follows from the rescale step:
+             * dequant magnitude <= block.norm (RHT is orthogonal, codebook
+             * values are <= cent_max in the rotated frame, and rescale
+             * multiplies by block.norm). We're not re-checking norm
+             * preservation (property_reconstruction_preserves_norm...
+             * covers that); we're asserting basic shape-creation correctness. */
+            const float norm = turbo_kv_fp16_to_fp32(blk.norm);
+            for (int i = 0; i < dim; i++) {
+                RC_ASSERT(std::isfinite(out[i]));
+                /* Upper bound: 2*norm is generous (covers fp16 roundoff of
+                 * the inv_std factor and any reasonable codebook-scale
+                 * overshoot). */
+                RC_ASSERT(fabsf(out[i]) <= 2.0f * norm + 1e-3f);
+            }
+        });
+}
+
 int main(int argc, char ** argv) {
     (void)argc; (void)argv;
     printf("=== turbo-kv-4b PBT ===\n\n");
@@ -832,6 +951,8 @@ int main(int argc, char ** argv) {
     property_codebook_size_is_16();
     property_reconstruction_rel_error_budget();
     property_TurboBlock_fields_after_quantize();
+    property_QuantizeBlock_creates_turbo_block();
+    property_DequantizeBlock_creates_tensor();
     property_SIMDEquivalence_turbo_kv_4b();
     property_SIMDEquivalence_multi_row();
 
