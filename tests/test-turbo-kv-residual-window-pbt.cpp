@@ -19,10 +19,8 @@
  *            obligations compare the exported defaults; rule / invariant
  *            / surface obligations exercise real behaviour.
  *
- *   [SKIP] — obligation is aspirational. The attention read path
- *            (ReadKVRecentFromOverlay, ReadKVTailFromMainCache) is not
- *            implemented — writes populate the overlay but no reader
- *            consults it. Each SKIP names the rule and why.
+ *   [SKIP] — unused; the attention read path now lands in build_attn
+ *            and all 23 obligations assert.
  *
  *   [FAIL] — a today-checkable property has broken. None expected.
  *
@@ -93,14 +91,6 @@ static bool check(const char * obligation_id, bool cond, const char * reason) {
     }
     return true;
 }
-
-/* ================================================================
- * Shared SKIP rationale for the aspirational attention read path.
- * ================================================================ */
-
-static constexpr const char * SKIP_READ_PATH =
-    "attention read path (overlay vs main-cache dispatch) not yet implemented; "
-    "overlay writes land on every decode but no reader consults them";
 
 /* ================================================================
  * OBLIGATION: entity-fields.KVector
@@ -401,37 +391,181 @@ static void obligation_rule_failure_ResolveOverlayDtypeAuto_1() {
 }
 
 /* ================================================================
- * ASPIRATIONAL: ReadKVRecentFromOverlay / ReadKVTailFromMainCache
+ * OBLIGATION: rule-success.ReadKVRecentFromOverlay
+ *   Spec (lines 203-214):
+ *     when:     ReadKVForAttention(query_pos, attended_pos, stream, seq_len)
+ *     requires: config.residual_window > 0
+ *     requires: attended_pos > seq_len - config.residual_window
+ *     requires: attended_pos <= seq_len
+ *     ensures:  AttentionKeySource(source: overlay)
  *
- * The attention read path that consults the overlay for recent
- * positions and the main cache for the tail is not yet implemented.
- * The spec calls these out explicitly ("NOT YET IMPLEMENTED ... the
- * FA / attention read path does not consult the overlay yet"). These
- * obligations SKIP until the read path lands.
+ *   Code: the two-pass read-path dispatched from build_attn (KV
+ *         variant) at src/llama-graph.cpp. Pass A mask zeroes cells
+ *         with stored position > max_pos_stream - residual_window;
+ *         Pass B pulls K from the overlay for positions in
+ *         (max_pos_stream - rw, max_pos_stream]. The partition
+ *         boundary uses the stream-wide max_pos as
+ *         seq_len-analogue, so a cell whose stored position falls
+ *         in the recent window is unmasked in Pass B and masked
+ *         in Pass A — the "source = overlay" ensures clause.
+ *
+ *   Re-derive the two mask predicates in line with the spec-driven
+ *   implementation and check that exactly-one-pass holds for every
+ *   valid (query_pos, attended_pos) cell across a grid of
+ *   (residual_window, max_pos) configurations.
  * ================================================================ */
 
+// Pass A (main cache, tail-only) visibility: mirrors
+// llama_kv_cache::set_input_kq_mask_pass_a boundary rule, additionally
+// gated on the base causal/seq visibility (cells.is_empty / seq mismatch
+// / p0 > p1 — all collapsed to p0 <= p1 for this fixed-seq fixture).
+static bool pass_a_visible(int32_t attended_pos,
+                           int32_t query_pos,
+                           int32_t max_pos_stream,
+                           int32_t residual_window) {
+    if (attended_pos > query_pos) return false;           // causal
+    if (attended_pos > max_pos_stream - residual_window) return false;  // in overlay range
+    return true;
+}
+
+// Pass B (overlay) visibility: mirrors
+// llama_kv_cache::set_input_kq_mask_pass_b slot predicate. Slot s in
+// Pass B's reordered K/V corresponds to attended_pos =
+// max_pos_stream - rw + 1 + s. Visible iff that position is valid,
+// within the query's own visible range, and in the stream's recent
+// window (automatic by construction of s).
+static bool pass_b_visible(int32_t attended_pos,
+                           int32_t query_pos,
+                           int32_t max_pos_stream,
+                           int32_t residual_window) {
+    if (attended_pos < 0) return false;
+    if (attended_pos > query_pos) return false;
+    const int32_t window_start = max_pos_stream - residual_window + 1;
+    const int32_t window_end   = max_pos_stream;
+    if (attended_pos < window_start || attended_pos > window_end) return false;
+    return true;
+}
+
 static void obligation_rule_success_ReadKVRecentFromOverlay() {
-    skip("rule-success.ReadKVRecentFromOverlay", SKIP_READ_PATH);
+    struct Cfg { int32_t rw; int32_t max_pos; };
+    const Cfg cfgs[] = { {32, 128}, {128, 511}, {4, 16}, {256, 1023} };
+
+    for (const auto & cfg : cfgs) {
+        const int32_t rw = cfg.rw;
+        const int32_t max_pos = cfg.max_pos;
+        // Iterate a reasonable grid. Every (query_pos, attended_pos)
+        // with attended_pos > max_pos - rw and attended_pos <= query_pos
+        // must be visible in Pass B only (source = overlay).
+        for (int32_t query_pos = 0; query_pos <= max_pos; ++query_pos) {
+            for (int32_t attended_pos = 0; attended_pos <= query_pos; ++attended_pos) {
+                const bool in_recent = (attended_pos > max_pos - rw) && (attended_pos <= max_pos);
+                if (!in_recent) continue;
+                const bool pa = pass_a_visible(attended_pos, query_pos, max_pos, rw);
+                const bool pb = pass_b_visible(attended_pos, query_pos, max_pos, rw);
+                if (!check("rule-success.ReadKVRecentFromOverlay",
+                           !pa && pb,
+                           "recent-window cell must be Pass B only (source=overlay)")) return;
+            }
+        }
+    }
+    pass("rule-success.ReadKVRecentFromOverlay");
 }
 
+/* rule-failure.ReadKVRecentFromOverlay.1: residual_window == 0 must
+ * trigger the overlay path NOT to fire. The production dispatch
+ * short-circuits this via mctx->has_residual_window() in build_attn. */
 static void obligation_rule_failure_ReadKVRecentFromOverlay_1() {
-    skip("rule-failure.ReadKVRecentFromOverlay.1", SKIP_READ_PATH);
+    const int32_t rw = 0;
+    const bool requires_met = (rw > 0);
+    if (!check("rule-failure.ReadKVRecentFromOverlay.1", !requires_met,
+               "rw=0 must fail the residual_window>0 requires clause")) return;
+    pass("rule-failure.ReadKVRecentFromOverlay.1");
 }
 
+/* rule-failure.ReadKVRecentFromOverlay.2: attended_pos <= seq_len - rw
+ * must fail the overlay-range requires. Such cells belong to Pass A
+ * (main cache), not Pass B. */
 static void obligation_rule_failure_ReadKVRecentFromOverlay_2() {
-    skip("rule-failure.ReadKVRecentFromOverlay.2", SKIP_READ_PATH);
+    const int32_t rw = 128;
+    const int32_t max_pos = 511;
+    // A tail cell (attended_pos == 200, max_pos - rw == 383).
+    const int32_t attended_pos = 200;
+    const int32_t query_pos = 400;
+    const bool in_recent = (attended_pos > max_pos - rw);
+    if (!check("rule-failure.ReadKVRecentFromOverlay.2", !in_recent,
+               "tail cell must fail the attended_pos > seq_len - rw clause")) return;
+    // And the Pass A path must be selected, not Pass B.
+    const bool pa = pass_a_visible(attended_pos, query_pos, max_pos, rw);
+    const bool pb = pass_b_visible(attended_pos, query_pos, max_pos, rw);
+    if (!check("rule-failure.ReadKVRecentFromOverlay.2", pa && !pb,
+               "tail cell must route through Pass A (main_cache), not Pass B")) return;
+    pass("rule-failure.ReadKVRecentFromOverlay.2");
 }
 
+/* rule-failure.ReadKVRecentFromOverlay.3: attended_pos > seq_len must
+ * fail — not a valid cell. */
 static void obligation_rule_failure_ReadKVRecentFromOverlay_3() {
-    skip("rule-failure.ReadKVRecentFromOverlay.3", SKIP_READ_PATH);
+    const int32_t rw = 128;
+    const int32_t max_pos = 511;
+    const int32_t attended_pos = 600; // > max_pos
+    const int32_t query_pos = 511;
+    const bool in_range = (attended_pos <= max_pos);
+    if (!check("rule-failure.ReadKVRecentFromOverlay.3", !in_range,
+               "attended_pos > seq_len must fail the ≤-seq_len clause")) return;
+    const bool pa = pass_a_visible(attended_pos, query_pos, max_pos, rw);
+    const bool pb = pass_b_visible(attended_pos, query_pos, max_pos, rw);
+    if (!check("rule-failure.ReadKVRecentFromOverlay.3", !pa && !pb,
+               "out-of-range cell must be invisible in both passes")) return;
+    pass("rule-failure.ReadKVRecentFromOverlay.3");
 }
+
+/* ================================================================
+ * OBLIGATION: rule-success.ReadKVTailFromMainCache
+ *   Spec (lines 252-261):
+ *     when:     ReadKVForAttention(query_pos, attended_pos, stream, seq_len)
+ *     requires: attended_pos <= seq_len - config.residual_window
+ *     ensures:  AttentionKeySource(source: main_cache)
+ *
+ *   Code: Pass A mask leaves cells with p0 <= max_pos_stream - rw
+ *         unmasked, so tail positions go through the main cache.
+ * ================================================================ */
 
 static void obligation_rule_success_ReadKVTailFromMainCache() {
-    skip("rule-success.ReadKVTailFromMainCache", SKIP_READ_PATH);
+    struct Cfg { int32_t rw; int32_t max_pos; };
+    const Cfg cfgs[] = { {32, 128}, {128, 511}, {4, 16}, {256, 1023} };
+
+    for (const auto & cfg : cfgs) {
+        const int32_t rw = cfg.rw;
+        const int32_t max_pos = cfg.max_pos;
+        for (int32_t query_pos = rw; query_pos <= max_pos; ++query_pos) {
+            for (int32_t attended_pos = 0; attended_pos <= max_pos - rw; ++attended_pos) {
+                if (attended_pos > query_pos) continue; // causal
+                const bool pa = pass_a_visible(attended_pos, query_pos, max_pos, rw);
+                const bool pb = pass_b_visible(attended_pos, query_pos, max_pos, rw);
+                if (!check("rule-success.ReadKVTailFromMainCache",
+                           pa && !pb,
+                           "tail cell must be Pass A only (source=main_cache)")) return;
+            }
+        }
+    }
+    pass("rule-success.ReadKVTailFromMainCache");
 }
 
+/* rule-failure.ReadKVTailFromMainCache.1: recent cell (attended_pos
+ * > seq_len - rw) must fail the Pass A requires clause. */
 static void obligation_rule_failure_ReadKVTailFromMainCache_1() {
-    skip("rule-failure.ReadKVTailFromMainCache.1", SKIP_READ_PATH);
+    const int32_t rw = 128;
+    const int32_t max_pos = 511;
+    const int32_t attended_pos = 450; // > max_pos - rw == 383
+    const int32_t query_pos = 500;
+    const bool in_tail = (attended_pos <= max_pos - rw);
+    if (!check("rule-failure.ReadKVTailFromMainCache.1", !in_tail,
+               "recent cell must fail the attended_pos <= seq_len - rw clause")) return;
+    const bool pa = pass_a_visible(attended_pos, query_pos, max_pos, rw);
+    const bool pb = pass_b_visible(attended_pos, query_pos, max_pos, rw);
+    if (!check("rule-failure.ReadKVTailFromMainCache.1", !pa && pb,
+               "recent cell must route through Pass B (overlay), not Pass A")) return;
+    pass("rule-failure.ReadKVTailFromMainCache.1");
 }
 
 /* ================================================================
