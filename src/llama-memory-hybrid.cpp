@@ -19,6 +19,7 @@ llama_memory_hybrid::llama_memory_hybrid(
                  uint32_t   n_pad,
                  uint32_t   n_swa,
            llama_swa_type   swa_type,
+                 uint32_t   residual_window,
                             /* recurrent */
                 ggml_type   type_r,
                 ggml_type   type_s,
@@ -44,10 +45,7 @@ llama_memory_hybrid::llama_memory_hybrid(
         n_pad,
         n_swa,
         swa_type,
-        /*residual_window=*/ 0, // hybrid caches are for recurrent models;
-                                // residual-window semantics do not apply
-                                // until/unless attention-side hybrid
-                                // layers adopt TURBO_KV quantisation.
+        residual_window,
         filter_attn == nullptr ?
             [&](int32_t il) { return !hparams.is_recurrent(il); }
             : filter_attn,

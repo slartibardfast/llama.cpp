@@ -26,6 +26,7 @@ public:
                      uint32_t   n_seq_max,
                      uint32_t   n_ubatch,
                      uint32_t   n_pad,
+                     uint32_t   residual_window, // fp16 rolling-tail size; applies only to the non-SWA base cache
         const layer_filter_cb & filter,
         const  layer_reuse_cb & reuse);
 

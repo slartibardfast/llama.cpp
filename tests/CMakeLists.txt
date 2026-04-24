@@ -323,6 +323,15 @@ target_include_directories(test-turbo-kv-residual-window-pbt PRIVATE
 # rapidcheck linkage will be added when the first rc::check lands
 # (today the file is skip-only — see header comment).
 
+# Residual-window integration harness: minimal llama_context-init
+# test. Emits a single HARNESS_OK line to stdout on success with
+# the cparams that were actually applied. Used by the residual-
+# window driver script to retro-verify cparam wiring and forward-
+# verify every subsequent step without llama-cli's MTP noise.
+# Needs the full llama library for llama_init_from_model.
+add_executable(test-turbo-kv-residual-window-harness test-turbo-kv-residual-window-harness.cpp)
+target_link_libraries(test-turbo-kv-residual-window-harness PRIVATE llama ggml)
+
 # TurboQuant asymmetric-K/V PBT: propagated from
 # turbo_kv_asymmetric.allium. PHASE26 Tier 1.2. Skip-stub today.
 add_executable(test-turbo-kv-asymmetric-pbt test-turbo-kv-asymmetric-pbt.cpp)

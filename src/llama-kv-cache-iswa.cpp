@@ -24,6 +24,7 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
                  uint32_t   n_seq_max,
                  uint32_t   n_ubatch,
                  uint32_t   n_pad,
+                 uint32_t   residual_window,
     const layer_filter_cb & filter,
     const  layer_reuse_cb & reuse) : hparams(model.hparams), unified(unified) {
 
@@ -60,15 +61,13 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
 
     LLAMA_LOG_INFO("%s: creating non-SWA KV cache, size = %u cells\n", __func__, size_base);
 
-    // residual_window = 0 for iSWA caches until a follow-on pass propagates
-    // the param through llama_kv_cache_iswa's ctor and its callers. iSWA
-    // models (Gemma-class interleaved SWA) don't overlap with the current
-    // TURBO_KV target configurations (Qwen3.5 9B / 35B-A3B); the
-    // residual-window wire is live only for the plain llama_kv_cache path.
+    // residual_window only applies to the non-SWA base cache: the SWA cache
+    // itself already discards tokens outside its window, so there is no
+    // older-positions tail to carry. Passing 0 to the SWA side is correct.
     kv_base = std::make_unique<llama_kv_cache>(
             model, type_k, type_k_static, type_v,
             v_trans, offload, unified, size_base, n_seq_max, n_pad,
-            0, LLAMA_SWA_TYPE_NONE, /*residual_window=*/ 0, filter_base, reuse);
+            0, LLAMA_SWA_TYPE_NONE, residual_window, filter_base, reuse);
 
     LLAMA_LOG_INFO("%s: creating     SWA KV cache, size = %u cells\n", __func__, size_swa);
 

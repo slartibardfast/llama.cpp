@@ -29,6 +29,7 @@ public:
                  uint32_t   n_pad,
                  uint32_t   n_swa,
            llama_swa_type   swa_type,
+                 uint32_t   residual_window, // fp16 rolling-tail size for the attention side
                             /* recurrent */
                 ggml_type   type_r,
                 ggml_type   type_s,
