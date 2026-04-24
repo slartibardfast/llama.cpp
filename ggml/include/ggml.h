@@ -2368,6 +2368,41 @@ extern "C" {
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
 
+    // Flash-attention variant that emits the unscaled numerator VKQ plus the
+    // online-softmax (max, sum) state per (head, query). Same inputs as
+    // ggml_flash_attn_ext; the output shape extends the last dim by 2:
+    //
+    //   res: [n_embd_v + 2, n_head, n_batch, ne3]  (permuted, as for ext)
+    //
+    // Row layout per (head, query):
+    //   indices [0, n_embd_v)   : VKQ_unscaled = sum_k exp(q·k - M) * V_k
+    //   index    n_embd_v       : M = max_k (q·k)
+    //   index    n_embd_v + 1   : S = sum_k exp(q·k - M)
+    //
+    // The non-lse variant computes VKQ_unscaled/S internally and writes only
+    // the scaled output; this variant exposes the raw state so callers can
+    // merge results of two independent FA passes via online softmax:
+    //
+    //   M_new = max(M_a, M_b)
+    //   scale_a = exp(M_a - M_new), scale_b = exp(M_b - M_new)
+    //   S_new = scale_a * S_a + scale_b * S_b
+    //   VKQ_new = scale_a * VKQ_a + scale_b * VKQ_b
+    //   final = VKQ_new / S_new
+    //
+    // CPU path: supported. Non-CPU backends: not yet implemented. [EXPERIMENTAL]
+    GGML_API struct ggml_tensor * ggml_flash_attn_ext_lse(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * mask,
+            float                 scale,
+            float                 max_bias,
+            float                 logit_softcap);
+
+    // Query whether an FA op was constructed with the LSE output variant.
+    GGML_API bool ggml_flash_attn_ext_is_lse(const struct ggml_tensor * a);
+
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(
            struct ggml_context * ctx,

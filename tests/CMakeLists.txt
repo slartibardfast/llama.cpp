@@ -333,6 +333,15 @@ target_include_directories(test-turbo-kv-residual-window-pbt PRIVATE
 add_executable(test-turbo-kv-residual-window-harness test-turbo-kv-residual-window-harness.cpp)
 target_link_libraries(test-turbo-kv-residual-window-harness PRIVATE llama ggml)
 
+# ggml_flash_attn_ext_lse numerical-agreement test. Builds two FA
+# nodes (normalised vs LSE variant) on the same inputs, runs both
+# on the CPU backend, and checks that FA_LSE's (VKQ / S) matches
+# FA's normalised output within fp32 rounding. Foundation for the
+# two-pass FA + online-softmax merge that consumes the residual
+# window on the attention read side.
+add_executable(test-flash-attn-lse test-flash-attn-lse.cpp)
+target_link_libraries(test-flash-attn-lse PRIVATE ggml ggml-cpu ggml-base)
+
 # TurboQuant asymmetric-K/V PBT: propagated from
 # turbo_kv_asymmetric.allium. PHASE26 Tier 1.2. Skip-stub today.
 add_executable(test-turbo-kv-asymmetric-pbt test-turbo-kv-asymmetric-pbt.cpp)

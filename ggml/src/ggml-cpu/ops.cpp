@@ -8214,7 +8214,16 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     const int64_t DV = nev0;
     const int64_t N  = neq1;
 
-    GGML_ASSERT(ne0 == DV);
+    // LSE mode (op_params slot 4): output is [DV+2, n_head, N, ne3] where
+    // the extra two rows per (head, query) hold (M, S) — the unscaled
+    // online-softmax max and sum. When set, we skip the final VKQ/S
+    // normalise and write raw state instead.
+    const bool lse_mode = (ggml_get_op_params_i32(dst, 4) == 1);
+    if (lse_mode) {
+        GGML_ASSERT(ne0 == DV + 2);
+    } else {
+        GGML_ASSERT(ne0 == DV);
+    }
     GGML_ASSERT(ne2 == N);
 
     // input tensor rows must be contiguous
@@ -8568,6 +8577,21 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
             partial[0] = M;
             partial[1] = S;
             memcpy(partial + 2, VKQ32, DV * sizeof(float));
+        } else if (lse_mode) {
+            // LSE mode: write unscaled [VKQ, M, S] directly to dst.
+            // Row layout: VKQ at [0..DV), M at [DV], S at [DV+1].
+            // Caller merges two FA outputs via online softmax and
+            // normalises by S after the merge.
+            const int i1 = iq1;
+            const int i2 = iq2;
+            const int i3 = iq3;
+
+            char  * dst_row = (char *) dst->data + (i3*ne2*ne1 + i2 + i1*ne1)*nb1;
+            float * dst_f32 = (float *) dst_row;
+
+            memcpy(dst_f32, VKQ32, DV * sizeof(float));
+            dst_f32[DV]     = M;
+            dst_f32[DV + 1] = S;
         } else {
             // V /= S
             const float S_inv = S == 0.0f ? 0.0f : 1.0f/S;
@@ -8965,8 +8989,18 @@ static void ggml_compute_forward_flash_attn_ext_f16(
     const int64_t DV = nev0;
     const int64_t N  = neq1;
 
+    // LSE mode: output is [DV+2, n_head, N, ne3]; caller gets raw (M, S)
+    // per query head for two-pass merge. Forces the simple one_chunk path
+    // on thread 0 — the chunked and tiled paths both write size-DV output
+    // and/or use an internal partials reduction that's incompatible with
+    // the extended layout.
+    const bool lse_mode = (ggml_get_op_params_i32(dst, 4) == 1);
 
-    GGML_ASSERT(ne0 == DV);
+    if (lse_mode) {
+        GGML_ASSERT(ne0 == DV + 2);
+    } else {
+        GGML_ASSERT(ne0 == DV);
+    }
     GGML_ASSERT(ne2 == N);
 
     // input tensor rows must be contiguous
@@ -8991,6 +9025,20 @@ static void ggml_compute_forward_flash_attn_ext_f16(
 
     // When use_ref is set, force the vec-only reference implementation (no tiling, no KV-chunking)
     const bool use_ref = params->use_ref;
+
+    // LSE mode forces the single-chunk non-tiled path, executed by thread 0
+    // only. Other threads idle at the barrier below. This is not a
+    // performance-critical path (two-pass FA is typically the slow side of
+    // attention already); correctness over parallelism for the first cut.
+    if (lse_mode) {
+        if (ith == 0) {
+            const int64_t nr = neq1*neq2*neq3;
+            ggml_compute_forward_flash_attn_ext_f16_one_chunk(
+                params, dst, 0, nr, 0, nek1, nullptr, 0);
+        }
+        ggml_barrier(params->threadpool);
+        return;
+    }
 
     // Split-KV path: parallelise K scan across all nth threads at decode.
     // Admits any K type with a vec_dot (F32, F16, Q4_0, Q8_0, TQ_KV_1B,
