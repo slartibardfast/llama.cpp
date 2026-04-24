@@ -10,6 +10,10 @@
  */
 
 #include "ggml-turbo-kv.h"
+#include "ggml.h"
+#include "ggml-cpu.h"
+#include "ggml-alloc.h"
+#include "ggml-backend.h"
 #include <rapidcheck.h>
 #include <cmath>
 #include <cstdio>
@@ -460,6 +464,103 @@ void property_RHT_multi_block_consistency() {
         });
 }
 
+/* ================================================================
+ * Spec: contract VecDot — @invariant SIMDEquivalence
+ * (mul_mat_cpu.allium)
+ *
+ * For any two registered vec_dot implementations of the same row_type
+ * (scalar vs SSE vs AVX2), their scores must agree within
+ * config.simd_equivalence_rel_tol relative tolerance on the same
+ * (row, query) inputs.
+ *
+ * This drives the CPU backend's registered dispatch via
+ * ggml_compute_forward_mul_mat (the production path), and compares
+ * against the ggml-base scalar ggml_vec_dot_turbo_kv_4b_f32. Which
+ * SIMD variant the dispatch selects depends on build flags — on this
+ * Zen 2 host (-march=native) it's AVX2. On hosts without AVX2 it's
+ * SSE4.1 or scalar; in all cases the comparison holds or the invariant
+ * is violated.
+ *
+ * Would have caught the AVX2 codebook buffer over-read in llama.cpp
+ * commit 588dd9bd (upper-lane contributions silently dropped).
+ * ================================================================ */
+void property_SIMDEquivalence_turbo_kv_4b() {
+    rc::check("SIMDEquivalence: CPU-backend mul_mat = ggml-base scalar vec_dot",
+        [](uint32_t seed, int n_blocks_selector) {
+            const int n_blocks = 1 + ((uint32_t)n_blocks_selector & 3u);  // 1..4
+            const int head_dim = n_blocks * TURBO_KV_BLOCK_SIZE;
+
+            std::vector<float> key(head_dim), query(head_dim);
+            fill_random(key.data(),   head_dim, seed);
+            fill_random(query.data(), head_dim, seed + 1);
+            /* Every block needs L2_norm > 0 per turbo-kv-4b spec. */
+            for (int b = 0; b < n_blocks; b++) {
+                if (vec_l2_norm(key.data() + b * TURBO_KV_BLOCK_SIZE,
+                                TURBO_KV_BLOCK_SIZE) < 1e-6f) {
+                    key[b * TURBO_KV_BLOCK_SIZE] = 1.0f;
+                }
+            }
+
+            /* Reference: ggml-base scalar vec_dot (no SIMD dispatch). */
+            std::vector<block_turbo_kv_4b> blocks(n_blocks);
+            quantize_row_turbo_kv_4b_ref(key.data(), blocks.data(), head_dim);
+            float ref_score = 0;
+            ggml_vec_dot_turbo_kv_4b_f32(
+                head_dim, &ref_score, 0,
+                reinterpret_cast<const void *>(blocks.data()), 0,
+                reinterpret_cast<const void *>(query.data()),  0,
+                1);
+
+            /* Dispatch: minimal mul_mat graph on the CPU backend. The
+             * type trait .vec_dot (ggml_vec_dot_turbo_kv_4b_f32_cpu)
+             * routes to whatever SIMD variant was compiled in.
+             *
+             * Uses the backend API (init → alloc → set → compute)
+             * rather than the raw ggml_init + graph_compute_with_ctx
+             * path, to match how production inference drives mul_mat
+             * and to let the backend manage tensor buffers properly. */
+            ggml_backend_t backend = ggml_backend_cpu_init();
+            RC_ASSERT(backend != nullptr);
+
+            const size_t ctx_size = 4 * ggml_tensor_overhead() + 2 * ggml_graph_overhead();
+            struct ggml_init_params p = { ctx_size, NULL, /*no_alloc=*/true };
+            struct ggml_context * ctx = ggml_init(p);
+            RC_ASSERT(ctx != nullptr);
+
+            struct ggml_tensor * A = ggml_new_tensor_2d(ctx, GGML_TYPE_TURBO_KV_4B, head_dim, 1);
+            struct ggml_tensor * B = ggml_new_tensor_2d(ctx, GGML_TYPE_F32,          head_dim, 1);
+            struct ggml_tensor * Y = ggml_mul_mat(ctx, A, B);
+
+            ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+            RC_ASSERT(buf != nullptr);
+
+            ggml_backend_tensor_set(A, blocks.data(), 0, n_blocks * sizeof(block_turbo_kv_4b));
+            ggml_backend_tensor_set(B, query.data(),  0, head_dim * sizeof(float));
+
+            struct ggml_cgraph * gf = ggml_new_graph(ctx);
+            ggml_build_forward_expand(gf, Y);
+            const enum ggml_status st = ggml_backend_graph_compute(backend, gf);
+            RC_ASSERT(st == GGML_STATUS_SUCCESS);
+
+            float actual = 0;
+            ggml_backend_tensor_get(Y, &actual, 0, sizeof(float));
+
+            ggml_backend_buffer_free(buf);
+            ggml_free(ctx);
+            ggml_backend_free(backend);
+
+            const float abs_err = fabsf(ref_score - actual);
+            const float rel_err = abs_err / (fabsf(ref_score) + 1e-6f);
+            /* mul_mat_cpu.allium: pass if abs_err <= abs_tol OR
+             * rel_err <= rel_tol (0.1, 0.05). Mixed metric needed
+             * because rel_err is unstable when random q/k produce a
+             * near-zero dot; budget covers fp accumulation + the ~1%
+             * int8-codebook quantization the SIMD kernels use for
+             * VPSHUFB-based lookup. See spec for full rationale. */
+            RC_ASSERT(abs_err < 0.1f || rel_err < 0.05f);
+        });
+}
+
 int main(int argc, char ** argv) {
     (void)argc; (void)argv;
     printf("=== turbo-kv-4b PBT ===\n\n");
@@ -481,6 +582,7 @@ int main(int argc, char ** argv) {
     property_VectorDot_matches_dequant_dot();
     property_MultiBlockVectorDot_matches_dequant_dot();
     property_RHT_multi_block_consistency();
+    property_SIMDEquivalence_turbo_kv_4b();
 
     printf("\n=== All properties passed ===\n");
     return 0;
