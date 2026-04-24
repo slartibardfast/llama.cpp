@@ -473,6 +473,12 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
     if (self_kq_mask_pass_b) {
         mctx->set_input_kq_mask_pass_b(self_kq_mask_pass_b, ubatch, cparams.causal_attn);
     }
+    if (self_window_reorder) {
+        mctx->set_input_window_reorder(self_window_reorder, ubatch);
+    }
+    if (self_v_window_idxs) {
+        mctx->set_input_v_window_idxs(self_v_window_idxs, ubatch);
+    }
 
     if (self_k_rot) {
         mctx->set_input_k_rot(self_k_rot);
@@ -613,6 +619,12 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
     }
     if (inp_attn->self_kq_mask_pass_b) {
         mctx->get_attn()->set_input_kq_mask_pass_b(inp_attn->self_kq_mask_pass_b, ubatch, cparams.causal_attn);
+    }
+    if (inp_attn->self_window_reorder) {
+        mctx->get_attn()->set_input_window_reorder(inp_attn->self_window_reorder, ubatch);
+    }
+    if (inp_attn->self_v_window_idxs) {
+        mctx->get_attn()->set_input_v_window_idxs(inp_attn->self_v_window_idxs, ubatch);
     }
 
     if (inp_attn->self_k_rot) {
@@ -2101,40 +2113,51 @@ static ggml_tensor * build_fa_lse_merge(
 
 ggml_tensor * llm_graph_context::build_attn_mha_two_pass(
          ggml_tensor * q,
-         ggml_tensor * k,
-         ggml_tensor * v,
+         ggml_tensor * k_a,
+         ggml_tensor * v_a,
+         ggml_tensor * k_b,
+         ggml_tensor * v_b,
          ggml_tensor * kq_mask_a,
          ggml_tensor * kq_mask_b,
                float   kq_scale,
                  int   il) const {
     GGML_ASSERT(cparams.flash_attn && "two-pass read path requires flash_attn");
     GGML_ASSERT(kq_mask_a && kq_mask_b);
+    GGML_ASSERT(k_a && v_a && k_b && v_b);
 
-    const bool v_trans = v->nb[1] > v->nb[2];
-    const auto n_stream = k->ne[3];
+    const bool v_trans_a = v_a->nb[1] > v_a->nb[2];
+    const bool v_trans_b = v_b->nb[1] > v_b->nb[2];
+    const auto n_stream  = k_a->ne[3];
+    GGML_ASSERT(n_stream == k_b->ne[3]);
 
     q = ggml_view_4d(ctx0, q, q->ne[0], q->ne[1], q->ne[2]/n_stream, n_stream,
                      q->nb[1], q->nb[2], q->nb[3]/n_stream, 0);
 
     q = ggml_permute(ctx0, q, 0, 2, 1, 3);
-    k = ggml_permute(ctx0, k, 0, 2, 1, 3);
-    v = ggml_permute(ctx0, v, 0, 2, 1, 3);
 
-    if (v_trans) {
-        v = ggml_transpose(ctx0, v);
-    }
-    if (k->type == GGML_TYPE_F32) {
-        k = ggml_cast(ctx0, k, GGML_TYPE_F16);
-    }
-    if (v->type == GGML_TYPE_F32) {
-        v = ggml_cast(ctx0, v, GGML_TYPE_F16);
-    }
+    auto prep_kv = [&](ggml_tensor * k, ggml_tensor * v, bool vt) {
+        k = ggml_permute(ctx0, k, 0, 2, 1, 3);
+        v = ggml_permute(ctx0, v, 0, 2, 1, 3);
+        if (vt) {
+            v = ggml_transpose(ctx0, v);
+        }
+        if (k->type == GGML_TYPE_F32) {
+            k = ggml_cast(ctx0, k, GGML_TYPE_F16);
+        }
+        if (v->type == GGML_TYPE_F32) {
+            v = ggml_cast(ctx0, v, GGML_TYPE_F16);
+        }
+        return std::make_pair(k, v);
+    };
+
+    auto [kp_a, vp_a] = prep_kv(k_a, v_a, v_trans_a);
+    auto [kp_b, vp_b] = prep_kv(k_b, v_b, v_trans_b);
 
     const float max_bias = hparams.f_max_alibi_bias;
     const float logit_sc = hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f;
 
-    ggml_tensor * lse_a = ggml_flash_attn_ext_lse(ctx0, q, k, v, kq_mask_a, kq_scale, max_bias, logit_sc);
-    ggml_tensor * lse_b = ggml_flash_attn_ext_lse(ctx0, q, k, v, kq_mask_b, kq_scale, max_bias, logit_sc);
+    ggml_tensor * lse_a = ggml_flash_attn_ext_lse(ctx0, q, kp_a, vp_a, kq_mask_a, kq_scale, max_bias, logit_sc);
+    ggml_tensor * lse_b = ggml_flash_attn_ext_lse(ctx0, q, kp_b, vp_b, kq_mask_b, kq_scale, max_bias, logit_sc);
     ggml_flash_attn_ext_set_prec(lse_a, GGML_PREC_F32);
     ggml_flash_attn_ext_set_prec(lse_b, GGML_PREC_F32);
     // Name must start with LLAMA_TENSOR_NAME_FATTN "-" so the auto-FA
@@ -2246,19 +2269,35 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
         inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams);
         inp->self_kq_mask_cnv = cparams.flash_attn ? ggml_cast(ctx0, inp->self_kq_mask, GGML_TYPE_F16) : inp->self_kq_mask;
 
-        // Residual-window two-pass masks. Allocated whenever the cache
-        // has a residual window; consumed by build_attn only when it
-        // dispatches the two-pass read path. Same shape and cast rules
-        // as the base kq_mask.
+        // Residual-window two-pass masks + index inputs for the
+        // overlay-K read path. Allocated whenever the cache has a
+        // residual window; consumed by build_attn only when it
+        // dispatches the two-pass read path.
+        //   pass_a mask: same shape as base kq_mask ([n_kv, n_tps, 1,
+        //       n_stream]), Pass A reads the full main cache with
+        //       tail-masked positions.
+        //   pass_b mask: [rw, n_tps, 1, n_stream] — Pass B reads a
+        //       reordered rw-slice of the overlay (K) and the V cache.
+        //   window_reorder: [rw] I32, ring-slot per position-order entry.
+        //   v_window_idxs:  [rw] I32, V cache slot per position-order entry.
         if (mctx_cur->has_residual_window()) {
             inp->self_kq_mask_pass_a = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams);
             inp->self_kq_mask_pass_a_cnv = cparams.flash_attn
                 ? ggml_cast(ctx0, inp->self_kq_mask_pass_a, GGML_TYPE_F16)
                 : inp->self_kq_mask_pass_a;
-            inp->self_kq_mask_pass_b = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams);
+
+            const uint32_t rw        = mctx_cur->get_residual_window();
+            const uint32_t n_stream_ = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
+            inp->self_kq_mask_pass_b = ggml_new_tensor_4d(
+                    ctx0, GGML_TYPE_F32, rw, ubatch.n_tokens/n_stream_, 1, n_stream_);
+            ggml_set_input(inp->self_kq_mask_pass_b);
+            ggml_set_name(inp->self_kq_mask_pass_b, "attn_inp_kq_mask_window");
             inp->self_kq_mask_pass_b_cnv = cparams.flash_attn
                 ? ggml_cast(ctx0, inp->self_kq_mask_pass_b, GGML_TYPE_F16)
                 : inp->self_kq_mask_pass_b;
+
+            inp->self_window_reorder = mctx_cur->build_input_window_reorder(ctx0, ubatch);
+            inp->self_v_window_idxs  = mctx_cur->build_input_v_window_idxs (ctx0, ubatch);
         }
     }
 
@@ -2413,24 +2452,39 @@ ggml_tensor * llm_graph_context::build_attn(
         }
     }
 
-    // Residual-window two-pass read-path dispatch. In this iteration
-    // both passes still read from the main K/V cache — pass_a over the
-    // "old" range (positions older than residual_window) and pass_b over
-    // the "recent" range. The two masks partition the base kq_mask, so
-    // the merged result must equal a single-pass FA numerically. This
-    // proves out the dispatch/merge wiring before the follow-up commit
-    // swaps pass_b's K for the overlay.
+    // Residual-window two-pass read-path dispatch. Pass A over the main
+    // K/V cache with positions-older-than-rw mask; Pass B over the fp16
+    // overlay K + main V sliced to the recent-window positions, with a
+    // position-order mask. Requires the overlay-K / overlay-V views to
+    // materialise (nullptr when the cache has no overlay or this layer
+    // has no K slot); falls back to single-pass FA otherwise.
+    // Residual-window two-pass read-path dispatch gating. Requires:
+    //   - flash-attn enabled
+    //   - cache has an overlay
+    //   - per-ubatch window-order index tensors materialised
+    //   - no extra FA side-channels (kq_b / sinks / v_mla)
+    //   - post-RoPE K (self_k_pos == nullptr): the overlay stores
+    //     what cpy_k gets, which is pre-RoPE for turbo_kv_4b and
+    //     split-K caches. Supporting the overlay for those types
+    //     requires RoPE-on-the-fly for Pass B — deferred.
+    //   - non-split-K: same reason.
+    ggml_tensor * k_window = nullptr;
+    ggml_tensor * v_window = nullptr;
+    if (cparams.flash_attn && mctx_cur->has_residual_window() &&
+        inp->self_window_reorder && inp->self_v_window_idxs &&
+        kq_b == nullptr && sinks == nullptr && v_mla == nullptr &&
+        inp->self_k_pos == nullptr && !mctx_cur->is_split_k()) {
+        k_window = mctx_cur->get_k_window(ctx0, il, inp->self_window_reorder);
+        v_window = mctx_cur->get_v_window(ctx0, il, inp->self_v_window_idxs);
+    }
+
     const bool overlay_two_pass =
-        cparams.flash_attn &&
-        mctx_cur->has_residual_window() &&
+        k_window != nullptr && v_window != nullptr &&
         inp->self_kq_mask_pass_a_cnv != nullptr &&
-        inp->self_kq_mask_pass_b_cnv != nullptr &&
-        kq_b == nullptr &&
-        sinks == nullptr &&
-        v_mla == nullptr;
+        inp->self_kq_mask_pass_b_cnv != nullptr;
 
     ggml_tensor * cur = overlay_two_pass
-        ? build_attn_mha_two_pass(q, k, v,
+        ? build_attn_mha_two_pass(q, k, v, k_window, v_window,
               inp->self_kq_mask_pass_a_cnv,
               inp->self_kq_mask_pass_b_cnv,
               kq_scale, il)

@@ -188,6 +188,24 @@ public:
     // meaningful when has_residual_window(); returns nullptr otherwise.
     ggml_tensor * cpy_k_window(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_window_idxs, int32_t il, const slot_info & sinfo) const;
 
+    // Residual-window two-pass read-path K/V views for Pass B. See the
+    // equivalent llama_kv_cache_context methods for semantics. The
+    // window_reorder / v_window_idxs tensors are built by the graph
+    // builder at input-build time and populated at set_input time.
+    ggml_tensor * get_k_window(ggml_context * ctx, int32_t il,
+                               ggml_tensor * window_reorder,
+                               const slot_info & sinfo) const;
+    ggml_tensor * get_v_window(ggml_context * ctx, int32_t il, uint32_t n_kv,
+                               ggml_tensor * v_window_idxs,
+                               const slot_info & sinfo) const;
+
+    // Populate the per-ubatch index tensors for the overlay-K reorder
+    // and the main-V-cache slice. v_window_idxs takes sinfo because the
+    // current ubatch's just-written positions land at slots given by
+    // sinfo.idxs[stream][token].
+    void set_input_window_reorder(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+    void set_input_v_window_idxs (ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const;
+
     // whether the cache was constructed with residual_window > 0 (and
     // therefore has the per-layer k_window_fp16 tensors allocated)
     bool has_residual_window() const;
@@ -226,6 +244,11 @@ public:
     // I64 [n_tokens] tensor of fp16-window slot indices per token. Only
     // built when has_residual_window(); returns nullptr otherwise.
     ggml_tensor * build_input_k_window_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const;
+
+    // I32 [rw, n_stream] index tensors for the two-pass read path's
+    // Pass B. Allocated when has_residual_window(); nullptr otherwise.
+    ggml_tensor * build_input_window_reorder(ggml_context * ctx, const llama_ubatch & ubatch) const;
+    ggml_tensor * build_input_v_window_idxs (ggml_context * ctx, const llama_ubatch & ubatch) const;
 
     ggml_tensor * build_input_k_rot(ggml_context * ctx) const;
     ggml_tensor * build_input_v_rot(ggml_context * ctx) const;
@@ -465,6 +488,31 @@ public:
     // has_residual_window(); returns nullptr otherwise so the caller
     // can guard with a simple null-check.
     ggml_tensor * cpy_k_window(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_window_idxs, int32_t il) const;
+
+    // Residual-window two-pass read-path views for Pass B. Both return
+    // tensors shaped [DK|DV, n_head_kv, rw, n_stream] in POSITION ORDER
+    // (oldest-of-window first). Requires single-stream, sequentially-
+    // stored cache — caller must guard.
+    //
+    //   get_k_window: reorders the ring-buffer overlay slots into
+    //       position order via ggml_get_rows(overlay, window_reorder).
+    //   get_v_window: picks the last rw positions out of the main V
+    //       cache via ggml_get_rows(v, v_window_idxs).
+    //
+    // Returns nullptr when the cache has no overlay or this layer has
+    // no K slot (recurrent layer in a hybrid cache).
+    ggml_tensor * get_k_window(ggml_context * ctx, int32_t il,
+                               ggml_tensor * window_reorder) const;
+    ggml_tensor * get_v_window(ggml_context * ctx, int32_t il,
+                               ggml_tensor * v_window_idxs) const;
+
+    // Per-ubatch I32 index tensors of shape [rw, n_stream] driving
+    // get_k_window / get_v_window. See the llama_kv_cache method
+    // comments for semantics.
+    ggml_tensor * build_input_window_reorder(ggml_context * ctx, const llama_ubatch & ubatch) const;
+    ggml_tensor * build_input_v_window_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const;
+    void set_input_window_reorder(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+    void set_input_v_window_idxs (ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     // create destination indices for each head of the current batch for where it would be written in the KV cache
     // the indices address the global KV cache (not per stream) - this is not relevant for the user of this API, but

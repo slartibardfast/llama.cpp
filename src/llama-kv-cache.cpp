@@ -1465,6 +1465,192 @@ ggml_tensor * llama_kv_cache::cpy_k_window(ggml_context * ctx, ggml_tensor * k_c
     return ggml_set_rows(ctx, k_win_flat, k_cur, k_window_idxs);
 }
 
+ggml_tensor * llama_kv_cache::get_k_window(ggml_context * ctx, int32_t il,
+                                           ggml_tensor * window_reorder,
+                                           const slot_info & sinfo) const {
+    GGML_UNUSED(sinfo);
+    if (residual_window == 0 || window_reorder == nullptr) {
+        return nullptr;
+    }
+    const int32_t ikv = map_layer_ids.at(il);
+    ggml_tensor * k_win = layers[ikv].k_window_fp16;
+    if (!k_win) {
+        return nullptr;
+    }
+
+    const int64_t n_embd_k_gqa = k_win->ne[0];
+    const int64_t rw           = k_win->ne[1];
+    const int64_t n_stream     = k_win->ne[2];
+    GGML_ASSERT(n_stream == 1 && "two-pass overlay read path: n_stream > 1 not supported yet");
+
+    const int64_t n_embd_head_k = hparams.n_embd_head_k(il);
+    const int64_t n_head_kv     = hparams.n_head_kv(il);
+    GGML_ASSERT(n_embd_k_gqa == n_embd_head_k * n_head_kv);
+
+    // Pick rw rows in position order out of the ring-buffer overlay.
+    // Source shape for get_rows: [n_embd_k_gqa, rw, 1, 1]; indices
+    // are [rw, 1, 1, 1]; result [n_embd_k_gqa, rw, 1, 1].
+    //
+    // ggml_get_rows returns F32 regardless of source type; cast back
+    // to the overlay's native float type so Pass B's FA_LSE sees the
+    // same K dtype as Pass A (the main cache). Without this, Pass B
+    // runs FA with K=F32 while Pass A runs with K=F16 — the FA kernel
+    // dispatches via q_to_vec_dot keyed on K type and the F32 path
+    // has a multi-thread result divergence versus the F16 path.
+    ggml_tensor * k_src = ggml_reshape_4d(ctx, k_win, n_embd_k_gqa, rw, 1, 1);
+    ggml_tensor * k_lin = ggml_get_rows(ctx, k_src, window_reorder);
+    k_lin = ggml_cast(ctx, k_lin, k_win->type);
+
+    // Shape to the permute-ready layout [DK, n_head_kv, rw, n_stream]
+    // that build_attn_mha_two_pass's permute(0,2,1,3) converts to
+    // the FA-expected [DK, rw, n_head_kv, n_stream].
+    return ggml_reshape_4d(ctx, k_lin, n_embd_head_k, n_head_kv, rw, 1);
+}
+
+ggml_tensor * llama_kv_cache::get_v_window(ggml_context * ctx, int32_t il, uint32_t n_kv,
+                                           ggml_tensor * v_window_idxs,
+                                           const slot_info & sinfo) const {
+    GGML_UNUSED(sinfo);
+    GGML_UNUSED(n_kv);
+    if (residual_window == 0 || v_window_idxs == nullptr) {
+        return nullptr;
+    }
+    const int32_t ikv = map_layer_ids.at(il);
+    ggml_tensor * v = layers[ikv].v;
+    if (!v) {
+        return nullptr;
+    }
+
+    // This path is only safe for flash_attn (v_trans == false). Caller
+    // guards; assert here as a load-bearing contract check.
+    GGML_ASSERT(!v_trans && "two-pass overlay read path requires !v_trans");
+
+    const int64_t n_embd_v_gqa = v->ne[0];
+    const int64_t kv_size      = v->ne[1];
+    const int64_t n_stream     = v->ne[2];
+    GGML_ASSERT(n_stream == 1 && "two-pass overlay read path: n_stream > 1 not supported yet");
+
+    GGML_UNUSED(kv_size);
+
+    const int64_t n_embd_head_v = hparams.n_embd_head_v(il);
+    const int64_t n_head_kv     = hparams.n_head_kv(il);
+    GGML_ASSERT(n_embd_v_gqa >= n_embd_head_v * n_head_kv);
+
+    const int64_t rw = (int64_t) residual_window;
+
+    // V underlying tensor is already [n_embd_v_gqa, kv_size, n_stream];
+    // get_rows picks rw rows by slot index for the single stream.
+    ggml_tensor * v_lin = ggml_get_rows(ctx, v, v_window_idxs);
+
+    return ggml_reshape_4d(ctx, v_lin, n_embd_head_v, n_head_kv, rw, 1);
+}
+
+ggml_tensor * llama_kv_cache::build_input_window_reorder(ggml_context * ctx, const llama_ubatch & ubatch) const {
+    if (residual_window == 0 || n_stream != 1) {
+        // Multi-stream overlay read path not yet wired; caller falls
+        // back to single-pass FA via null checks in build_attn.
+        return nullptr;
+    }
+    GGML_UNUSED(ubatch);
+    ggml_tensor * t = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, residual_window);
+    ggml_set_input(t);
+    return t;
+}
+
+ggml_tensor * llama_kv_cache::build_input_v_window_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const {
+    if (residual_window == 0 || n_stream != 1) {
+        return nullptr;
+    }
+    GGML_UNUSED(ubatch);
+    ggml_tensor * t = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, residual_window);
+    ggml_set_input(t);
+    return t;
+}
+
+void llama_kv_cache::set_input_window_reorder(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+    if (dst->buffer == nullptr) {
+        return;
+    }
+    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+    GGML_ASSERT(residual_window > 0);
+    GGML_ASSERT(n_stream == 1);
+
+    const int32_t rw = (int32_t) residual_window;
+    // max_pos over the ubatch. For multi-token PP ubatches this defines
+    // the recent-window endpoint shared across all tokens in the ubatch
+    // (per-token visibility is handled by the Pass B mask).
+    llama_pos max_pos = 0;
+    for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+        if (ubatch->pos[i] > max_pos) {
+            max_pos = ubatch->pos[i];
+        }
+    }
+
+    int32_t * data = (int32_t *) dst->data;
+    for (int32_t s = 0; s < rw; ++s) {
+        // Position order: slot s represents (max_pos - rw + 1 + s).
+        // Ring-buffer slot for that position = ((max_pos - rw + 1 + s) % rw).
+        const int32_t pos_s      = max_pos - rw + 1 + s;
+        const int32_t ring_slot  = ((pos_s % rw) + rw) % rw; // positive modulo
+        data[s] = ring_slot;
+    }
+}
+
+void llama_kv_cache::set_input_v_window_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const {
+    if (dst->buffer == nullptr) {
+        return;
+    }
+    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+    GGML_ASSERT(residual_window > 0);
+    GGML_ASSERT(n_stream == 1);
+    GGML_ASSERT(!v_trans && "two-pass overlay read path requires !v_trans");
+
+    const int32_t rw = (int32_t) residual_window;
+    llama_pos max_pos = 0;
+    for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+        if (ubatch->pos[i] > max_pos) {
+            max_pos = ubatch->pos[i];
+        }
+    }
+
+    // Build a position->slot map for the recent window. Positions come
+    // from two sources:
+    //   1. The current ubatch's just-written slots (sinfo.idxs[0][i]
+    //      holds position ubatch->pos[i]).
+    //   2. The prior-state cache cells (v_cells[0].pos_get(j) holds
+    //      position j for slot j, when populated).
+    // The current ubatch's writes overwrite any prior cell state — so
+    // we prefer sinfo when a position falls in both (which is normal).
+    std::vector<int32_t> pos_to_slot(rw, 0); // default 0; mask handles invalid
+    std::vector<bool>    filled(rw, false);
+
+    const auto & cells = v_cells.at(seq_to_stream.at(ubatch->seq_id[0][0]));
+    const uint32_t cache_size = cells.size();
+    for (uint32_t j = 0; j < cache_size; ++j) {
+        if (cells.is_empty(j)) continue;
+        const llama_pos p = cells.pos_get(j);
+        if (p < max_pos - rw + 1 || p > max_pos) continue;
+        const int32_t s = (int32_t)(p - (max_pos - rw + 1));
+        pos_to_slot[s] = (int32_t) j;
+        filled[s]      = true;
+    }
+    // The current ubatch's writes may not yet be in v_cells at set_input
+    // time, but they're in sinfo.idxs[0]. Overwrite those entries.
+    GGML_ASSERT(sinfo.idxs.size() == 1);
+    for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+        const llama_pos p = ubatch->pos[i];
+        if (p < max_pos - rw + 1 || p > max_pos) continue;
+        const int32_t s = (int32_t)(p - (max_pos - rw + 1));
+        pos_to_slot[s] = (int32_t) sinfo.idxs[0][i];
+        filled[s]      = true;
+    }
+
+    int32_t * data = (int32_t *) dst->data;
+    for (int32_t s = 0; s < rw; ++s) {
+        data[s] = pos_to_slot[s]; // mask handles the !filled cases
+    }
+}
+
 ggml_tensor * llama_kv_cache::cpy_k_rope(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const {
     GGML_UNUSED(sinfo);
     GGML_ASSERT(is_split_k());
@@ -1969,18 +2155,23 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
     //LLAMA_LOG_ERROR("%s: kq mask time: %0.3f ms\n", __func__, (t_end - t_start)/1000.0);
 }
 
-// Partition the base kq_mask over stored-position vs query-position into
-// two halves for the residual-window two-pass read path. Cells visible in
-// the base mask (data == 0) flip to -INFINITY in one pass or the other
-// depending on whether p0 > p1 - residual_window (recent) or <= (old).
-// Cells masked in the base stay -INFINITY in both. No attempt to handle
-// SWA / ALiBi / 2D MRoPE here — those are asserted off in
-// turbo_kv_residual_window.allium's invariants and the callers only
-// activate this path when the overlay is live.
+// Partition the base kq_mask into two halves for the residual-window
+// two-pass read path. The partition is at SEQUENCE-wide max_pos (per
+// stream), not per-query position: cells with stored position
+// p0 > max_pos - residual_window go to Pass B (the overlay);
+// cells with p0 <= max_pos - residual_window go to Pass A. This
+// ensures every visible cell lands in exactly one of the two passes
+// regardless of the querying token's own position — otherwise tokens
+// near the start of a wide ubatch see their visible cells masked
+// in BOTH passes, producing NaN after the merge.
+// No attempt to handle SWA / ALiBi / 2D MRoPE here — the overlay
+// two-pass dispatch only fires when those are off.
 void llama_kv_cache::set_input_kq_mask_pass_a(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
+    if (dst->buffer == nullptr) {
+        return;
+    }
     GGML_ASSERT(residual_window > 0);
 
-    // First fill the dst with the base mask.
     set_input_kq_mask(dst, ubatch, causal_attn);
 
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
@@ -1993,20 +2184,29 @@ void llama_kv_cache::set_input_kq_mask_pass_a(ggml_tensor * dst, const llama_uba
     const int32_t rw = (int32_t) residual_window;
 
     for (int64_t s = 0; s < n_stream; ++s) {
+        // max_pos across this stream's ubatch tokens (the partition
+        // boundary is shared across all tokens in the stream).
+        llama_pos max_pos_stream = 0;
+        for (int64_t ii = 0; ii < n_tps; ++ii) {
+            const int64_t i = s * n_tps + ii;
+            if (ubatch->pos[i] > max_pos_stream) {
+                max_pos_stream = ubatch->pos[i];
+            }
+        }
+        const llama_pos boundary = max_pos_stream - rw;
+
         for (int64_t ii = 0; ii < n_tps; ++ii) {
             const int64_t i = s * n_tps + ii;
             const llama_seq_id seq_id = ubatch->seq_id[i][0];
             const auto & cells = v_cells.at(seq_to_stream[seq_id]);
-            const llama_pos p1 = ubatch->pos[i];
             const uint64_t idst = n_kv * i;
 
             for (int64_t j = 0; j < n_kv; ++j) {
                 if (data[idst + j] == -INFINITY) continue;
                 if (cells.is_empty(j))           continue;
                 const llama_pos p0 = cells.pos_get(j);
-                // Pass A sees old positions only. Mask out cells within the
-                // recent window.
-                if (p0 > p1 - rw) {
+                // Pass A sees cells older than the shared recent window.
+                if (p0 > boundary) {
                     data[idst + j] = -INFINITY;
                 }
             }
@@ -2014,36 +2214,45 @@ void llama_kv_cache::set_input_kq_mask_pass_a(ggml_tensor * dst, const llama_uba
     }
 }
 
+// Pass B mask — [rw, n_tps, 1, n_stream]. Slot s in Pass B's
+// reordered K/V corresponds to position (max_pos_stream - rw + 1 + s).
+// By construction these positions lie in (boundary, max_pos_stream],
+// so they are never in Pass A's range — visibility reduces to causal:
+//   visible iff 0 <= p_slot <= p_i
 void llama_kv_cache::set_input_kq_mask_pass_b(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
+    GGML_UNUSED(causal_attn);
+    if (dst->buffer == nullptr) {
+        return;
+    }
+    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
     GGML_ASSERT(residual_window > 0);
 
-    set_input_kq_mask(dst, ubatch, causal_attn);
+    const int64_t rw_dim       = dst->ne[0];
+    const int64_t n_tps        = dst->ne[1];
+    const int64_t n_stream_dim = dst->ne[3];
+    const int64_t rw           = (int64_t) residual_window;
+    GGML_ASSERT(rw_dim == rw);
+    GGML_ASSERT((int64_t) ubatch->n_tokens == n_tps * n_stream_dim);
 
-    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
     float * data = (float *) dst->data;
 
-    const int64_t n_kv     = dst->ne[0];
-    const int64_t n_stream = dst->ne[3];
-    const int64_t n_tps    = ubatch->n_tokens / n_stream;
-
-    const int32_t rw = (int32_t) residual_window;
-
-    for (int64_t s = 0; s < n_stream; ++s) {
+    for (int64_t s = 0; s < n_stream_dim; ++s) {
+        llama_pos max_pos_stream = 0;
         for (int64_t ii = 0; ii < n_tps; ++ii) {
             const int64_t i = s * n_tps + ii;
-            const llama_seq_id seq_id = ubatch->seq_id[i][0];
-            const auto & cells = v_cells.at(seq_to_stream[seq_id]);
-            const llama_pos p1 = ubatch->pos[i];
-            const uint64_t idst = n_kv * i;
+            if (ubatch->pos[i] > max_pos_stream) {
+                max_pos_stream = ubatch->pos[i];
+            }
+        }
 
-            for (int64_t j = 0; j < n_kv; ++j) {
-                if (data[idst + j] == -INFINITY) continue;
-                if (cells.is_empty(j))           continue;
-                const llama_pos p0 = cells.pos_get(j);
-                // Pass B sees recent positions only. Mask out old cells.
-                if (p0 <= p1 - rw) {
-                    data[idst + j] = -INFINITY;
-                }
+        for (int64_t ii = 0; ii < n_tps; ++ii) {
+            const int64_t i = s * n_tps + ii;
+            const llama_pos p_i = ubatch->pos[i];
+            const uint64_t row = s * n_tps * rw + ii * rw;
+            for (int64_t slot = 0; slot < rw; ++slot) {
+                const llama_pos p_slot = max_pos_stream - rw + 1 + slot;
+                const bool visible = p_slot >= 0 && p_slot <= p_i;
+                data[row + slot] = visible ? 0.0f : -INFINITY;
             }
         }
     }
@@ -2929,6 +3138,30 @@ ggml_tensor * llama_kv_cache_context::cpy_v(ggml_context * ctx, ggml_tensor * v_
 
 ggml_tensor * llama_kv_cache_context::cpy_k_window(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_window_idxs, int32_t il) const {
     return kv->cpy_k_window(ctx, k_cur, k_window_idxs, il, sinfos[i_cur]);
+}
+
+ggml_tensor * llama_kv_cache_context::get_k_window(ggml_context * ctx, int32_t il, ggml_tensor * window_reorder) const {
+    return kv->get_k_window(ctx, il, window_reorder, sinfos[i_cur]);
+}
+
+ggml_tensor * llama_kv_cache_context::get_v_window(ggml_context * ctx, int32_t il, ggml_tensor * v_window_idxs) const {
+    return kv->get_v_window(ctx, il, n_kv, v_window_idxs, sinfos[i_cur]);
+}
+
+ggml_tensor * llama_kv_cache_context::build_input_window_reorder(ggml_context * ctx, const llama_ubatch & ubatch) const {
+    return kv->build_input_window_reorder(ctx, ubatch);
+}
+
+ggml_tensor * llama_kv_cache_context::build_input_v_window_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const {
+    return kv->build_input_v_window_idxs(ctx, ubatch);
+}
+
+void llama_kv_cache_context::set_input_window_reorder(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+    kv->set_input_window_reorder(dst, ubatch);
+}
+
+void llama_kv_cache_context::set_input_v_window_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+    kv->set_input_v_window_idxs(dst, ubatch, sinfos[i_cur]);
 }
 
 bool llama_kv_cache_context::has_residual_window() const {

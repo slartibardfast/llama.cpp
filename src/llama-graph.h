@@ -317,10 +317,23 @@ public:
     ggml_tensor * self_kq_mask_cnv = nullptr; //     [n_kv, n_batch/n_stream, 1, n_stream]
 
     // Two-pass read-path masks, see comment on get_kq_mask_pass_*.
+    // Pass A mask shape matches self_kq_mask ([n_kv, n_tps, 1, n_stream]).
+    // Pass B mask shape is [rw, n_tps, 1, n_stream] — Pass B attends to
+    // the overlay's rw reordered positions, not the full n_kv cache.
     ggml_tensor * self_kq_mask_pass_a     = nullptr;
     ggml_tensor * self_kq_mask_pass_a_cnv = nullptr;
     ggml_tensor * self_kq_mask_pass_b     = nullptr;
     ggml_tensor * self_kq_mask_pass_b_cnv = nullptr;
+
+    // Residual-window ring-buffer reorder: I32 [rw]. Element s holds
+    // the overlay ring-buffer slot for the s-th-oldest position in the
+    // ubatch's recent window. Drives ggml_get_rows into the overlay.
+    ggml_tensor * self_window_reorder = nullptr;
+
+    // Main V cache slot per recent-window position: I32 [rw]. Element s
+    // holds the cache slot for the same s-th-oldest position. Drives
+    // ggml_get_rows into the V cache for Pass B.
+    ggml_tensor * self_v_window_idxs = nullptr;
 
     // note: assumes v_rot^2 == I
     ggml_tensor * self_k_rot = nullptr;
@@ -911,19 +924,21 @@ struct llm_graph_context {
             ggml_tensor * kq_pre = nullptr) const; // pre-computed Q@K^T scores (split attention)
 
     // Two-pass flash-attention with online-softmax merge. Runs
-    // ggml_flash_attn_ext_lse twice — once with kq_mask_a, once with
-    // kq_mask_b — over the same q/k/v, then combines the outputs so the
-    // result equals a single ggml_flash_attn_ext over (kq_mask_a |
-    // kq_mask_b). Used by the residual-window read path:
-    //   pass_a covers "old" positions (main cache attendees further back
-    //   than residual_window), pass_b covers the recent overlay range.
-    // In this iteration pass_b reads the same main K/V as pass_a; the
-    // overlay-K swap lands in a follow-up commit. Requires flash-attn
-    // enabled; asserts on anything else.
+    // ggml_flash_attn_ext_lse twice — Pass A over (k_a, v_a, kq_mask_a)
+    // and Pass B over (k_b, v_b, kq_mask_b) — then combines via the
+    // online-softmax identity. Used by the residual-window read path:
+    //   Pass A: main cache K/V, mask restricted to positions outside
+    //           the recent residual_window.
+    //   Pass B: overlay K (reordered into position order) and main V
+    //           cache (sliced to the same positions), mask covers the
+    //           recent rw positions per query.
+    // Requires flash-attn enabled.
     ggml_tensor * build_attn_mha_two_pass(
             ggml_tensor * q,
-            ggml_tensor * k,
-            ggml_tensor * v,
+            ggml_tensor * k_a,
+            ggml_tensor * v_a,
+            ggml_tensor * k_b,
+            ggml_tensor * v_b,
             ggml_tensor * kq_mask_a,
             ggml_tensor * kq_mask_b,
                   float   kq_scale,
