@@ -89,10 +89,12 @@ llama_kv_cache::llama_kv_cache(
                  uint32_t   n_pad,
                  uint32_t   n_swa,
            llama_swa_type   swa_type,
+                 uint32_t   residual_window,
     const layer_filter_cb & filter,
     const  layer_reuse_cb & reuse) :
     model(model), hparams(model.hparams), v_trans(v_trans), type_k_static_(type_k_static),
-    n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type) {
+    n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa),
+    residual_window(residual_window), swa_type(swa_type) {
 
     // Block-quantized V types can't use the transposed layout: the scatter-write
     // reshapes to [1, N] (violates blck_size alignment), and the transposed read
@@ -122,8 +124,14 @@ llama_kv_cache::llama_kv_cache(
         auto it = ctx_map.find(buft);
         if (it == ctx_map.end()) {
             ggml_init_params params = {
-                // extra factor for split K: k_rope + k_static tensors per layer
-                /*.mem_size   =*/ size_t((type_k_static != GGML_TYPE_COUNT ? 4u : 2u)*(1 + n_stream)*n_layer_kv*ggml_tensor_overhead()),
+                // extra factor for split K: k_rope + k_static tensors per layer.
+                // +1 slot per layer when residual_window > 0 for the fp16
+                // rolling-tail buffer (no per-stream views — the tensor is
+                // already 3D over [n_embd_k_gqa, residual_window, n_stream]).
+                /*.mem_size   =*/ size_t(
+                    ((type_k_static != GGML_TYPE_COUNT ? 4u : 2u)*(1 + n_stream)
+                     + (residual_window > 0 ? 1u : 0u))
+                    * n_layer_kv*ggml_tensor_overhead()),
                 /*.mem_buffer =*/ NULL,
                 /*.no_alloc   =*/ true,
             };
@@ -261,6 +269,16 @@ llama_kv_cache::llama_kv_cache(
         ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, type_v, n_embd_v_gqa, kv_size, n_stream) : nullptr;
         has_v && ggml_format_name(v, "cache_v_l%d", il);
 
+        // fp16 rolling-tail buffer for TURBO_KV residual-window caches.
+        // Allocated only when the cache was constructed with
+        // residual_window > 0 AND the layer has a K cache slot. Type is
+        // always F16 — the window stores pre-quantisation data by design.
+        ggml_tensor * k_window_fp16_t = nullptr;
+        if (residual_window > 0 && has_k) {
+            k_window_fp16_t = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, n_embd_k_gqa, residual_window, n_stream);
+            ggml_format_name(k_window_fp16_t, "cache_k_window_fp16_l%d", il);
+        }
+
         std::vector<ggml_tensor *> k_stream;
         std::vector<ggml_tensor *> v_stream;
 
@@ -276,7 +294,7 @@ llama_kv_cache::llama_kv_cache(
 
         map_layer_ids[il] = layers.size();
 
-        layers.push_back({ il, k, v, k_rope_t, k_static_t, k_stream, v_stream, });
+        layers.push_back({ il, k, v, k_rope_t, k_static_t, k_window_fp16_t, k_stream, v_stream, });
     }
 
     if (reuse) {

@@ -106,6 +106,7 @@ public:
                      uint32_t   n_pad,
                      uint32_t   n_swa,
                llama_swa_type   swa_type,
+                     uint32_t   residual_window, // fp16 rolling-tail size for TURBO_KV caches (0 = disabled)
         const layer_filter_cb & filter,
         const  layer_reuse_cb & reuse);
 
@@ -239,6 +240,14 @@ private:
         ggml_tensor * k_rope   = nullptr; // [n_rot * n_head_kv, kv_size, n_stream]
         ggml_tensor * k_static = nullptr; // [(head_dim - n_rot) * n_head_kv, kv_size, n_stream]
 
+        // fp16 rolling-tail buffer for TURBO_KV residual-window caches.
+        // Shape: [n_embd_k_gqa, residual_window, n_stream]. Nullptr when
+        // residual_window == 0 on the owning cache. Allocated as GGML_TYPE_F16
+        // regardless of the K type — quantisation only applies to positions
+        // that have been evicted from this buffer. See
+        // turbo_kv_residual_window.allium for semantics.
+        ggml_tensor * k_window_fp16 = nullptr;
+
         std::vector<ggml_tensor *> k_stream;
         std::vector<ggml_tensor *> v_stream;
     };
@@ -256,6 +265,11 @@ private:
 
     // SWA
     const uint32_t n_swa = 0;
+
+    // residual window: when > 0, the last N positions per stream are kept in
+    // fp16 in k_window_fp16 buffers rather than being quantised into k/k_rope.
+    // Only meaningful for TURBO_KV_* K types; ignored by fp16/fp32 K caches.
+    const uint32_t residual_window = 0;
 
     // env: LLAMA_ATTN_ROT_DISABLE
     bool attn_rot_k = false;
