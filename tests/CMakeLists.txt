@@ -309,6 +309,21 @@ target_include_directories(test-turbo-kv-backend-pbt PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../../rapidcheck/include
     ${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src)
 
+# TurboQuant attention PBT: propagated from turbo_kv_4b_attention.allium.
+# Compares GGML_OP_FLASH_ATTN_EXT output between the CPU scalar
+# reference and each registered non-CPU backend at the multi-block
+# head_dim=256 configuration used by Qwen3.5 9B / 35B-A3B. Diagnoses
+# the 9B PPL regression — if this passes within spec tolerance, the
+# regression is algorithmic (codebook granularity at multi-block
+# heads); if it fails, there's a latent GPU FA bug analogous to the
+# CPY / GET_ROWS multi-block bugs fixed earlier.
+add_executable(test-turbo-kv-attention-pbt test-turbo-kv-attention-pbt.cpp)
+target_link_libraries(test-turbo-kv-attention-pbt PRIVATE ggml-base ggml
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../rapidcheck/build/librapidcheck.a)
+target_include_directories(test-turbo-kv-attention-pbt PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../rapidcheck/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src)
+
 # Micro-benchmark for PHASE25 step 3 profiling — isolates
 # turbo_kv_4b_avx2_single_block_dot in a tight loop so `perf record`
 # attribution lands on the kernel's hot instructions, not harness noise.
