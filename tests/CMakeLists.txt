@@ -290,6 +290,18 @@ target_link_libraries(test-turbo-kv-pbt PRIVATE ggml-base ggml-cpu
 target_include_directories(test-turbo-kv-pbt PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../../rapidcheck/include)
 
+# Micro-benchmark for PHASE25 step 3 profiling — isolates
+# turbo_kv_4b_avx2_single_block_dot in a tight loop so `perf record`
+# attribution lands on the kernel's hot instructions, not harness noise.
+# Needs -march=native explicitly because it pulls in the AVX2 kernel
+# header directly (bypasses the ggml-cpu trait dispatch that already
+# guards on __AVX2__).
+add_executable(bench-turbo-kv-4b-avx2 bench-turbo-kv-4b-avx2.cpp)
+target_link_libraries(bench-turbo-kv-4b-avx2 PRIVATE ggml-base)
+target_include_directories(bench-turbo-kv-4b-avx2 PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src)
+target_compile_options(bench-turbo-kv-4b-avx2 PRIVATE -march=native)
+
 add_executable(test-split-k-attention test-split-k-attention.cpp)
 
 add_executable(test-split-k-graph test-split-k-graph.cpp)
