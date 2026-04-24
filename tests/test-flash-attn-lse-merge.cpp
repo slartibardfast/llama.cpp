@@ -448,6 +448,11 @@ int main(int argc, char ** argv) {
         { "qwen_head_decode",   128, 128, 7, 1, 256,  128, 1.0f/11.31f, true  },
         { "qwen_head_pp4",      128, 128, 7, 4, 256,  128, 1.0f/11.31f, true  },
         { "long_ctx_split",     128, 128, 4, 1, 512,  384, 1.0f/11.31f, true  },
+        // PP-scale case matching llama-perplexity workload (batch=512,
+        // Qwen3.5 0.8B shape). Exercises the path that shows a
+        // multi-thread regression at rw=128 in the residual-window
+        // two-pass FA dispatch.
+        { "qwen_pp512_rw128",   128, 128,16, 512, 512, 384, 1.0f/11.31f, true  },
     };
     const int n = sizeof(cases) / sizeof(cases[0]);
 

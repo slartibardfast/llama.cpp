@@ -1447,16 +1447,50 @@ ggml_tensor * llama_kv_cache::cpy_k_window(ggml_context * ctx, ggml_tensor * k_c
     const int64_t n_tokens    = k_cur->ne[2];
 
     const int64_t n_embd_gqa = n_embd_head*n_head;
+    const int64_t n_stream   = k_win->ne[2];
 
     GGML_ASSERT(ggml_row_size(k_cur->type, n_embd_head) == k_cur->nb[1]);
 
+    // When n_tokens_per_stream > residual_window, multiple source tokens
+    // map to the same overlay slot (collision via pos % rw). Single-thread
+    // set_rows resolves this by writing rows in order so the last write
+    // wins (newest position), but multi-thread set_rows partitions the
+    // source rows across threads and the write order becomes undefined —
+    // a write-write race that produces non-deterministic overlay state.
+    //
+    // Slice k_cur and k_window_idxs down to the LAST `rw` rows per stream
+    // so every surviving source row maps to a unique slot. Earlier rows
+    // would have been overwritten by these anyway.
+    const int64_t n_tps = n_tokens / std::max<int64_t>(n_stream, 1);
+    if (n_tps > (int64_t) residual_window) {
+        const int64_t survivors = (int64_t) residual_window;
+        const int64_t skip      = n_tps - survivors;
+
+        if (n_stream == 1) {
+            // simple 1D slice over the n_tokens dim
+            k_cur = ggml_view_3d(ctx, k_cur,
+                    n_embd_head, n_head, survivors,
+                    k_cur->nb[1], k_cur->nb[2],
+                    skip * k_cur->nb[2]);
+            k_window_idxs = ggml_view_1d(ctx, k_window_idxs,
+                    survivors,
+                    skip * k_window_idxs->nb[0]);
+        } else {
+            // Per-stream slice would require a non-contiguous gather over
+            // the token dim (each stream's last `rw` tokens). Defer to
+            // the n_stream==1 path until a multi-stream consumer exists;
+            // the read path (get_k_window) also asserts n_stream==1.
+            GGML_ASSERT(false && "cpy_k_window: n_tps > rw with n_stream > 1 not implemented");
+        }
+    }
+
     // merge [head_dim, n_head, n_tokens] -> [n_embd_gqa, n_tokens].
-    k_cur = ggml_view_2d(ctx, k_cur, n_embd_gqa, n_tokens, k_cur->nb[2], 0);
+    const int64_t n_rows = (n_tps > (int64_t) residual_window) ? (int64_t) residual_window : n_tokens;
+    k_cur = ggml_view_2d(ctx, k_cur, n_embd_gqa, n_rows, k_cur->nb[2], 0);
 
     // flatten k_window [n_embd_gqa, residual_window, n_stream] ->
     // [n_embd_gqa, residual_window * n_stream] so global indices from
     // k_window_idxs address directly into it.
-    const int64_t n_stream = k_win->ne[2];
     ggml_tensor * k_win_flat = k_win;
     if (n_stream > 1) {
         k_win_flat = ggml_reshape_2d(ctx, k_win, n_embd_gqa, residual_window * n_stream);
