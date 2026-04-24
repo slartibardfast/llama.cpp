@@ -302,6 +302,15 @@ target_include_directories(bench-turbo-kv-4b-avx2 PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src)
 target_compile_options(bench-turbo-kv-4b-avx2 PRIVATE -march=native)
 
+# Sibling micro-bench for the quantize path (PHASE25 step 3 follow-up).
+# Hammers quantize_row_turbo_kv_4b_ref which is the exported API that
+# runs per-token-per-layer during prefill AND decode KV writes.
+# No arch-specific header here — quantize_row_turbo_kv_4b_ref is
+# ggml-base's exported symbol; the SSE4.1 walsh_hadamard_sse inside
+# it is already guarded on __SSE4_1__.
+add_executable(bench-turbo-kv-quantize bench-turbo-kv-quantize.cpp)
+target_link_libraries(bench-turbo-kv-quantize PRIVATE ggml-base)
+
 add_executable(test-split-k-attention test-split-k-attention.cpp)
 
 add_executable(test-split-k-graph test-split-k-graph.cpp)
