@@ -236,9 +236,25 @@ uint16_t turbo_kv_fp32_to_fp16(float f) {
 }
 
 /* ============================================================
- * Quantize one block (128 elements -> 72 bytes)
+ * Quantize one block: steps 1-4 (L2 norm, normalize, RHT, inv_std)
+ *
+ * Exposed so ggml-cpu's AVX2 quantize can share the same prep pass
+ * as the scalar reference. The scalar `quantize_block_turbo_kv_4b`
+ * below calls this + the scalar Step 5; the AVX2 variant in ggml-cpu
+ * calls this + `turbo_kv_4b_avx2_nearest_centroid_block`. Keeping
+ * the shared prep in one place means future pipeline changes (new
+ * seed, different norm clamp, etc.) don't need to be mirrored.
+ *
+ * Writes:
+ *   block->norm, block->inv_std_fp16, block->residual_norm, block->_pad
+ *   rotated_out[0..TURBO_KV_BLOCK_SIZE-1] (filled; slack zero-padded)
+ * Returns inv_std as fp32 (so the caller's Step 5 can use the full-
+ * precision value, not the fp16 round-trip that would lose a ULP
+ * and potentially flip argmin at tie boundaries).
  * ============================================================ */
-static void quantize_block_turbo_kv_4b(const float * src, block_turbo_kv_4b * block, int dim) {
+float turbo_kv_4b_prepare_block(
+    const float * src, int dim, block_turbo_kv_4b * block, float * rotated_out)
+{
     if (dim > TURBO_KV_BLOCK_SIZE) dim = TURBO_KV_BLOCK_SIZE;
 
     /* Step 1: L2 norm */
@@ -251,28 +267,40 @@ static void quantize_block_turbo_kv_4b(const float * src, block_turbo_kv_4b * bl
     block->residual_norm = 0;
     block->_pad = 0;
 
-    /* Step 2: normalize to unit vector */
-    float rotated[TURBO_KV_BLOCK_SIZE];
+    /* Step 2: normalize to unit vector (slack zero-padded) */
     const float inv_norm = (norm > 1e-10f) ? (1.0f / norm) : 0.0f;
     for (int i = 0; i < dim; i++) {
-        rotated[i] = src[i] * inv_norm;
+        rotated_out[i] = src[i] * inv_norm;
     }
     for (int i = dim; i < TURBO_KV_BLOCK_SIZE; i++) {
-        rotated[i] = 0.0f;
+        rotated_out[i] = 0.0f;
     }
 
     /* Step 3: RHT (in-place) */
-    turbo_kv_rht_forward(rotated, dim, TURBO_KV_DEFAULT_SEED);
+    turbo_kv_rht_forward(rotated_out, dim, TURBO_KV_DEFAULT_SEED);
 
     /* Step 4: compute max_abs and per-block inv_std */
     float max_abs = 0.0f;
     for (int i = 0; i < dim; i++) {
-        const float a = fabsf(rotated[i]);
+        const float a = fabsf(rotated_out[i]);
         if (a > max_abs) max_abs = a;
     }
     if (max_abs < 1e-10f) max_abs = 1.0f;
     const float inv_std = TURBO_KV_4B_CENT_MAX / max_abs;
     block->inv_std_fp16 = turbo_kv_fp32_to_fp16(inv_std);
+
+    return inv_std;
+}
+
+/* ============================================================
+ * Quantize one block (128 elements -> 72 bytes), scalar Step 5.
+ * Shares Steps 1-4 with the AVX2 variant via turbo_kv_4b_prepare_block.
+ * ============================================================ */
+static void quantize_block_turbo_kv_4b(const float * src, block_turbo_kv_4b * block, int dim) {
+    if (dim > TURBO_KV_BLOCK_SIZE) dim = TURBO_KV_BLOCK_SIZE;
+
+    float rotated[TURBO_KV_BLOCK_SIZE];
+    const float inv_std = turbo_kv_4b_prepare_block(src, dim, block, rotated);
 
     /* Step 5: per-element nearest-centroid lookup after scaling by inv_std */
     memset(block->mse_indices, 0, TURBO_KV_BLOCK_SIZE / 2);

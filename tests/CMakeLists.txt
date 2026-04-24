@@ -313,7 +313,7 @@ target_compile_options(bench-turbo-kv-4b-avx2 PRIVATE -march=native)
 # ggml-base's exported symbol; the SSE4.1 walsh_hadamard_sse inside
 # it is already guarded on __SSE4_1__.
 add_executable(bench-turbo-kv-quantize bench-turbo-kv-quantize.cpp)
-target_link_libraries(bench-turbo-kv-quantize PRIVATE ggml-base)
+target_link_libraries(bench-turbo-kv-quantize PRIVATE ggml-base ggml-cpu)
 
 # AVX2 argmin head-to-head: same (rotated, inv_std) pool, scalar vs
 # AVX2 Step-5 only, reports ns/call and speedup. PHASE25 step 3

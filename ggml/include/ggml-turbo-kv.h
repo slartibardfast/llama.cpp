@@ -117,6 +117,21 @@ void turbo_kv_rht_inverse(float * data, int n, uint32_t seed);
 void quantize_row_turbo_kv_4b_ref(const float * x, block_turbo_kv_4b * y, int64_t k);
 void dequantize_row_turbo_kv_4b  (const block_turbo_kv_4b * x, float * y, int64_t k);
 
+/* Prepare one block: run steps 1-4 of the quantize pipeline
+ * (L2 norm, normalize, RHT, max_abs → inv_std). Writes block->norm,
+ * block->inv_std_fp16, block->residual_norm, block->_pad; fills
+ * rotated_out[0..TURBO_KV_BLOCK_SIZE-1] with the rotated values
+ * (zero-padded where dim < block size). Returns inv_std as fp32
+ * for the caller's Step 5; don't round-trip through fp16 before
+ * argmin or tie-break can flip.
+ *
+ * Exposed so ggml-cpu's AVX2 argmin variant can share this prep
+ * with the scalar ggml-base reference. The scalar
+ * quantize_row_turbo_kv_4b_ref uses this helper internally.
+ */
+float turbo_kv_4b_prepare_block(
+    const float * src, int dim, block_turbo_kv_4b * block, float * rotated_out);
+
 /* ============================================================
  * Vector dot product: <f32 query, quantized key>
  *

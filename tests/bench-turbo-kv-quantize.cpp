@@ -23,6 +23,7 @@
  */
 
 #include "ggml-turbo-kv.h"
+#include "ggml-cpu.h"
 
 #include <chrono>
 #include <cstdio>
@@ -61,32 +62,46 @@ int main() {
      * 72-byte store. Cache-local. */
     block_turbo_kv_4b dst;
 
-    /* Warm the cache + any lazy init. */
-    quantize_row_turbo_kv_4b_ref(src_pool.data(), &dst, HEAD_DIM);
+    /* The production AVX2-aware quantize is a static function in
+     * ggml-cpu.c; reach it via the type_traits_cpu dispatch table
+     * which is what ggml's mul_mat / cpy / set_rows paths use too. */
+    const struct ggml_type_traits_cpu * tt =
+        ggml_get_type_traits_cpu(GGML_TYPE_TURBO_KV_4B);
+    if (tt == NULL || tt->from_float == NULL) {
+        fprintf(stderr, "failed to get type_traits_cpu for TURBO_KV_4B\n");
+        return 1;
+    }
 
-    const auto t0 = std::chrono::steady_clock::now();
+    /* Warm the cache + any lazy init on both paths. */
+    quantize_row_turbo_kv_4b_ref(src_pool.data(), &dst, HEAD_DIM);
+    tt->from_float(src_pool.data(), &dst, HEAD_DIM);
+
+    /* Scalar path (ggml-base reference). */
+    const auto s0 = std::chrono::steady_clock::now();
     for (int i = 0; i < TOTAL_CALLS; i++) {
         const int r = i & (N_ROWS - 1);
         quantize_row_turbo_kv_4b_ref(
             src_pool.data() + r * HEAD_DIM, &dst, HEAD_DIM);
     }
-    const auto t1 = std::chrono::steady_clock::now();
+    const auto s1 = std::chrono::steady_clock::now();
+    volatile uint8_t sink_s = dst.mse_indices[0];
 
-    /* Anti-dead-code: read one byte from dst so the compiler can't
-     * assume the output is unused. */
-    volatile uint8_t sink = dst.mse_indices[0];
-    (void) sink;
+    /* AVX2-aware path (ggml-cpu type trait, what production uses). */
+    const auto a0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < TOTAL_CALLS; i++) {
+        const int r = i & (N_ROWS - 1);
+        tt->from_float(src_pool.data() + r * HEAD_DIM, &dst, HEAD_DIM);
+    }
+    const auto a1 = std::chrono::steady_clock::now();
+    volatile uint8_t sink_a = dst.mse_indices[0];
+    (void) sink_s; (void) sink_a;
 
-    const double ns = std::chrono::duration<double, std::nano>(t1 - t0).count();
-    const double ns_per_call = ns / TOTAL_CALLS;
-    const double calls_per_sec = 1e9 / ns_per_call;
+    const double scalar_ns = std::chrono::duration<double, std::nano>(s1 - s0).count() / TOTAL_CALLS;
+    const double avx2_ns   = std::chrono::duration<double, std::nano>(a1 - a0).count() / TOTAL_CALLS;
 
-    fprintf(stderr, "quantize_row_turbo_kv_4b_ref (one block, %d elems):\n", HEAD_DIM);
-    fprintf(stderr, "  total calls     : %d\n", TOTAL_CALLS);
-    fprintf(stderr, "  working rows    : %d (~%zu bytes)\n",
-            N_ROWS, N_ROWS * HEAD_DIM * sizeof(float));
-    fprintf(stderr, "  elapsed         : %.3f ms\n", ns / 1e6);
-    fprintf(stderr, "  ns per call     : %.2f\n", ns_per_call);
-    fprintf(stderr, "  calls per sec   : %.2e\n", calls_per_sec);
+    fprintf(stderr, "quantize one block (%d elems, full pipeline — steps 1-5):\n", HEAD_DIM);
+    fprintf(stderr, "  scalar (ggml-base _ref)       : %7.2f ns/call\n", scalar_ns);
+    fprintf(stderr, "  AVX2   (ggml-cpu production)  : %7.2f ns/call\n", avx2_ns);
+    fprintf(stderr, "  end-to-end speedup            : %.2fx\n", scalar_ns / avx2_ns);
     return 0;
 }

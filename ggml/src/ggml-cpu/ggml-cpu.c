@@ -253,6 +253,42 @@ static void ggml_vec_dot_tq_kv_1b_f32(int n, float * GGML_RESTRICT s, size_t bs,
 #include "arch/x86/turbo_kv_4b_sse.h"
 #endif
 
+/* AVX2-aware quantize: shares Steps 1-4 with ggml-base's scalar
+ * reference via turbo_kv_4b_prepare_block, then runs the vectorized
+ * nearest-centroid argmin for Step 5. Registered as
+ * type_traits_cpu[TURBO_KV_4B].from_float so ggml's mul_mat / cpy /
+ * set_rows paths that call .from_float pick it up on AVX2 hosts.
+ *
+ * Falls back to the scalar quantize_row_turbo_kv_4b_ref entirely
+ * on non-AVX2 hosts. Output bytes are bit-exact with the scalar
+ * reference on all hosts (contract: nearest_centroid.allium
+ * config.argmin_index_rel_tol = 0.0; verified by
+ * property_AVX2_NearestCentroidAssignment_matches_reference). */
+static void quantize_row_turbo_kv_4b(const float * GGML_RESTRICT x,
+                                       void * GGML_RESTRICT y,
+                                       int64_t k)
+{
+#if defined(GGML_TURBO_KV_4B_HAVE_AVX2)
+    GGML_ASSERT(k % TURBO_KV_BLOCK_SIZE == 0);
+    const int64_t nb = k / TURBO_KV_BLOCK_SIZE;
+    block_turbo_kv_4b * blocks = (block_turbo_kv_4b *) y;
+
+    float rotated[TURBO_KV_BLOCK_SIZE];
+    for (int64_t b = 0; b < nb; b++) {
+        const float inv_std = turbo_kv_4b_prepare_block(
+            x + b * TURBO_KV_BLOCK_SIZE,
+            TURBO_KV_BLOCK_SIZE,
+            &blocks[b],
+            rotated);
+        turbo_kv_4b_avx2_nearest_centroid_block(
+            rotated, inv_std, blocks[b].mse_indices);
+    }
+#else
+    /* No AVX2 in this build — defer to the ggml-base scalar. */
+    quantize_row_turbo_kv_4b_ref(x, (block_turbo_kv_4b *) y, k);
+#endif
+}
+
 static void ggml_vec_dot_turbo_kv_4b_f32_cpu(
     int n, float * GGML_RESTRICT s, size_t bs,
     const void * GGML_RESTRICT vx, size_t bx,
@@ -404,8 +440,14 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
          * (-fa off). The cpu wrapper dispatches to the SSSE3 pshufb kernel
          * on Westmere+ and to the scalar ggml-base reference elsewhere.
          *
-         * turbo_kv_4b_attention_multi handles Q rotation internally. */
-        .from_float               = (ggml_from_float_t) quantize_row_turbo_kv_4b_ref,
+         * turbo_kv_4b_attention_multi handles Q rotation internally.
+         *
+         * .from_float uses the AVX2-aware quantize_row_turbo_kv_4b on
+         * hosts where AVX2 is compiled in (falls back to the scalar
+         * ref otherwise). 11.1x speedup on Zen 2 for the Step 5
+         * argmin alone; bit-exact with the scalar ref by design of
+         * nearest_centroid.allium's zero-tolerance contract. */
+        .from_float               = (ggml_from_float_t) quantize_row_turbo_kv_4b,
         .vec_dot                  = ggml_vec_dot_turbo_kv_4b_f32_cpu,
         .vec_dot_type             = GGML_TYPE_F32,
         .nrows                    = 1,
