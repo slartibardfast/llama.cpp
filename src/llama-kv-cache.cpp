@@ -1546,6 +1546,40 @@ uint32_t llama_kv_cache::get_residual_window() const {
     return residual_window;
 }
 
+size_t llama_kv_cache::get_k_window_slot_nbytes(int32_t il) const {
+    if (residual_window == 0) return 0;
+    auto it = map_layer_ids.find(il);
+    if (it == map_layer_ids.end()) return 0;
+    ggml_tensor * k_win = layers[it->second].k_window_fp16;
+    if (!k_win) return 0;
+    return ggml_row_size(k_win->type, k_win->ne[0]); // bytes per slot (n_embd_k_gqa elements)
+}
+
+size_t llama_kv_cache::peek_k_window_slot(int32_t il, int32_t stream, int32_t slot,
+                                          void * dst, size_t dst_size) const {
+    if (residual_window == 0 || dst == nullptr || dst_size == 0) return 0;
+    if (stream < 0 || slot < 0 || slot >= (int32_t) residual_window) return 0;
+
+    auto it = map_layer_ids.find(il);
+    if (it == map_layer_ids.end()) return 0;
+    ggml_tensor * k_win = layers[it->second].k_window_fp16;
+    if (!k_win) return 0;
+
+    const int64_t n_embd_k_gqa = k_win->ne[0];
+    const int64_t rw           = k_win->ne[1];
+    const int64_t n_stream     = k_win->ne[2];
+    if (stream >= (int32_t) n_stream) return 0;
+    if (slot   >= (int32_t) rw)       return 0;
+
+    const size_t row_bytes = ggml_row_size(k_win->type, n_embd_k_gqa);
+    const size_t offset    = ((size_t) stream * rw + (size_t) slot) * row_bytes;
+
+    // Pull via the backend buffer API so this works regardless of backend (CPU, GPU, etc.).
+    const size_t n_copy = row_bytes < dst_size ? row_bytes : dst_size;
+    ggml_backend_tensor_get(k_win, dst, offset, n_copy);
+    return n_copy;
+}
+
 ggml_tensor * llama_kv_cache::build_input_v_idxs(ggml_context * ctx, const llama_ubatch & ubatch) const {
     const uint32_t n_tokens = ubatch.n_tokens;
 

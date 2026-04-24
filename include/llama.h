@@ -801,6 +801,27 @@ extern "C" {
     // Check if the memory supports shifting
     LLAMA_API bool llama_memory_can_shift(llama_memory_t mem);
 
+    // Test-facing: peek one slot of the residual-window overlay buffer.
+    //   il      — layer index
+    //   stream  — stream index (0 for unified, < n_seq_max otherwise)
+    //   slot    — slot index in [0, residual_window)
+    //   dst/dst_size — caller-provided buffer, at least `get_slot_nbytes`
+    // Returns number of bytes copied. Returns 0 when the memory has no
+    // overlay, the layer has no K cache slot, or the indices are out of
+    // range — callers can iterate safely without error handling.
+    LLAMA_API size_t llama_memory_residual_window_peek(
+            llama_memory_t mem,
+                   int32_t il,
+                   int32_t stream,
+                   int32_t slot,
+                      void * dst,
+                    size_t   dst_size);
+
+    // Byte size of one overlay slot row for layer `il` (0 if no overlay).
+    LLAMA_API size_t llama_memory_residual_window_slot_nbytes(
+            llama_memory_t mem,
+                   int32_t il);
+
     //
     // State / sessions
     //

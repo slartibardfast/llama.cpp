@@ -245,6 +245,15 @@ void llama_kv_cache_iswa::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
     kv_swa->state_read(io, seq_id, flags);
 }
 
+size_t llama_kv_cache_iswa::peek_k_window_slot(int32_t il, int32_t stream, int32_t slot,
+                                               void * dst, size_t dst_size) const {
+    return kv_base->peek_k_window_slot(il, stream, slot, dst, dst_size);
+}
+
+size_t llama_kv_cache_iswa::get_k_window_slot_nbytes(int32_t il) const {
+    return kv_base->get_k_window_slot_nbytes(il);
+}
+
 llama_kv_cache * llama_kv_cache_iswa::get_base() const {
     return kv_base.get();
 }

@@ -20,6 +20,10 @@
  *   --append N        run N incremental decode() calls with a dummy
  *                     token each to exercise the KV-cache write path
  *                     (default 0 — skip decode, init-only smoke)
+ *   --check-window    after --append, peek every overlay slot and assert
+ *                     that exactly min(N, rw) slots per stream are non-zero
+ *                     per active layer. Emits WINDOW_CHECK_{PASS,FAIL}
+ *                     lines to stdout. Exit 5 on mismatch.
  *   --verbose         enable llama info logging to stderr
  *
  * Exit codes:
@@ -39,10 +43,12 @@
 
 #include "llama.h"
 
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <vector>
 
 static void print_usage(const char * argv0) {
     fprintf(stderr,
@@ -71,6 +77,7 @@ int main(int argc, char ** argv) {
     ggml_type rw_type_k      = GGML_TYPE_COUNT; // auto
     std::string rw_type_k_name = "auto";
     int append_n = 0;
+    bool check_window = false;
     bool verbose = false;
 
     for (int i = 2; i < argc; ++i) {
@@ -106,6 +113,8 @@ int main(int argc, char ** argv) {
             int v = atoi(argv[++i]);
             if (v < 0) { fprintf(stderr, "--append must be >= 0\n"); return 1; }
             append_n = v;
+        } else if (strcmp(a, "--check-window") == 0) {
+            check_window = true;
         } else if (strcmp(a, "--verbose") == 0) {
             verbose = true;
         } else {
@@ -180,11 +189,77 @@ int main(int argc, char ** argv) {
         llama_batch_free(batch);
     }
 
+    // --check-window: peek every overlay slot after --append. A slot is
+    // "touched" if any byte is non-zero; the expected count per (layer,
+    // stream) is min(append_n, rw). Iterates a generous layer range
+    // (nlayer up to the model's report) and skips layers with no overlay
+    // (peek returns 0 bytes).
+    int check_status = 0;
+    if (check_window && rw > 0) {
+        const int n_layer = llama_model_n_layer(model);
+        llama_memory_t mem = llama_get_memory(ctx);
+        const int expected = (append_n >= (int) rw) ? (int) rw : append_n;
+
+        int layers_checked = 0;
+        int layers_ok      = 0;
+        int layers_fail    = 0;
+
+        // One slot can be at most a few KiB on wide models; 65536 bytes
+        // is a comfortable upper bound for any realistic head dim.
+        std::vector<uint8_t> buf(65536);
+
+        for (int il = 0; il < n_layer; ++il) {
+            size_t slot_nbytes = llama_memory_residual_window_slot_nbytes(mem, il);
+            if (slot_nbytes == 0) {
+                continue; // no overlay on this layer
+            }
+            if (slot_nbytes > buf.size()) {
+                buf.resize(slot_nbytes);
+            }
+            layers_checked++;
+
+            const int stream = 0; // unified cache; harness uses n_seq_max=1
+            int touched = 0;
+            for (uint32_t s = 0; s < rw; ++s) {
+                size_t got = llama_memory_residual_window_peek(
+                        mem, il, stream, (int) s, buf.data(), slot_nbytes);
+                if (got != slot_nbytes) {
+                    fprintf(stderr, "WINDOW_CHECK il=%d stream=%d slot=%u: peek size mismatch (%zu != %zu)\n",
+                        il, stream, s, got, slot_nbytes);
+                    layers_fail++;
+                    check_status = 5;
+                    break;
+                }
+                bool nonzero = false;
+                for (size_t b = 0; b < got; ++b) {
+                    if (buf[b] != 0) { nonzero = true; break; }
+                }
+                if (nonzero) touched++;
+            }
+
+            if (touched == expected) {
+                layers_ok++;
+                if (verbose) {
+                    fprintf(stdout, "WINDOW_CHECK_PASS il=%d touched=%d expected=%d slot_bytes=%zu\n",
+                        il, touched, expected, slot_nbytes);
+                }
+            } else {
+                fprintf(stdout, "WINDOW_CHECK_FAIL il=%d touched=%d expected=%d slot_bytes=%zu\n",
+                    il, touched, expected, slot_nbytes);
+                layers_fail++;
+                check_status = 5;
+            }
+        }
+
+        fprintf(stdout, "WINDOW_CHECK layers=%d ok=%d fail=%d expected_per_layer=%d\n",
+            layers_checked, layers_ok, layers_fail, expected);
+    }
+
     fprintf(stdout, "HARNESS_OK rw=%u ctx=%u type_k=%s rw_type_k=%s decoded=%d\n",
         rw, (uint32_t) llama_n_ctx(ctx), type_k_name.c_str(), rw_type_k_name.c_str(), decoded);
 
     llama_free(ctx);
     llama_model_free(model);
     llama_backend_free();
-    return 0;
+    return check_status;
 }

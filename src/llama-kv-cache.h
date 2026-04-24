@@ -193,6 +193,11 @@ public:
     bool has_residual_window() const;
     uint32_t get_residual_window() const;
 
+    // test-facing introspection (see llama_memory_i for contract)
+    size_t peek_k_window_slot(int32_t il, int32_t stream, int32_t slot,
+                              void * dst, size_t dst_size) const override;
+    size_t get_k_window_slot_nbytes(int32_t il) const override;
+
     //
     // preparation API
     //

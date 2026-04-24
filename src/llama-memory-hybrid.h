@@ -78,6 +78,11 @@ public:
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
     void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0)       override;
 
+    // residual-window forwards to the attention KV cache.
+    size_t peek_k_window_slot(int32_t il, int32_t stream, int32_t slot,
+                              void * dst, size_t dst_size) const override;
+    size_t get_k_window_slot_nbytes(int32_t il) const override;
+
     //
     // llama_memory_hybrid specific API
     //

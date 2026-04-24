@@ -196,6 +196,15 @@ void llama_memory_hybrid::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
     mem_recr->state_read(io, seq_id, flags);
 }
 
+size_t llama_memory_hybrid::peek_k_window_slot(int32_t il, int32_t stream, int32_t slot,
+                                               void * dst, size_t dst_size) const {
+    return mem_attn->peek_k_window_slot(il, stream, slot, dst, dst_size);
+}
+
+size_t llama_memory_hybrid::get_k_window_slot_nbytes(int32_t il) const {
+    return mem_attn->get_k_window_slot_nbytes(il);
+}
+
 llama_kv_cache * llama_memory_hybrid::get_mem_attn() const {
     return mem_attn.get();
 }

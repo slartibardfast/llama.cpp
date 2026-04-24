@@ -3434,6 +3434,28 @@ void llama_memory_seq_div(
     mem->seq_div(seq_id, p0, p1, d);
 }
 
+size_t llama_memory_residual_window_peek(
+        llama_memory_t mem,
+               int32_t il,
+               int32_t stream,
+               int32_t slot,
+                  void * dst,
+                size_t   dst_size) {
+    if (!mem) {
+        return 0;
+    }
+    return mem->peek_k_window_slot(il, stream, slot, dst, dst_size);
+}
+
+size_t llama_memory_residual_window_slot_nbytes(
+        llama_memory_t mem,
+               int32_t il) {
+    if (!mem) {
+        return 0;
+    }
+    return mem->get_k_window_slot_nbytes(il);
+}
+
 llama_pos llama_memory_seq_pos_min(
         llama_memory_t mem,
           llama_seq_id seq_id) {

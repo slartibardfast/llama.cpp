@@ -118,6 +118,28 @@ struct llama_memory_i {
 
     virtual void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const = 0;
     virtual void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) = 0;
+
+    //
+    // residual-window overlay introspection (test-facing)
+    //
+    // peek one slot of the fp16/bf16 rolling-tail overlay for layer `il`,
+    // stream `stream`, at slot index `slot` (0..residual_window-1).
+    // Returns number of bytes copied into dst (min of a full slot row
+    // and dst_size). Returns 0 when the memory type has no overlay, the
+    // layer has no K cache slot, the cache was constructed with
+    // residual_window == 0, or indices are out of range.
+    virtual size_t peek_k_window_slot(int32_t il, int32_t stream, int32_t slot,
+                                      void * dst, size_t dst_size) const {
+        (void) il; (void) stream; (void) slot; (void) dst; (void) dst_size;
+        return 0;
+    }
+
+    // byte size of one slot row for layer `il` (== ggml_row_size(type, n_embd_k_gqa)).
+    // Returns 0 when the layer has no overlay.
+    virtual size_t get_k_window_slot_nbytes(int32_t il) const {
+        (void) il;
+        return 0;
+    }
 };
 
 using llama_memory_ptr = std::unique_ptr<llama_memory_i>;
