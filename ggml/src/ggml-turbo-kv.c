@@ -28,6 +28,9 @@
 #ifdef __SSE4_1__
 #include <smmintrin.h>
 #endif
+#ifdef __AVX2__
+#include <immintrin.h>
+#endif
 #include <float.h>
 
 /* ============================================================
@@ -279,12 +282,40 @@ float turbo_kv_4b_prepare_block(
     /* Step 3: RHT (in-place) */
     turbo_kv_rht_forward(rotated_out, dim, TURBO_KV_DEFAULT_SEED);
 
-    /* Step 4: compute max_abs and per-block inv_std */
+    /* Step 4: compute max_abs and per-block inv_std. Max is associative
+     * for non-NaN fp32, so SIMD reduction is bit-exact with the scalar
+     * sequential max. Our inputs are bounded in [-cent_max, cent_max]
+     * after RHT so non-NaN is guaranteed. */
     float max_abs = 0.0f;
+#if defined(__AVX2__)
+    {
+        const __m256 sign_clear =
+            _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFFFFFF));
+        __m256 max_vec = _mm256_setzero_ps();
+        int i = 0;
+        for (; i + 7 < dim; i += 8) {
+            const __m256 v = _mm256_loadu_ps(rotated_out + i);
+            const __m256 abs_v = _mm256_and_ps(v, sign_clear);
+            max_vec = _mm256_max_ps(max_vec, abs_v);
+        }
+        /* Horizontal max of 8 lanes. */
+        float tmp[8];
+        _mm256_storeu_ps(tmp, max_vec);
+        for (int k = 0; k < 8; k++) {
+            if (tmp[k] > max_abs) max_abs = tmp[k];
+        }
+        /* Scalar tail for dim not a multiple of 8. */
+        for (; i < dim; i++) {
+            const float a = fabsf(rotated_out[i]);
+            if (a > max_abs) max_abs = a;
+        }
+    }
+#else
     for (int i = 0; i < dim; i++) {
         const float a = fabsf(rotated_out[i]);
         if (a > max_abs) max_abs = a;
     }
+#endif
     if (max_abs < 1e-10f) max_abs = 1.0f;
     const float inv_std = TURBO_KV_4B_CENT_MAX / max_abs;
     block->inv_std_fp16 = turbo_kv_fp32_to_fp16(inv_std);
