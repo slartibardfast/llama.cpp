@@ -323,6 +323,21 @@ target_include_directories(test-turbo-kv-residual-window-pbt PRIVATE
 # rapidcheck linkage will be added when the first rc::check lands
 # (today the file is skip-only — see header comment).
 
+# TurboQuant asymmetric-K/V PBT: propagated from
+# turbo_kv_asymmetric.allium. PHASE26 Tier 1.2. Skip-stub today.
+add_executable(test-turbo-kv-asymmetric-pbt test-turbo-kv-asymmetric-pbt.cpp)
+target_link_libraries(test-turbo-kv-asymmetric-pbt PRIVATE ggml-base)
+
+# TurboQuant layer-adaptive PBT: propagated from
+# turbo_kv_layer_adaptive.allium. PHASE26 Tier 2.1. Skip-stub today.
+add_executable(test-turbo-kv-layer-adaptive-pbt test-turbo-kv-layer-adaptive-pbt.cpp)
+target_link_libraries(test-turbo-kv-layer-adaptive-pbt PRIVATE ggml-base)
+
+# TurboQuant outliers PBT: propagated from turbo_kv_outliers.allium.
+# PHASE26 Tier 2.2. Skip-stub today.
+add_executable(test-turbo-kv-outliers-pbt test-turbo-kv-outliers-pbt.cpp)
+target_link_libraries(test-turbo-kv-outliers-pbt PRIVATE ggml-base)
+
 # TurboQuant attention PBT: propagated from turbo_kv_4b_attention.allium.
 # Compares GGML_OP_FLASH_ATTN_EXT output between the CPU scalar
 # reference and each registered non-CPU backend at the multi-block
