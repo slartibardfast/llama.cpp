@@ -290,6 +290,11 @@ public:
     // Pre-RoPE K: populate per-cell absolute positions for on-the-fly RoPE
     void set_input_k_pos(ggml_tensor * dst, const slot_info & sinfo) const;
 
+    // Pre-RoPE Pass-B overlay K positions: populate [rw * 4] tensor with
+    // the absolute positions of the rw recent-window slots in position
+    // order (max_pos - rw + 1 + s for s in [0, rw)).
+    void set_input_window_k_pos(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+
 private:
     const llama_model & model;
     const llama_hparams & hparams;
@@ -531,6 +536,12 @@ public:
     // Returns a [n_kv] I32 tensor, or nullptr if K type is not pre-RoPE.
     ggml_tensor * build_input_k_pos(ggml_context * ctx) const;
 
+    // Pre-RoPE Pass-B overlay K positions: [rw * 4] I32 tensor populated in
+    // position order with the absolute position of each window slot
+    // (max_pos - rw + 1 + s). nullptr when overlay is disabled or the cache
+    // type stores post-RoPE K (i.e. self_k_pos is also nullptr).
+    ggml_tensor * build_input_window_k_pos(ggml_context * ctx) const;
+
     void set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
     void set_input_k_window_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
     void set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const;
@@ -548,6 +559,7 @@ public:
     void set_input_v_rot(ggml_tensor * dst) const;
 
     void set_input_k_pos(ggml_tensor * dst) const;
+    void set_input_window_k_pos(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
 private:
     llama_memory_status status;

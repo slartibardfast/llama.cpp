@@ -344,6 +344,12 @@ public:
     // Shape: I32 [n_kv * n_stream]. Populated by set_input with pos_get(i).
     ggml_tensor * self_k_pos = nullptr;
 
+    // Pre-RoPE Pass-B overlay K positions: I32 [rw * 4]. Populated in
+    // position order with the absolute position of each window slot
+    // (max_pos - rw + 1 + s). Non-null only when both has_residual_window
+    // and the cache type stores pre-RoPE K (turbo_kv_4b, split-K).
+    ggml_tensor * self_window_k_pos = nullptr;
+
     // note: these have to be copies because in order to be able to reuse a graph, its inputs
     //       need to carry these parameters with them. otherwise, they can point to freed
     //       llm_graph_params from a previous batch, causing stack-use-after-return

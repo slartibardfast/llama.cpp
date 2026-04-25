@@ -2355,6 +2355,42 @@ void llama_kv_cache::set_input_k_pos(ggml_tensor * dst, const slot_info & sinfo)
     }
 }
 
+void llama_kv_cache::set_input_window_k_pos(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+    if (dst->buffer == nullptr) {
+        return;
+    }
+    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+    GGML_ASSERT(residual_window > 0);
+    GGML_ASSERT(n_stream == 1 && "two-pass overlay read path: n_stream > 1 not supported");
+
+    int32_t * data = (int32_t *) dst->data;
+    const uint32_t rw = (uint32_t) (dst->ne[0] / 4);
+    GGML_ASSERT(rw == residual_window);
+
+    // max_pos_stream — same partition boundary used by set_input_window_reorder
+    // and the Pass B mask. Slot s in Pass B corresponds to absolute position
+    // (max_pos - rw + 1 + s).
+    llama_pos max_pos = 0;
+    for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+        if (ubatch->pos[i] > max_pos) {
+            max_pos = ubatch->pos[i];
+        }
+    }
+    const llama_pos base = max_pos - (llama_pos) rw + 1;
+
+    for (uint32_t s = 0; s < rw; ++s) {
+        const llama_pos p = base + (llama_pos) s;
+        // Mask negative positions to 0 — the Pass B mask masks slots with
+        // p_slot < 0 anyway, so RoPE on the dummy slot doesn't influence
+        // the merged output.
+        const int32_t pos = (p >= 0) ? (int32_t) p : 0;
+        data[s + rw * 0] = pos;
+        data[s + rw * 1] = pos;
+        data[s + rw * 2] = pos;
+        data[s + rw * 3] = 0;
+    }
+}
+
 size_t llama_kv_cache::total_size() const {
     size_t size = 0;
 
@@ -3291,8 +3327,31 @@ ggml_tensor * llama_kv_cache_context::build_input_k_pos(ggml_context * ctx) cons
     return res;
 }
 
+ggml_tensor * llama_kv_cache_context::build_input_window_k_pos(ggml_context * ctx) const {
+    // Only meaningful when the overlay is active AND the cache type stores
+    // pre-RoPE K (i.e. self_k_pos would also be built for the main cache).
+    // For post-RoPE caches the overlay slice is read directly with no
+    // RoPE step in Pass B; this tensor is unused.
+    if (!has_residual_window()) {
+        return nullptr;
+    }
+    if (!is_split_k() && type_k() != GGML_TYPE_TURBO_KV_4B) {
+        return nullptr;
+    }
+    const uint32_t rw = get_residual_window();
+    // [rw * 4] for M-RoPE — same layout convention as build_input_k_pos.
+    ggml_tensor * res = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, rw * 4);
+    ggml_set_input(res);
+    ggml_set_name(res, "window_k_pos");
+    return res;
+}
+
 void llama_kv_cache_context::set_input_k_pos(ggml_tensor * dst) const {
     // Delegate to the kv cache's set_input_k_shift-style pattern.
     // We use the same cell iteration but read absolute positions, not shifts.
     kv->set_input_k_pos(dst, sinfos[i_cur]);
+}
+
+void llama_kv_cache_context::set_input_window_k_pos(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+    kv->set_input_window_k_pos(dst, ubatch);
 }
