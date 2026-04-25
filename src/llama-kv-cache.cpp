@@ -3311,9 +3311,13 @@ void llama_kv_cache_context::set_input_v_rot(ggml_tensor * dst) const {
 }
 
 ggml_tensor * llama_kv_cache_context::build_input_k_pos(ggml_context * ctx) const {
-    // Pre-RoPE K: needed for split K (RoPE applied on-the-fly to rope dims)
-    // and for turbo_kv_4b (pre-RoPE storage).
-    if (!is_split_k() && type_k() != GGML_TYPE_TURBO_KV_4B) {
+    // Pre-RoPE K: needed for split K (RoPE applied on-the-fly to rope dims).
+    // turbo_kv_4b switched to post-RoPE storage to make its read path match
+    // f16/bf16 caches (read → cast → FA, no rope-on-the-fly), unblocking
+    // two-pass FA + LSE merge at rw>0. The codebook tolerates RoPE-rotated
+    // K_pre because per-block normalize+RHT homogenises the distribution
+    // before quantisation.
+    if (!is_split_k()) {
         return nullptr;
     }
     const uint32_t n_kv = get_n_kv();
@@ -3329,13 +3333,12 @@ ggml_tensor * llama_kv_cache_context::build_input_k_pos(ggml_context * ctx) cons
 
 ggml_tensor * llama_kv_cache_context::build_input_window_k_pos(ggml_context * ctx) const {
     // Only meaningful when the overlay is active AND the cache type stores
-    // pre-RoPE K (i.e. self_k_pos would also be built for the main cache).
-    // For post-RoPE caches the overlay slice is read directly with no
-    // RoPE step in Pass B; this tensor is unused.
+    // pre-RoPE K (i.e. self_k_pos would also be built for the main cache —
+    // currently only split_k after the turbo_kv_4b → post-RoPE flip).
     if (!has_residual_window()) {
         return nullptr;
     }
-    if (!is_split_k() && type_k() != GGML_TYPE_TURBO_KV_4B) {
+    if (!is_split_k()) {
         return nullptr;
     }
     const uint32_t rw = get_residual_window();

@@ -2461,104 +2461,27 @@ ggml_tensor * llm_graph_context::build_attn(
         }
     }
 
-    // Residual-window two-pass read-path dispatch. Pass A over the main
-    // K/V cache with positions-older-than-rw mask; Pass B over the fp16
+    // Residual-window two-pass read-path dispatch. Pass A reads the main
+    // K/V cache with positions-older-than-rw masked; Pass B reads the
     // overlay K + main V sliced to the recent-window positions, with a
     // position-order mask.
     //
-    // RoPE state alignment (per turbo_kv_residual_window.allium guidance):
-    // Pass B's K must arrive at FA_LSE in the same RoPE state as Q.
-    //   - post-RoPE store (self_k_pos == nullptr): the overlay holds
-    //     post-RoPE K already; Pass B reads the position-ordered slice
-    //     directly.
-    //   - pre-RoPE store (self_k_pos != nullptr — turbo_kv_4b, etc.): the
-    //     overlay holds pre-RoPE K; Pass B applies the same
-    //     ggml_rope_multi recipe used by the main-cache read path,
-    //     keyed on self_window_k_pos for the recent-window slice.
-    //
-    // PRE-ROPE PATH GATED OFF (5b INCOMPLETE): the pre-RoPE branch is
-    // implemented (build_input_window_k_pos, set_input_window_k_pos,
-    // and the ggml_rope_multi block below) but produces a +0.84 PPL
-    // regression on Qwen3.5 0.8B turbo_kv_4b at rw=128 vs rw=0 baseline
-    // (17.6968 → 18.5815 at -t 8, race-free, scales with rw). The
-    // overlay → F32 → rope path is symbolically equivalent to Pass A's
-    // dequant → F32 → rope, but produces numerically different attention
-    // outputs in some way I have not yet isolated. F16 vs BF16 vs F32
-    // K dtype at the FA boundary moves PPL by < 0.05 — the dominant
-    // gap is elsewhere. Until rooted out, gate pre-RoPE caches back to
-    // single-pass FA so users don't see the regression.
+    // Requires post-RoPE-store caches (self_k_pos == nullptr). f16, bf16,
+    // and turbo_kv_4b (post-PHASE28-iter21) all satisfy this. split-K
+    // still uses pre-RoPE storage with rope-on-the-fly at attention time
+    // and is not yet ported to two-pass.
     //
     // Falls back to single-pass FA when the overlay views are not
-    // materialised, when extra FA side-channels are in use, when the
-    // cache stores pre-RoPE K (until 5b is fixed), or when the cache
-    // uses split-K.
+    // materialised, extra FA side-channels are in use (kq_b / sinks /
+    // v_mla), the cache uses pre-RoPE storage, or the cache uses split-K.
     ggml_tensor * k_window = nullptr;
     ggml_tensor * v_window = nullptr;
-
-    // DIAGNOSTIC: lift the pre-RoPE gate when LLAMA_DIAG_5B_OPEN_GATE is set.
-    // Optionally substitute the overlay K source with the main K cache
-    // (read via ggml_get_rows on dequant) when LLAMA_DIAG_5B_PASS_B_FROM_MAIN
-    // is set — Pass B then sees the same data Pass A would see, just
-    // gathered from cells [max_pos-rw+1, max_pos] via the same indices the
-    // overlay path uses. If the diag-from-main config matches single-pass
-    // PPL, the merge mechanism is correct and the overlay path is the
-    // problem.
-    const bool diag_open_gate          = std::getenv("LLAMA_DIAG_5B_OPEN_GATE") != nullptr;
-    const bool diag_pass_b_from_main   = std::getenv("LLAMA_DIAG_5B_PASS_B_FROM_MAIN") != nullptr;
-    const bool gate_pre_rope_off       = (inp->self_k_pos == nullptr) || diag_open_gate;
-
     if (cparams.flash_attn && mctx_cur->has_residual_window() &&
         inp->self_window_reorder && inp->self_v_window_idxs &&
         kq_b == nullptr && sinks == nullptr && v_mla == nullptr &&
-        gate_pre_rope_off && !mctx_cur->is_split_k()) {
-
-        if (diag_pass_b_from_main && inp->self_k_pos) {
-            // Pass B's K = ggml_get_rows(main_k, v_window_idxs) — substitute
-            // the overlay with the dequantised main cache, indexed by the
-            // same per-position indices used for V. Apply the same rope
-            // recipe used on the main K read path.
-            ggml_tensor * k_main_full = mctx_cur->get_k(ctx0, il);
-            // Shape: [DK_head, n_head_kv, n_kv, n_stream]. Reshape to
-            // [n_embd_k_gqa, n_kv, n_stream, 1] to match the get_rows
-            // input layout used by get_k_window.
-            const int64_t DK_head    = hparams.n_embd_head_k(il);
-            const int64_t n_head_kv  = hparams.n_head_kv(il);
-            const int64_t n_kv_local = k_main_full->ne[2];
-            ggml_tensor * k_main_flat = ggml_reshape_4d(ctx0, k_main_full,
-                                                       DK_head * n_head_kv,
-                                                       n_kv_local, 1, 1);
-            // Cast to F32 first (turbo_kv_4b dequant), so get_rows on a
-            // standard float type is what runs.
-            k_main_flat = ggml_cast(ctx0, k_main_flat, GGML_TYPE_F32);
-            ggml_tensor * k_lin = ggml_get_rows(ctx0, k_main_flat,
-                                                inp->self_v_window_idxs);
-            k_window = ggml_reshape_4d(ctx0, k_lin, DK_head, n_head_kv,
-                                       (int64_t) mctx_cur->get_residual_window(), 1);
-        } else {
-            k_window = mctx_cur->get_k_window(ctx0, il, inp->self_window_reorder);
-        }
+        inp->self_k_pos == nullptr && !mctx_cur->is_split_k()) {
+        k_window = mctx_cur->get_k_window(ctx0, il, inp->self_window_reorder);
         v_window = mctx_cur->get_v_window(ctx0, il, inp->self_v_window_idxs);
-
-        // Pre-RoPE overlay: apply on-the-fly RoPE to the position-ordered
-        // overlay slice using the parallel window-position tensor.
-        // get_k_window returns shape [n_embd_head_k, n_head_kv, rw, 1],
-        // matching ggml_rope_multi's expected [head_dim, head, n_tokens, batch].
-        if (k_window && inp->self_k_pos && inp->self_window_k_pos) {
-            if (k_window->type != GGML_TYPE_F32) {
-                k_window = ggml_cast(ctx0, k_window, GGML_TYPE_F32);
-            }
-
-            int sections[4];
-            std::copy(hparams.rope_sections.begin(), hparams.rope_sections.end(), sections);
-            k_window = ggml_rope_multi(ctx0, k_window,
-                inp->self_window_k_pos, nullptr,
-                hparams.n_rot(il), sections,
-                hparams.rope_type,
-                cparams.n_ctx_orig_yarn, cparams.rope_freq_base, cparams.rope_freq_scale,
-                cparams.yarn_ext_factor, cparams.yarn_attn_factor,
-                cparams.yarn_beta_fast, cparams.yarn_beta_slow);
-            cb(k_window, "k_window_rope_on_the_fly", il);
-        }
     }
 
     const bool overlay_two_pass =
