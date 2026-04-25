@@ -216,6 +216,14 @@ public:
                               void * dst, size_t dst_size) const override;
     size_t get_k_window_slot_nbytes(int32_t il) const override;
 
+    // ReconcileOverlayOnSequenceRemoval (turbo_kv_residual_window.allium):
+    // restore-from-main strategy. Called by seq_rm after the cell-removal
+    // loop. For each ring slot in [0, rw), find the highest-position
+    // surviving cell whose pos % rw == s and rewrite that slot from
+    // main-cache K (dequant + dtype-convert as needed). Slots with no
+    // surviving writer are zeroed. No-op when residual_window == 0.
+    void reconcile_overlay_after_removal(uint32_t stream_idx);
+
     //
     // preparation API
     //

@@ -423,6 +423,90 @@ void llama_kv_cache::clear(bool data) {
     }
 }
 
+void llama_kv_cache::reconcile_overlay_after_removal(uint32_t stream_idx) {
+    if (residual_window == 0) {
+        return;
+    }
+    GGML_ASSERT(stream_idx < n_stream);
+
+    const auto & cells = v_cells[stream_idx];
+    const llama_pos rw = (llama_pos) residual_window;
+
+    // For each ring slot, find the highest-position surviving cell whose
+    // p % rw == slot. After seq_rm, removed cells are .is_empty(), so they
+    // are skipped automatically.
+    std::vector<llama_pos> slot_to_pos((size_t) rw, -1);
+    std::vector<uint32_t>  slot_to_cell((size_t) rw, UINT32_MAX);
+
+    for (uint32_t j = 0; j < cells.size(); ++j) {
+        if (cells.is_empty(j)) continue;
+        const llama_pos p = cells.pos_get(j);
+        if (p < 0) continue;
+        const llama_pos s = ((p % rw) + rw) % rw;
+        if (p > slot_to_pos[(size_t) s]) {
+            slot_to_pos[(size_t) s]  = p;
+            slot_to_cell[(size_t) s] = j;
+        }
+    }
+
+    // For each layer that has an overlay, restore each slot from the
+    // chosen surviving cell (or zero the slot if no such cell exists).
+    const uint64_t cache_size = (uint64_t) cells.size();
+    for (size_t ikv = 0; ikv < layers.size(); ++ikv) {
+        ggml_tensor * k_main = layers[ikv].k;
+        ggml_tensor * k_win  = layers[ikv].k_window_fp16;
+        if (!k_main || !k_win) continue;
+
+        const int64_t n_embd_k_gqa = k_win->ne[0];
+        const size_t  win_row_bytes  = ggml_row_size(k_win->type,  n_embd_k_gqa);
+        const size_t  main_row_bytes = ggml_row_size(k_main->type, n_embd_k_gqa);
+
+        std::vector<uint8_t> main_buf(main_row_bytes);
+        std::vector<float>   dequant_buf((size_t) n_embd_k_gqa);
+        std::vector<uint8_t> overlay_buf(win_row_bytes);
+
+        const auto * traits_main = ggml_get_type_traits(k_main->type);
+
+        for (uint32_t s = 0; s < (uint32_t) rw; ++s) {
+            if (slot_to_pos[s] < 0) {
+                std::memset(overlay_buf.data(), 0, win_row_bytes);
+            } else {
+                // Read main K row at (stream_idx, cell).
+                const uint64_t main_offset = ((uint64_t) stream_idx * cache_size + slot_to_cell[s]) * main_row_bytes;
+                ggml_backend_tensor_get(k_main, main_buf.data(), main_offset, main_row_bytes);
+
+                // Dequant / extend to F32.
+                if (k_main->type == GGML_TYPE_F32) {
+                    std::memcpy(dequant_buf.data(), main_buf.data(), (size_t) n_embd_k_gqa * sizeof(float));
+                } else if (k_main->type == GGML_TYPE_F16) {
+                    ggml_fp16_to_fp32_row((const ggml_fp16_t *) main_buf.data(), dequant_buf.data(), n_embd_k_gqa);
+                } else if (k_main->type == GGML_TYPE_BF16) {
+                    ggml_bf16_to_fp32_row((const ggml_bf16_t *) main_buf.data(), dequant_buf.data(), n_embd_k_gqa);
+                } else if (traits_main && traits_main->to_float) {
+                    traits_main->to_float(main_buf.data(), dequant_buf.data(), n_embd_k_gqa);
+                } else {
+                    GGML_ABORT("reconcile_overlay_after_removal: K cache type %s has no to_float",
+                               ggml_type_name(k_main->type));
+                }
+
+                // Convert F32 → overlay dtype.
+                if (k_win->type == GGML_TYPE_F16) {
+                    ggml_fp32_to_fp16_row(dequant_buf.data(), (ggml_fp16_t *) overlay_buf.data(), n_embd_k_gqa);
+                } else if (k_win->type == GGML_TYPE_BF16) {
+                    ggml_fp32_to_bf16_row(dequant_buf.data(), (ggml_bf16_t *) overlay_buf.data(), n_embd_k_gqa);
+                } else {
+                    GGML_ABORT("reconcile_overlay_after_removal: overlay dtype %s not supported",
+                               ggml_type_name(k_win->type));
+                }
+            }
+
+            // Write overlay slot.
+            const uint64_t win_offset = ((uint64_t) stream_idx * (uint64_t) rw + (uint64_t) s) * win_row_bytes;
+            ggml_backend_tensor_set(k_win, overlay_buf.data(), win_offset, win_row_bytes);
+        }
+    }
+}
+
 bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     GGML_ASSERT(seq_id == -1 || (seq_id >= 0 && (size_t) seq_id < seq_to_stream.size()));
 
@@ -435,8 +519,9 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     }
 
     if (seq_id >= 0) {
-        auto & cells = v_cells[seq_to_stream[seq_id]];
-        auto & head  = v_heads[seq_to_stream[seq_id]];
+        const uint32_t stream_idx = seq_to_stream[seq_id];
+        auto & cells = v_cells[stream_idx];
+        auto & head  = v_heads[stream_idx];
 
         uint32_t new_head = cells.size();
 
@@ -456,6 +541,10 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
         if (new_head != cells.size() && new_head < head) {
             head = new_head;
         }
+
+        // ReconcileOverlayOnSequenceRemoval (turbo_kv_residual_window.allium):
+        // restore-from-main strategy. No-op when residual_window == 0.
+        reconcile_overlay_after_removal(stream_idx);
     } else {
         // match any sequence
         for (uint32_t s = 0; s < n_stream; ++s) {
@@ -480,6 +569,8 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
             if (new_head != cells.size() && new_head < head) {
                 head = new_head;
             }
+
+            reconcile_overlay_after_removal(s);
         }
     }
 

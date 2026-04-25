@@ -79,6 +79,8 @@ int main(int argc, char ** argv) {
     int append_n = 0;
     bool check_window = false;
     bool verbose = false;
+    int seq_rm_then_peek_p_min = -1;
+    int seq_rm_then_peek_p_max = -1;
 
     for (int i = 2; i < argc; ++i) {
         const char * a = argv[i];
@@ -115,6 +117,13 @@ int main(int argc, char ** argv) {
             append_n = v;
         } else if (strcmp(a, "--check-window") == 0) {
             check_window = true;
+        } else if (strcmp(a, "--seq-rm-then-peek") == 0 && i + 2 < argc) {
+            seq_rm_then_peek_p_min = atoi(argv[++i]);
+            seq_rm_then_peek_p_max = atoi(argv[++i]);
+            if (seq_rm_then_peek_p_min < 0 || seq_rm_then_peek_p_max < seq_rm_then_peek_p_min) {
+                fprintf(stderr, "--seq-rm-then-peek expects 0 <= p_min <= p_max\n");
+                return 1;
+            }
         } else if (strcmp(a, "--verbose") == 0) {
             verbose = true;
         } else {
@@ -253,6 +262,110 @@ int main(int argc, char ** argv) {
 
         fprintf(stdout, "WINDOW_CHECK layers=%d ok=%d fail=%d expected_per_layer=%d\n",
             layers_checked, layers_ok, layers_fail, expected);
+    }
+
+    // --seq-rm-then-peek: snapshot every overlay slot, call seq_rm on the
+    // requested position range, peek each slot again, and report how many
+    // slots changed. With ReconcileOverlayOnSequenceRemoval implemented and
+    // an f16 main cache (where the f16 → f32 → f16 reconciliation round-trip
+    // is lossless), the expected count of changed slots equals the number of
+    // ring slots whose pre-removal last writer was in the removed range:
+    //     |{ p % rw : p in [p_min, p_max] }|
+    // Without reconciliation, ZERO slots would change. This is the binary
+    // gate for the rewind hazard fix.
+    //
+    // KNOWN LIMITATION: on hybrid models (Qwen3.5 et al.), the public
+    // llama_memory_seq_rm routes through llama_memory_hybrid::seq_rm,
+    // which fails when the recurrent cache cannot roll back the SSM
+    // state without a checkpoint. The result is changed=0 because
+    // seq_rm returned false before reaching the attention cache. To
+    // exercise reconcile_overlay_after_removal directly, this test
+    // needs either (a) a non-hybrid model with rw>0, or (b) a test-
+    // only API that bypasses the hybrid wrapper. The reconcile path
+    // itself is verified by code review until that test infrastructure
+    // lands.
+    if (seq_rm_then_peek_p_min >= 0 && rw > 0) {
+        const int n_layer = llama_model_n_layer(model);
+        llama_memory_t mem = llama_get_memory(ctx);
+        const int p_min = seq_rm_then_peek_p_min;
+        const int p_max = seq_rm_then_peek_p_max;
+
+        // Pick a layer with an overlay to inspect.
+        int probe_il = -1;
+        size_t probe_slot_nbytes = 0;
+        for (int il = 0; il < n_layer; ++il) {
+            size_t nb = llama_memory_residual_window_slot_nbytes(mem, il);
+            if (nb > 0) { probe_il = il; probe_slot_nbytes = nb; break; }
+        }
+        if (probe_il < 0) {
+            fprintf(stdout, "SEQ_RM_PEEK_SKIP no_overlay_layers\n");
+        } else {
+            std::vector<uint8_t> before(rw * probe_slot_nbytes);
+            std::vector<uint8_t> after(rw * probe_slot_nbytes);
+
+            for (uint32_t s = 0; s < rw; ++s) {
+                size_t got = llama_memory_residual_window_peek(
+                        mem, probe_il, /*stream=*/0, (int) s,
+                        before.data() + s * probe_slot_nbytes, probe_slot_nbytes);
+                if (got != probe_slot_nbytes) {
+                    fprintf(stderr, "SEQ_RM_PEEK pre-snapshot peek mismatch slot=%u\n", s);
+                    check_status = 6;
+                    break;
+                }
+            }
+
+            // Apply seq_rm via the public API. seq_id 0 (the only sequence
+            // the harness uses). Use [p_min, -1) — truncate from p_min
+            // onwards — to match MTP rejection semantics and also because
+            // hybrid models reject partial-range seq_rm (the recurrent
+            // cache only supports tail-truncate).
+            const bool ok = llama_memory_seq_rm(mem, /*seq_id=*/0, p_min, -1);
+            if (!ok) {
+                fprintf(stderr, "SEQ_RM_PEEK seq_rm returned false (likely hybrid recurrent rejection)\n");
+                check_status = 6;
+            }
+
+            for (uint32_t s = 0; s < rw; ++s) {
+                size_t got = llama_memory_residual_window_peek(
+                        mem, probe_il, /*stream=*/0, (int) s,
+                        after.data() + s * probe_slot_nbytes, probe_slot_nbytes);
+                if (got != probe_slot_nbytes) {
+                    fprintf(stderr, "SEQ_RM_PEEK post-snapshot peek mismatch slot=%u\n", s);
+                    check_status = 6;
+                    break;
+                }
+            }
+
+            int changed = 0;
+            for (uint32_t s = 0; s < rw; ++s) {
+                if (std::memcmp(before.data() + s * probe_slot_nbytes,
+                                after.data()  + s * probe_slot_nbytes,
+                                probe_slot_nbytes) != 0) {
+                    changed++;
+                }
+            }
+
+            // Expected changed slots: { p % rw : p in [p_min, p_max] }
+            // For hybrid models we used tail-truncate (p1=-1), so the
+            // effective removed range is [p_min, append_n - 1] (= the
+            // tail of what was decoded). Use the requested p_max as a
+            // hard upper bound but cap at append_n - 1 to be safe.
+            const int p_max_eff = (p_max < append_n - 1) ? p_max : (append_n - 1);
+            std::vector<bool> expected(rw, false);
+            for (int p = p_min; p <= p_max_eff; ++p) {
+                expected[(uint32_t)(((p % (int) rw) + (int) rw) % (int) rw)] = true;
+            }
+            int n_expected = 0;
+            for (uint32_t s = 0; s < rw; ++s) {
+                if (expected[s]) n_expected++;
+            }
+
+            fprintf(stdout, "SEQ_RM_PEEK il=%d p_min=%d p_max=%d changed=%d expected=%d\n",
+                    probe_il, p_min, p_max, changed, n_expected);
+            if (changed != n_expected) {
+                check_status = 6;
+            }
+        }
     }
 
     fprintf(stdout, "HARNESS_OK rw=%u ctx=%u type_k=%s rw_type_k=%s decoded=%d\n",
