@@ -2494,22 +2494,59 @@ ggml_tensor * llm_graph_context::build_attn(
     // uses split-K.
     ggml_tensor * k_window = nullptr;
     ggml_tensor * v_window = nullptr;
+
+    // DIAGNOSTIC: lift the pre-RoPE gate when LLAMA_DIAG_5B_OPEN_GATE is set.
+    // Optionally substitute the overlay K source with the main K cache
+    // (read via ggml_get_rows on dequant) when LLAMA_DIAG_5B_PASS_B_FROM_MAIN
+    // is set — Pass B then sees the same data Pass A would see, just
+    // gathered from cells [max_pos-rw+1, max_pos] via the same indices the
+    // overlay path uses. If the diag-from-main config matches single-pass
+    // PPL, the merge mechanism is correct and the overlay path is the
+    // problem.
+    const bool diag_open_gate          = std::getenv("LLAMA_DIAG_5B_OPEN_GATE") != nullptr;
+    const bool diag_pass_b_from_main   = std::getenv("LLAMA_DIAG_5B_PASS_B_FROM_MAIN") != nullptr;
+    const bool gate_pre_rope_off       = (inp->self_k_pos == nullptr) || diag_open_gate;
+
     if (cparams.flash_attn && mctx_cur->has_residual_window() &&
         inp->self_window_reorder && inp->self_v_window_idxs &&
         kq_b == nullptr && sinks == nullptr && v_mla == nullptr &&
-        inp->self_k_pos == nullptr && !mctx_cur->is_split_k()) {
-        k_window = mctx_cur->get_k_window(ctx0, il, inp->self_window_reorder);
+        gate_pre_rope_off && !mctx_cur->is_split_k()) {
+
+        if (diag_pass_b_from_main && inp->self_k_pos) {
+            // Pass B's K = ggml_get_rows(main_k, v_window_idxs) — substitute
+            // the overlay with the dequantised main cache, indexed by the
+            // same per-position indices used for V. Apply the same rope
+            // recipe used on the main K read path.
+            ggml_tensor * k_main_full = mctx_cur->get_k(ctx0, il);
+            // Shape: [DK_head, n_head_kv, n_kv, n_stream]. Reshape to
+            // [n_embd_k_gqa, n_kv, n_stream, 1] to match the get_rows
+            // input layout used by get_k_window.
+            const int64_t DK_head    = hparams.n_embd_head_k(il);
+            const int64_t n_head_kv  = hparams.n_head_kv(il);
+            const int64_t n_kv_local = k_main_full->ne[2];
+            ggml_tensor * k_main_flat = ggml_reshape_4d(ctx0, k_main_full,
+                                                       DK_head * n_head_kv,
+                                                       n_kv_local, 1, 1);
+            // Cast to F32 first (turbo_kv_4b dequant), so get_rows on a
+            // standard float type is what runs.
+            k_main_flat = ggml_cast(ctx0, k_main_flat, GGML_TYPE_F32);
+            ggml_tensor * k_lin = ggml_get_rows(ctx0, k_main_flat,
+                                                inp->self_v_window_idxs);
+            k_window = ggml_reshape_4d(ctx0, k_lin, DK_head, n_head_kv,
+                                       (int64_t) mctx_cur->get_residual_window(), 1);
+        } else {
+            k_window = mctx_cur->get_k_window(ctx0, il, inp->self_window_reorder);
+        }
         v_window = mctx_cur->get_v_window(ctx0, il, inp->self_v_window_idxs);
 
         // Pre-RoPE overlay: apply on-the-fly RoPE to the position-ordered
         // overlay slice using the parallel window-position tensor.
         // get_k_window returns shape [n_embd_head_k, n_head_kv, rw, 1],
         // matching ggml_rope_multi's expected [head_dim, head, n_tokens, batch].
-        // (Currently dead code — gated off above. Kept compiled so the
-        // infrastructure lands and the gate can be flipped in one commit
-        // once the PPL regression is understood.)
         if (k_window && inp->self_k_pos && inp->self_window_k_pos) {
-            k_window = ggml_cast(ctx0, k_window, GGML_TYPE_F32);
+            if (k_window->type != GGML_TYPE_F32) {
+                k_window = ggml_cast(ctx0, k_window, GGML_TYPE_F32);
+            }
 
             int sections[4];
             std::copy(hparams.rope_sections.begin(), hparams.rope_sections.end(), sections);
