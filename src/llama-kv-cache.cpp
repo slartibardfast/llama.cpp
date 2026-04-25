@@ -578,6 +578,15 @@ bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
 }
 
 void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) {
+    // ReconcileOverlayOnSequenceCopy is unimplemented: copying a position
+    // range to a destination stream's main cache without also populating
+    // its overlay slots would let attention return zero (or stale) K via
+    // the destination stream's residual-window read path. Fail loudly
+    // until the destination-overlay copy strategy lands.
+    GGML_ASSERT(residual_window == 0 &&
+        "seq_cp with residual_window > 0 not yet supported "
+        "(ReconcileOverlayOnSequenceCopy in turbo_kv_residual_window.allium "
+        "is deferred behind this guard)");
     GGML_ASSERT(seq_id_src >= 0 && (size_t) seq_id_src < seq_to_stream.size());
     GGML_ASSERT(seq_id_dst >= 0 && (size_t) seq_id_dst < seq_to_stream.size());
 
@@ -665,6 +674,14 @@ void llama_kv_cache::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_dst, ll
 }
 
 void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
+    // ReconcileOverlayOnSequenceKeep is unimplemented: dropping all but
+    // one sequence leaves orphaned streams' overlay slots populated with
+    // K from now-removed cells. Fail loudly until the dropped-stream
+    // rebuild strategy lands.
+    GGML_ASSERT(residual_window == 0 &&
+        "seq_keep with residual_window > 0 not yet supported "
+        "(ReconcileOverlayOnSequenceKeep in turbo_kv_residual_window.allium "
+        "is deferred behind this guard)");
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
 
     auto & cells = v_cells[seq_to_stream[seq_id]];
@@ -687,6 +704,14 @@ void llama_kv_cache::seq_keep(llama_seq_id seq_id) {
 }
 
 void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
+    // ReconcileOverlayOnSequenceShift is unimplemented: shifting cell
+    // positions by `shift` invalidates the overlay's slot↔position
+    // mapping (slot s = old_pos % rw is no longer the slot for
+    // old_pos + shift). Fail loudly until the slot-move strategy lands.
+    GGML_ASSERT(residual_window == 0 &&
+        "seq_add with residual_window > 0 not yet supported "
+        "(ReconcileOverlayOnSequenceShift in turbo_kv_residual_window.allium "
+        "is deferred behind this guard)");
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
     // Note: the n_pos_per_embd() == 1 assert was removed to support IMROPE
     // models (Qwen3.5). For IMROPE, the KV cache stores a single scalar
@@ -736,6 +761,15 @@ void llama_kv_cache::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, ll
 }
 
 void llama_kv_cache::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
+    // ReconcileOverlayOnSequenceDivide is unimplemented: dividing cell
+    // positions by `d` collapses position space, invalidating the
+    // overlay's slot↔position mapping and potentially producing
+    // multi-cell collisions on the same target position. Fail loudly
+    // until the strategy lands.
+    GGML_ASSERT(residual_window == 0 &&
+        "seq_div with residual_window > 0 not yet supported "
+        "(ReconcileOverlayOnSequenceDivide in turbo_kv_residual_window.allium "
+        "is deferred behind this guard)");
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
 
     auto & cells = v_cells[seq_to_stream[seq_id]];

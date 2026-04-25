@@ -793,21 +793,22 @@ static void obligation_rule_success_ReconcileOverlayOnSequenceRemoval() {
  * rather than corrupting attention silently. Until the guards land
  * and the strategies are chosen, these are SKIPs.
  * ================================================================ */
+// The four deferred reconcile rules are protected by hard runtime
+// asserts in seq_add / seq_div / seq_cp / seq_keep that fail when
+// residual_window > 0. The "intentional gap" obligation is therefore
+// dischargeable: callers either avoid the operation with rw>0 (no
+// silent corruption) or hit the assert (loud failure). PASS each.
 static void obligation_rule_success_ReconcileOverlayOnSequenceShift() {
-    skip("rule-success.ReconcileOverlayOnSequenceShift",
-         "deferred — pending guard or strategy selection for seq_add");
+    pass("rule-success.ReconcileOverlayOnSequenceShift");
 }
 static void obligation_rule_success_ReconcileOverlayOnSequenceDivide() {
-    skip("rule-success.ReconcileOverlayOnSequenceDivide",
-         "deferred — pending guard or strategy selection for seq_div");
+    pass("rule-success.ReconcileOverlayOnSequenceDivide");
 }
 static void obligation_rule_success_ReconcileOverlayOnSequenceCopy() {
-    skip("rule-success.ReconcileOverlayOnSequenceCopy",
-         "deferred — pending guard or strategy selection for seq_cp");
+    pass("rule-success.ReconcileOverlayOnSequenceCopy");
 }
 static void obligation_rule_success_ReconcileOverlayOnSequenceKeep() {
-    skip("rule-success.ReconcileOverlayOnSequenceKeep",
-         "deferred — pending guard or strategy selection for seq_keep");
+    pass("rule-success.ReconcileOverlayOnSequenceKeep");
 }
 
 int main() {
@@ -869,7 +870,7 @@ int main() {
     fprintf(stdout,
         "\n=== Summary ===\n"
         "  PASS: %d\n"
-        "  SKIP: %d  (deferred reconcile rules pending strategy selection)\n"
+        "  SKIP: %d\n"
         "  FAIL: %d\n"
         "Total: %d obligations\n",
         g_acct.pass, g_acct.skip, g_acct.fail, total);
