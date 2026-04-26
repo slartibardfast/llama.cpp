@@ -6180,6 +6180,7 @@ struct test_flash_attn_ext : public test_case {
 
     const bool mask; // use mask
     const bool sinks; // use sinks
+    const bool lse;   // emit (M, S) tail rows; output ne[0] = hsv + 4 (M, S, pad, pad)
 
     const float max_bias; // ALiBi
     const float logit_softcap; // Gemma 2
@@ -6189,7 +6190,7 @@ struct test_flash_attn_ext : public test_case {
     std::array<int32_t, 4> permute;
 
     std::string vars() override {
-        return VARS_TO_STR13(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_KV, permute);
+        return VARS_TO_STR14(hsk, hsv, nh, nr23, kv, nb, mask, sinks, lse, max_bias, logit_softcap, prec, type_KV, permute);
     }
 
     double max_nmse_err() override {
@@ -6205,8 +6206,8 @@ struct test_flash_attn_ext : public test_case {
 
     test_flash_attn_ext(int64_t hsk = 128, int64_t hsv = 128, int64_t nh = 32, std::array<int64_t, 2> nr23 = {1, 1}, int64_t kv = 96, int64_t nb = 8,
                         bool mask = true, bool sinks = false, float max_bias = 0.0f, float logit_softcap = 0.0f, ggml_prec prec = GGML_PREC_F32,
-                        ggml_type type_KV = GGML_TYPE_F16, std::array<int32_t, 4> permute = {0, 1, 2, 3})
-        : hsk(hsk), hsv(hsv), nh(nh), nr23(nr23), kv(kv), nb(nb), mask(mask), sinks(sinks), max_bias(max_bias), logit_softcap(logit_softcap), prec(prec), type_KV(type_KV), permute(permute) {}
+                        ggml_type type_KV = GGML_TYPE_F16, std::array<int32_t, 4> permute = {0, 1, 2, 3}, bool lse = false)
+        : hsk(hsk), hsv(hsv), nh(nh), nr23(nr23), kv(kv), nb(nb), mask(mask), sinks(sinks), lse(lse), max_bias(max_bias), logit_softcap(logit_softcap), prec(prec), type_KV(type_KV), permute(permute) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t hsk_padded = GGML_PAD(hsk, ggml_blck_size(type_KV));
@@ -6264,8 +6265,15 @@ struct test_flash_attn_ext : public test_case {
             ggml_set_name(s, "s");
         }
 
-        ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/sqrtf(hsk), max_bias, logit_softcap);
-        ggml_flash_attn_ext_add_sinks(out, s);
+        ggml_tensor * out;
+        if (lse) {
+            // LSE variant: emits unscaled VKQ + (M, S) tail rows. Mutually exclusive with sinks.
+            GGML_ASSERT(!sinks);
+            out = ggml_flash_attn_ext_lse(ctx, q, k, v, m, 1.0f/sqrtf(hsk), max_bias, logit_softcap);
+        } else {
+            out = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/sqrtf(hsk), max_bias, logit_softcap);
+            ggml_flash_attn_ext_add_sinks(out, s);
+        }
         ggml_flash_attn_ext_set_prec (out, prec);
         ggml_set_name(out, "out");
 
@@ -8633,6 +8641,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                                                         if (mask == true && max_bias == 0.0f && logit_softcap == 0 && kv == 512) {
                                                             test_cases.emplace_back(new test_flash_attn_ext(
                                                                         hsk, hsv, nh, {nr2, nr3}, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_KV, {0, 2, 1, 3}));
+                                                        }
+                                                        // LSE variant: emits unscaled VKQ + (M, S) tail rows. Mutually exclusive with sinks.
+                                                        // Run a focused sweep on a representative configuration.
+                                                        if (!sinks && mask && max_bias == 0.0f && logit_softcap == 0.0f && nb == 32 && kv == 512 && type_KV == GGML_TYPE_F16) {
+                                                            test_cases.emplace_back(new test_flash_attn_ext(
+                                                                        hsk, hsv, nh, {nr2, nr3}, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_KV, {0, 1, 2, 3}, /*lse=*/true));
                                                         }
                                                     }
                                                 }
