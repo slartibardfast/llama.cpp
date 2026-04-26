@@ -52,7 +52,7 @@
 
 static void print_usage(const char * argv0) {
     fprintf(stderr,
-        "usage: %s <model.gguf> [--rw N] [--ctx N] [--type-k NAME] [--verbose]\n",
+        "usage: %s <model.gguf> [--rw N] [--ctx N] [--type-k NAME] [--ngl N] [--verbose]\n",
         argv0);
 }
 
@@ -81,6 +81,7 @@ int main(int argc, char ** argv) {
     bool verbose = false;
     int seq_rm_then_peek_p_min = -1;
     int seq_rm_then_peek_p_max = -1;
+    int n_gpu_layers = 0; /* default CPU; --ngl pushes to active GPU backend */
 
     for (int i = 2; i < argc; ++i) {
         const char * a = argv[i];
@@ -124,6 +125,10 @@ int main(int argc, char ** argv) {
                 fprintf(stderr, "--seq-rm-then-peek expects 0 <= p_min <= p_max\n");
                 return 1;
             }
+        } else if (strcmp(a, "--ngl") == 0 && i + 1 < argc) {
+            int v = atoi(argv[++i]);
+            if (v < 0) { fprintf(stderr, "--ngl must be >= 0\n"); return 1; }
+            n_gpu_layers = v;
         } else if (strcmp(a, "--verbose") == 0) {
             verbose = true;
         } else {
@@ -145,7 +150,7 @@ int main(int argc, char ** argv) {
     llama_backend_init();
 
     llama_model_params mparams = llama_model_default_params();
-    mparams.n_gpu_layers = 0; /* pure CPU — portable across hosts */
+    mparams.n_gpu_layers = n_gpu_layers; /* default 0 = pure CPU; --ngl probes a GPU backend */
 
     llama_model * model = llama_model_load_from_file(model_path, mparams);
     if (!model) {
