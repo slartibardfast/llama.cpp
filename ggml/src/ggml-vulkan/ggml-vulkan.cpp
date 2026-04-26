@@ -9276,7 +9276,15 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     uint32_t N = neq1;
     const uint32_t KV = nek1;
 
-    GGML_ASSERT(ne0 == HSV);
+    // LSE mode (op_params[4]==1) widens dst to HSV+2 rows: rows [0..HSV) hold
+    // unscaled VKQ (numerator), row HSV holds the running max M, row HSV+1
+    // holds the running denominator S. Standard FA dst is HSV. The supports_op
+    // gate still refuses LSE-flagged FA on Vulkan until the shader-level math
+    // lands (substeps 6.3-6.5); this assertion just makes the dispatcher itself
+    // legal-shape-aware so the math substeps can be tested without tripping a
+    // shape mismatch here.
+    const bool lse_mode = (ggml_get_op_params_i32(dst, 4) == 1);
+    GGML_ASSERT(ne0 == (lse_mode ? (int64_t)(HSV + 2) : (int64_t)HSV));
     GGML_ASSERT(ne2 == N);
 
     // input tensor rows must be contiguous
