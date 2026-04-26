@@ -1646,8 +1646,9 @@ struct vk_op_flash_attn_split_k_reduce_push_constants {
     uint32_t k_num;
     uint32_t sinks;
     // LSE mode + the actual dst row stride. When lse_mode == 0, ne0_dst == D
-    // (legacy stride). When lse_mode == 1, ne0_dst == D + 2 because dst gains
-    // M and S rows.
+    // (legacy stride). When lse_mode == 1, ne0_dst == D + 4: dst gains M and
+    // S at cols D and D+1 plus 2 pad cols so the row stride stays
+    // vec4-aligned for GPU writes.
     uint32_t lse_mode;
     uint32_t ne0_dst;
 };
@@ -9286,11 +9287,13 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     uint32_t N = neq1;
     const uint32_t KV = nek1;
 
-    // LSE mode (op_params[4]==1) widens dst to HSV+2 rows: rows [0..HSV) hold
+    // LSE mode (op_params[4]==1) widens dst to HSV+4 rows: rows [0..HSV) hold
     // unscaled VKQ (numerator), row HSV holds the running max M, row HSV+1
-    // holds the running denominator S. Standard FA dst is HSV.
+    // holds the running denominator S, rows HSV+2 and HSV+3 are pad so the
+    // row stride is a multiple of 4 floats (vec4-aligned). Standard FA dst
+    // is HSV.
     const bool lse_mode = (ggml_get_op_params_i32(dst, 4) == 1);
-    GGML_ASSERT(ne0 == (lse_mode ? (int64_t)(HSV + 2) : (int64_t)HSV));
+    GGML_ASSERT(ne0 == (lse_mode ? (int64_t)(HSV + 4) : (int64_t)HSV));
     GGML_ASSERT(ne2 == N);
 
     // input tensor rows must be contiguous
@@ -15886,14 +15889,15 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
             }
         case GGML_OP_FLASH_ATTN_EXT:
             {
-                // LSE mode (op_params[4]==1) requires the kernel to emit (M, S)
-                // into 2 trailing rows of the output. Not implemented in Vulkan
-                // FA shaders. Refuse so the scheduler routes to CPU. The
-                // previous behaviour was a silent fallback to single-pass
-                // shape; that hid the gap on Vulkan but was never a correct
-                // LSE path.
+                // LSE mode (op_params[4]==1) requires the kernel to emit
+                // (M, S) at cols [HSV] and [HSV+1] of an HSV+4-wide dst.
+                // Implemented in flash_attn.comp + flash_attn_split_k_reduce.
+                // Coopmat variants are not yet ported, so refuse LSE on
+                // coopmat-capable devices to keep scheduler honest.
                 if (ggml_get_op_params_i32(op, 4) == 1) {
-                    return false;
+                    if (device->coopmat2 || device->coopmat1_fa_support) {
+                        return false;
+                    }
                 }
                 bool coopmat2 = device->coopmat2;
                 uint32_t HSK = op->src[1]->ne[0];

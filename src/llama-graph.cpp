@@ -2133,10 +2133,12 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 }
 
 // Online-softmax merge of two ggml_flash_attn_ext_lse outputs. Each
-// input has shape [DV+2, H, N, ne3]: rows [0..DV) hold unscaled VKQ,
+// input has shape [DV+4, H, N, ne3]: rows [0..DV) hold unscaled VKQ,
 // row DV holds M (max exponent), row DV+1 holds S (sum of
-// exponentials). Returns [DV, H, N, ne3] equal to a single FA over
-// the union of the two input mask supports.
+// exponentials), rows DV+2 and DV+3 are pad so the row stride is a
+// multiple of 4 floats (vec4-aligned for GPU kernels). Returns
+// [DV, H, N, ne3] equal to a single FA over the union of the two
+// input mask supports.
 //
 // Covered numerically by tests/test-flash-attn-lse-merge.cpp including
 // the empty-pass handover corner (M clamped to -1e30 before the
@@ -2148,9 +2150,9 @@ static ggml_tensor * build_fa_lse_merge(
     GGML_ASSERT(lse_a->type == GGML_TYPE_F32);
     GGML_ASSERT(lse_b->type == GGML_TYPE_F32);
     GGML_ASSERT(lse_a->ne[0] == lse_b->ne[0]);
-    GGML_ASSERT(lse_a->ne[0] >= 3);
+    GGML_ASSERT(lse_a->ne[0] >= 5);
 
-    const int64_t DV  = lse_a->ne[0] - 2;
+    const int64_t DV  = lse_a->ne[0] - 4;
     const int64_t H   = lse_a->ne[1];
     const int64_t N   = lse_a->ne[2];
     const int64_t ne3 = lse_a->ne[3];

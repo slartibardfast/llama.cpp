@@ -5493,8 +5493,10 @@ struct ggml_tensor * ggml_flash_attn_ext_lse(
         GGML_ASSERT(mask);
     }
 
-    // permute(0, 2, 1, 3); extend d_v by 2 for the (M, S) tail rows.
-    int64_t ne[4] = { v->ne[0] + 2, q->ne[2], q->ne[1], q->ne[3] };
+    // permute(0, 2, 1, 3); extend d_v by 4 — M and S occupy cols [DV] and
+    // [DV+1]; cols [DV+2] and [DV+3] are pad so each row stride is a
+    // multiple of 4 floats (vec4-aligned for GPU kernels).
+    int64_t ne[4] = { v->ne[0] + 4, q->ne[2], q->ne[1], q->ne[3] };
     struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
 
     float params[] = { scale, max_bias, logit_softcap };

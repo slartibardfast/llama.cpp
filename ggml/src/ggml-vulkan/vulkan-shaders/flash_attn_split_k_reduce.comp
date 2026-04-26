@@ -131,11 +131,16 @@ void main() {
         data_d[(i3 * p.ne2 + i2) * p.ne1 * p.ne0_dst + p.ne0_dst * n + d] = O;
     }
 
-    // LSE-only writeback of M (row D) and S (row D+1).
-    // Guarded so exactly one invocation per row writes the auxiliaries.
+    // LSE-only writeback of M (col D), S (col D+1), and pad zeros at cols
+    // D+2 and D+3 (the layout pads each row to a multiple of 4 floats so
+    // GPU kernels can use vec4 writes; pad cols must hold a defined value
+    // so test-backend-ops byte-exact comparison succeeds). Guarded so
+    // exactly one invocation per row writes the auxiliaries.
     if (p.lse_mode != 0 && gl_WorkGroupID.y == 0 && tid == 0) {
         uint base = (i3 * p.ne2 + i2) * p.ne1 * p.ne0_dst + p.ne0_dst * n;
         data_d[base + D + 0] = effective_M;
         data_d[base + D + 1] = L_pre_invert;
+        data_d[base + D + 2] = 0.0;
+        data_d[base + D + 3] = 0.0;
     }
 }

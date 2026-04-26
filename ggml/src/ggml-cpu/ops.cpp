@@ -8219,13 +8219,13 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     const int64_t DV = nev0;
     const int64_t N  = neq1;
 
-    // LSE mode (op_params slot 4): output is [DV+2, n_head, N, ne3] where
-    // the extra two rows per (head, query) hold (M, S) — the unscaled
-    // online-softmax max and sum. When set, we skip the final VKQ/S
-    // normalise and write raw state instead.
+    // LSE mode (op_params slot 4): output is [DV+4, n_head, N, ne3]. M and
+    // S occupy cols [DV] and [DV+1]; cols [DV+2] and [DV+3] are pad so the
+    // row stride is a multiple of 4 floats (vec4-aligned for GPU kernels).
+    // When set, we skip the final VKQ/S normalise and write raw state.
     const bool lse_mode = (ggml_get_op_params_i32(dst, 4) == 1);
     if (lse_mode) {
-        GGML_ASSERT(ne0 == DV + 2);
+        GGML_ASSERT(ne0 == DV + 4);
     } else {
         GGML_ASSERT(ne0 == DV);
     }
@@ -8583,10 +8583,11 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
             partial[1] = S;
             memcpy(partial + 2, VKQ32, DV * sizeof(float));
         } else if (lse_mode) {
-            // LSE mode: write unscaled [VKQ, M, S] directly to dst.
-            // Row layout: VKQ at [0..DV), M at [DV], S at [DV+1].
-            // Caller merges two FA outputs via online softmax and
-            // normalises by S after the merge.
+            // LSE mode: write unscaled [VKQ, M, S, pad, pad] directly to dst.
+            // Row layout: VKQ at [0..DV), M at [DV], S at [DV+1], pad at
+            // [DV+2..DV+4). Pad keeps the row stride a multiple of 4 floats
+            // (vec4-aligned for GPU kernels). Caller merges two FA outputs
+            // via online softmax and normalises by S after the merge.
             const int i1 = iq1;
             const int i2 = iq2;
             const int i3 = iq3;
@@ -8597,6 +8598,8 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
             memcpy(dst_f32, VKQ32, DV * sizeof(float));
             dst_f32[DV]     = M;
             dst_f32[DV + 1] = S;
+            dst_f32[DV + 2] = 0.0f;
+            dst_f32[DV + 3] = 0.0f;
         } else {
             // V /= S
             const float S_inv = S == 0.0f ? 0.0f : 1.0f/S;
@@ -8994,15 +8997,16 @@ static void ggml_compute_forward_flash_attn_ext_f16(
     const int64_t DV = nev0;
     const int64_t N  = neq1;
 
-    // LSE mode: output is [DV+2, n_head, N, ne3]; caller gets raw (M, S)
-    // per query head for two-pass merge. Forces the simple one_chunk path
-    // on thread 0 — the chunked and tiled paths both write size-DV output
-    // and/or use an internal partials reduction that's incompatible with
-    // the extended layout.
+    // LSE mode: output is [DV+4, n_head, N, ne3]; caller gets raw (M, S)
+    // per query head for two-pass merge (cols [DV] and [DV+1]; cols [DV+2]
+    // and [DV+3] are pad for vec4 alignment). Forces the simple one_chunk
+    // path on thread 0 — the chunked and tiled paths both write size-DV
+    // output and/or use an internal partials reduction that's incompatible
+    // with the extended layout.
     const bool lse_mode = (ggml_get_op_params_i32(dst, 4) == 1);
 
     if (lse_mode) {
-        GGML_ASSERT(ne0 == DV + 2);
+        GGML_ASSERT(ne0 == DV + 4);
     } else {
         GGML_ASSERT(ne0 == DV);
     }

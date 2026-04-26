@@ -42,7 +42,8 @@
 static ggml_fp16_t f32_to_f16(float x) { return ggml_fp32_to_fp16(x); }
 
 // Build the merge graph. `lse_a` and `lse_b` must both have shape
-// [DV+2, H, N, ne3]. Returns a [DV, H, N, ne3] tensor that equals the
+// [DV+4, H, N, ne3] — VKQ at [0..DV), M at DV, S at DV+1, pad at
+// DV+2..DV+4. Returns a [DV, H, N, ne3] tensor that equals the
 // normalised FA output over the union of the two input key ranges.
 //
 // Implementation leans on existing ggml ops only: add, sub, scale, abs,
@@ -57,9 +58,9 @@ static ggml_tensor * build_fa_lse_merge(
     GGML_ASSERT(lse_a->ne[1] == lse_b->ne[1]);
     GGML_ASSERT(lse_a->ne[2] == lse_b->ne[2]);
     GGML_ASSERT(lse_a->ne[3] == lse_b->ne[3]);
-    GGML_ASSERT(lse_a->ne[0] >= 3);
+    GGML_ASSERT(lse_a->ne[0] >= 5);
 
-    const int64_t DV  = lse_a->ne[0] - 2;
+    const int64_t DV  = lse_a->ne[0] - 4;
     const int64_t H   = lse_a->ne[1];
     const int64_t N   = lse_a->ne[2];
     const int64_t ne3 = lse_a->ne[3];
