@@ -277,9 +277,6 @@ target_link_libraries(test-turbo-4b-roundtrip PRIVATE ggml-base)
 add_executable(test-turbo-4b-codebook test-turbo-4b-codebook.cpp)
 target_link_libraries(test-turbo-4b-codebook PRIVATE ggml-base ggml)
 
-add_executable(test-turbo-4b-e8p test-turbo-4b-e8p.cpp)
-target_link_libraries(test-turbo-4b-e8p PRIVATE ggml-base)
-
 # TurboQuant PBT: property-based tests from turbo-kv-4b.allium and
 # mul_mat_cpu.allium. The SIMDEquivalence property from mul_mat_cpu
 # drives a minimal CPU-backend mul_mat graph, so we link ggml-cpu in
