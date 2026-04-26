@@ -3004,10 +3004,15 @@ llama_context_params llama_context_default_params() {
         /*.type_k                      =*/ GGML_TYPE_COUNT, // auto: inherit native float
         /*.type_k_static               =*/ GGML_TYPE_COUNT,
         /*.type_v                      =*/ GGML_TYPE_COUNT, // auto: inherit native float
-        /*.residual_window             =*/ 128, // fp16 rolling-tail default for
-                                                // TURBO_KV caches. Ignored when
-                                                // type_k/type_v is not a
-                                                // TURBO_KV_* type.
+        /*.residual_window             =*/ 0,   // disabled by default. Pass
+                                                // --cache-residual-window N to enable.
+                                                // Note: residual_window > 0 is currently
+                                                // verified only on Qwen 3.5 0.8B (dense).
+                                                // Hybrid MoE archs (Qwen 3.5/3.6 35B-A3B
+                                                // with delta-net + attn_output_gate) need
+                                                // a full FA_LSE port for HIP/Vulkan; until
+                                                // then those backends refuse the LSE op so
+                                                // the LSE FA falls back to CPU.
         /*.residual_window_type_k      =*/ GGML_TYPE_COUNT, // auto: inherit from
                                                 // model's native K projection
                                                 // dtype at context init.
