@@ -577,6 +577,19 @@ void main() {
         return;
     }
 
+    // LSE mode widens dst to HSV+4 floats per row: VKQ at [0..HSV), M at HSV,
+    // S at HSV+1, pad at HSV+2..HSV+4. Pad keeps the row stride a multiple
+    // of 4 floats so vec4 writes work in both modes. Mf is not updated by
+    // sink correction below, so the LSE epilogue tracks effective_Mf
+    // separately to write max(Mf, sink) at col HSV.
+    const bool lse_mode = (p.mask_n_head_log2 & LSE_ENABLE_BIT) != 0;
+    const uint32_t ne0_dst = HSV + (lse_mode ? 4u : 0u);
+
+    float effective_Mf[rows_per_thread];
+    [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
+        effective_Mf[r] = Mf[r];
+    }
+
     if ((p.mask_n_head_log2 & SINK_ENABLE_BIT) != 0) {
         [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
             float sink = perElemOpGetSink(tile_row(r), 0u, ACC_TYPE(0), iq2);
@@ -586,6 +599,7 @@ void main() {
 
             if (sink > Mf[r]) {
                 ms = exp(Mf[r] - sink);
+                effective_Mf[r] = sink;
 
                 [[unroll]] for (uint32_t d0 = 0; d0 < HSV / 4; d0 += threads_per_rowgroup) {
                     const uint d_local = d0 / threads_per_rowgroup;
@@ -599,22 +613,24 @@ void main() {
         }
     }
 
-    float Lfrcp[rows_per_thread];
-    [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
-        Lfrcp[r] = (Lf[r] == 0.0) ? 0.0 : (1.0 / Lf[r]);
-    }
-
-    [[unroll]] for (uint32_t d0 = 0; d0 < HSV / 4; d0 += threads_per_rowgroup) {
-        const uint d_local = d0 / threads_per_rowgroup;
+    if (!lse_mode) {
+        float Lfrcp[rows_per_thread];
         [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
-            Of[r][d_local] *= float16_t(Lfrcp[r]);
+            Lfrcp[r] = (Lf[r] == 0.0) ? 0.0 : (1.0 / Lf[r]);
+        }
+
+        [[unroll]] for (uint32_t d0 = 0; d0 < HSV / 4; d0 += threads_per_rowgroup) {
+            const uint d_local = d0 / threads_per_rowgroup;
+            [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
+                Of[r][d_local] *= float16_t(Lfrcp[r]);
 #if defined(FLOAT_TYPE_MAX)
-            Of[r][d_local] = clamp(Of[r][d_local], -FLOAT_TYPE_MAX, FLOAT_TYPE_MAX);
+                Of[r][d_local] = clamp(Of[r][d_local], -FLOAT_TYPE_MAX, FLOAT_TYPE_MAX);
 #endif
+            }
         }
     }
 
-    uint32_t o_offset = (gqa_iq1*p.ne1*HSV + iq3*p.ne2*p.ne1*HSV) / 4;
+    uint32_t o_offset = (gqa_iq1*p.ne1*ne0_dst + iq3*p.ne2*p.ne1*ne0_dst) / 4;
 
     if (p.gqa_ratio > 1) {
         [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
@@ -623,7 +639,17 @@ void main() {
                     const uint d = d0 + col_tid;
                     if (d >= HSV / 4) break;
                     const uint d_local = d0 / threads_per_rowgroup;
-                    gqaStore(tile_row(r), d, Of[r][d_local], o_offset, iq2, N, HSV / 4);
+                    gqaStore(tile_row(r), d, Of[r][d_local], o_offset, iq2, N, ne0_dst / 4);
+                }
+            }
+        }
+        // LSE-only: trailing vec4 of each row holds (M, S, 0, 0) — emit
+        // from a single guarded invocation per (head, query) row.
+        if (lse_mode && col_tid == 0) {
+            [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
+                if (tile_row(r) < N) {
+                    const uint32_t lse_v4 = o_offset + (iq2 + tile_row(r)) * (ne0_dst / 4) + (HSV / 4);
+                    data_ov4[lse_v4] = D_TYPEV4(effective_Mf[r], Lf[r], 0.0f, 0.0f);
                 }
             }
         }
@@ -634,7 +660,16 @@ void main() {
                     const uint d = d0 + col_tid;
                     if (d >= HSV / 4) break;
                     const uint d_local = d0 / threads_per_rowgroup;
-                    data_ov4[o_offset + (iq2 * HSV + (i * Br + tile_row(r)) * p.ne1 * HSV) / 4 + d] = D_TYPEV4(Of[r][d_local]);
+                    data_ov4[o_offset + (iq2 * ne0_dst + (i * Br + tile_row(r)) * p.ne1 * ne0_dst) / 4 + d] = D_TYPEV4(Of[r][d_local]);
+                }
+            }
+        }
+        if (lse_mode && col_tid == 0) {
+            [[unroll]] for (uint32_t r = 0; r < rows_per_thread; ++r) {
+                const uint global_row = i * Br + tile_row(r);
+                if (global_row < N) {
+                    const uint32_t lse_v4 = o_offset + (iq2 * ne0_dst + global_row * p.ne1 * ne0_dst) / 4 + (HSV / 4);
+                    data_ov4[lse_v4] = D_TYPEV4(effective_Mf[r], Lf[r], 0.0f, 0.0f);
                 }
             }
         }

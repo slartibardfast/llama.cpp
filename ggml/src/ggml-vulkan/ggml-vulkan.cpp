@@ -15891,11 +15891,12 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
             {
                 // LSE mode (op_params[4]==1) requires the kernel to emit
                 // (M, S) at cols [HSV] and [HSV+1] of an HSV+4-wide dst.
-                // Implemented in flash_attn.comp + flash_attn_split_k_reduce.
-                // Coopmat variants are not yet ported, so refuse LSE on
-                // coopmat-capable devices to keep scheduler honest.
+                // Implemented in flash_attn.comp, flash_attn_cm1.comp, and
+                // flash_attn_split_k_reduce.comp. The cm2 variant is not
+                // yet ported, so refuse LSE on coopmat2-capable devices to
+                // keep the scheduler honest.
                 if (ggml_get_op_params_i32(op, 4) == 1) {
-                    if (device->coopmat2 || device->coopmat1_fa_support) {
+                    if (device->coopmat2) {
                         return false;
                     }
                 }
