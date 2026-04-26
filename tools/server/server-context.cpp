@@ -177,25 +177,6 @@ struct server_slot {
 
     llama_token sampled; // in speculative mode, this is the last accepted token
 
-    // Inline MTP (Multi-Token Prediction) state.
-    // Instead of using the speculative framework (which has M-RoPE and SSM
-    // rollback issues), we propose one draft token from MTP logits and verify
-    // it in the next decode step. No seq_rm or rollback needed.
-    llama_token  mtp_draft_token = -1;  // proposed draft token (-1 = none)
-    int          mtp_i_batch     = -1;  // batch index of the draft token
-    bool         mtp_pending     = false; // true when draft is in the batch awaiting verification
-    bool         mtp_cooldown    = false; // skip MTP proposal for one iteration after draft processing
-
-    // Plan A 1-phase batched spec decode state (gated by LLAMA_MTP_PLAN_A=1).
-    // When active, the producer fills spec_drafts with up to k drafts from
-    // chained-rollout MTP output, the batching loop snapshots the recurrent
-    // state and emits [T_prev, D1..Dk] into the main batch, and the verifier
-    // samples verified[0..k], finds the first mismatch, commits accepted
-    // tokens + correction/bonus, and restores the snapshot on partial reject.
-    llama_tokens          spec_drafts;          // proposed drafts for this iter
-    std::vector<uint8_t>  spec_snap;            // recurrent-only state snapshot
-    int                   spec_n_past_before = 0; // seq position before the spec batch
-
     // stats
     size_t n_sent_text = 0; // number of sent text character
 
@@ -224,13 +205,6 @@ struct server_slot {
         stopping_word  = "";
         n_sent_text    = 0;
 
-        mtp_draft_token = -1;
-        mtp_i_batch     = -1;
-        mtp_pending     = false;
-        mtp_cooldown    = false;
-        spec_drafts.clear();
-        spec_snap.clear();
-        spec_n_past_before = 0;
         if (can_speculate()) {
             spec_draft.clear();
             spec_i_batch.clear();
@@ -726,14 +700,6 @@ private:
 
     bool sleeping = false;
 
-    // Plan A 1-phase batched spec decode knobs. Gated by LLAMA_MTP_PLAN_A=1 so
-    // the existing inline 2-phase path remains the default until Plan A proves
-    // its throughput win on the byte-identical regression gate. plan_a_k_max
-    // is the upper bound on drafts per iteration (the actual draft count is
-    // min(k_max, n_drafts_available_from_mtp_rollout)).
-    bool plan_a_enabled = false;
-    int  plan_a_k_max   = 1;
-
     void destroy() {
         llama_init.reset();
 
@@ -938,29 +904,6 @@ private:
             } else if (n_mtp > 0) {
                 SRV_INF("model has %d MTP layer(s) but speculative context not compatible\n", n_mtp);
             }
-        }
-
-        // Plan A 1-phase batched spec decode opt-in.
-        //   LLAMA_MTP_PLAN_A=1   → activate 1-phase batched spec decode
-        //   LLAMA_MTP_PLAN_A_K=N → max drafts per iteration (defaults to the
-        //                         graph's n_draft_rollout or 3 if unset)
-        // NOTE: Plan A inline path uses master's spec_snap which depends on
-        // the master spec lifecycle. Upstream replaced spec_snap with
-        // server_prompt_checkpoint (spec_ckpt). Plan A is currently disabled
-        // in this merged tree pending a port to spec_ckpt; setting
-        // LLAMA_MTP_PLAN_A=1 will only set the flag without changing behavior.
-        if (const char * e = getenv("LLAMA_MTP_PLAN_A")) {
-            plan_a_enabled = (std::atoi(e) != 0);
-        }
-        if (plan_a_enabled) {
-            plan_a_k_max = 3;
-            if (const char * e = getenv("LLAMA_MTP_PLAN_A_K")) {
-                const int v = std::atoi(e);
-                if (v > 0) {
-                    plan_a_k_max = v;
-                }
-            }
-            SRV_INF("Plan A 1-phase spec decode ENABLED (placeholder; logic deferred), k_max=%d\n", plan_a_k_max);
         }
 
         // initialize slots
@@ -1416,42 +1359,6 @@ private:
 
         SLT_INF(slot, "processing task, is_child = %d\n", slot.task->is_child());
         return true;
-    }
-
-    // MTP draft producer: reads chained-rollout MTP logits from the target
-    // context's most recent decode and stores drafts on the slot for the
-    // next iteration's spec batch.
-    //
-    //   plan_a_enabled = false (legacy 2-phase):
-    //     stores a single scalar draft in slot.mtp_draft_token; the 2-phase
-    //     verifier below consumes it via common_sampler_sample equality.
-    //
-    //   plan_a_enabled = true (Plan A 1-phase):
-    //     stores up to plan_a_k_max drafts in slot.spec_drafts; the batching
-    //     loop snapshots state and emits [T_prev, D1..Dk] into the main batch,
-    //     and the 1-phase verifier below samples verified[0..k], finds the
-    //     first mismatch, commits the accepted prefix + correction or bonus,
-    //     and restores the snapshot on partial reject.
-    void try_set_mtp_draft(server_slot & slot) {
-        slot.mtp_pending     = false;
-        slot.mtp_draft_token = -1;
-        slot.mtp_i_batch     = -1;
-        slot.spec_drafts.clear();
-        slot.spec_snap.clear();
-
-        const int k_max = plan_a_enabled ? plan_a_k_max : 1;
-        llama_tokens drafts = common_mtp_read_drafts(ctx, k_max);
-        if (drafts.empty()) {
-            return;
-        }
-
-        if (plan_a_enabled) {
-            slot.spec_drafts = std::move(drafts);
-            slot.mtp_pending = true;
-        } else {
-            slot.mtp_draft_token = drafts.front();
-            slot.mtp_pending     = true;
-        }
     }
 
     bool process_token(completion_token_output & result, server_slot & slot) {
@@ -3073,12 +2980,6 @@ private:
 
                     continue;
                 }
-
-                // Producer: after the first post-prompt sample (and any subsequent
-                // sample that falls through the normal path), propose a draft from
-                // the fresh MTP logits so the next iteration enters the verifier
-                // block above instead of looping through normal sample again.
-                try_set_mtp_draft(slot);
             }
 
             // speculative decoding - main model sample and accept
