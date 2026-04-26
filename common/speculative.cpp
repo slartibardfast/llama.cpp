@@ -1175,10 +1175,10 @@ llama_tokens common_mtp_read_drafts(llama_context * ctx_tgt, int k_max) {
 
     // When the graph was built with chained rollout, the stacked tensor holds
     // drafts for multiple output positions interleaved iteration-major. At
-    // single-token generation (the Plan A path) there is exactly one output
-    // position, so rows 0..n-1 correspond directly to rollout iterations
-    // 0..n-1, i.e. predictions for positions P+2, P+3, ..., P+n+1 given the
-    // last committed token at P+1. Pick up to k_max consecutive rows from row 0.
+    // single-token generation there is exactly one output position, so rows
+    // 0..n-1 correspond directly to rollout iterations 0..n-1, i.e. predictions
+    // for positions P+2, P+3, ..., P+n+1 given the last committed token at
+    // P+1. Pick up to k_max consecutive rows from row 0.
     const auto * vocab = llama_model_get_vocab(llama_get_model(ctx_tgt));
 
     const int64_t k = std::min<int64_t>(mtp_n_drafts, (int64_t)k_max);
