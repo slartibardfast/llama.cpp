@@ -1122,8 +1122,13 @@ struct vk_flash_attn_push_constants {
     uint32_t gqa_ratio;
     uint32_t split_kv;
     uint32_t k_num;
+    // PHASE28 substep 6.2: LSE mode is packed into mask_n_head_log2 bit 25
+    // (next free bit after SINK_ENABLE_BIT at bit 24). The struct is already
+    // at the Vulkan-spec-guaranteed 128-byte push-constant ceiling, so a
+    // dedicated field would overflow on any spec-compliant device.
 };
 static_assert(sizeof(vk_flash_attn_push_constants) <= 128, "sizeof(vk_flash_attn_push_constants) must be <= 128");
+#define VK_FA_LSE_ENABLE_BIT (1u << 25)
 
 struct vk_op_push_constants {
     uint32_t KX;
@@ -1640,6 +1645,12 @@ struct vk_op_flash_attn_split_k_reduce_push_constants {
     uint32_t ne3;
     uint32_t k_num;
     uint32_t sinks;
+    // PHASE28 substep 6.2: LSE mode + the actual dst row stride.
+    // When lse_mode == 0, ne0_dst == D (legacy stride). When lse_mode == 1,
+    // ne0_dst == D + 2 because dst gains M and S rows. Plumbed but unused
+    // until the reduce shader learns the LSE branch (substep 6.3).
+    uint32_t lse_mode;
+    uint32_t ne0_dst;
 };
 
 struct vk_op_flash_attn_mask_opt_push_constants {
@@ -9487,6 +9498,10 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
     vk_subbuffer mask_opt_buf = use_mask_opt ? ggml_vk_subbuffer(ctx, ctx->prealloc_y, 0) : q_buf;
 
     uint32_t mask_n_head_log2 = ((sinks != nullptr) << 24) | n_head_log2;
+    // PHASE28 substep 6.2: pack LSE mode into bit 25 of mask_n_head_log2.
+    if (lse_mode) {
+        mask_n_head_log2 |= VK_FA_LSE_ENABLE_BIT;
+    }
 
     if (use_mask_opt)
     {
@@ -9544,7 +9559,7 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
                                     pc, { dispatch_x, workgroups_y, workgroups_z });
 
         ggml_vk_sync_buffers(ctx, subctx);
-        const vk_op_flash_attn_split_k_reduce_push_constants pc2 = { HSV, (uint32_t)ne1, (uint32_t)ne2, (uint32_t)ne3, split_k, (sinks != nullptr) };
+        const vk_op_flash_attn_split_k_reduce_push_constants pc2 = { HSV, (uint32_t)ne1, (uint32_t)ne2, (uint32_t)ne3, split_k, (sinks != nullptr), (uint32_t)(lse_mode ? 1 : 0), (uint32_t)ne0 };
         ggml_vk_dispatch_pipeline(ctx, subctx, ctx->device->pipeline_flash_attn_split_k_reduce,
                                     {split_k_buf, sinks_buf, dst_buf},
                                     pc2, { (uint32_t)ne1, HSV, (uint32_t)(ne2 * ne3) });

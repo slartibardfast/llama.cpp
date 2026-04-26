@@ -67,6 +67,8 @@ layout (push_constant) uniform parameter {
 } p;
 
 #define SINK_ENABLE_BIT (1<<24)
+// PHASE28 substep 6.2: LSE-mode flag bit packed into p.mask_n_head_log2.
+#define LSE_ENABLE_BIT (1<<25)
 #define N_LOG2_MASK 0xFFFF
 
 layout (binding = 4) readonly buffer S {float data_s[];};

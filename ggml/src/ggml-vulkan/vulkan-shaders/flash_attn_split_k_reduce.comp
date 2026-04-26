@@ -17,6 +17,9 @@ layout (push_constant) uniform parameter {
     uint ne3;
     uint k_num;
     uint sinks;
+    // PHASE28 substep 6.2: LSE mode + dst row stride (mirror of C++ struct).
+    uint lse_mode;
+    uint ne0_dst;
 } p;
 
 shared float tmpsh[BLOCK_SIZE];
