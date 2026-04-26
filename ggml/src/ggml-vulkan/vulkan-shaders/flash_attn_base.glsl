@@ -660,8 +660,10 @@ const float FATTN_KQ_MAX_OFFSET = 3.0f*0.6931f;
 
 // Store the output when doing grouped query attention.
 // Rows index by Q's dimension 2, and the first N rows are valid.
-void gqaStore(const in uint32_t r, const in uint32_t c, const in FLOAT_TYPEV4 elems, const in uint32_t o_offset, const in uint32_t iq2, const in uint32_t N)
+// ne0_v4 is the dst row stride in vec4 elements: HSV/4 in standard mode,
+// (HSV+2)/4 in LSE mode (caller derives from LSE_ENABLE_BIT bit-pack).
+void gqaStore(const in uint32_t r, const in uint32_t c, const in FLOAT_TYPEV4 elems, const in uint32_t o_offset, const in uint32_t iq2, const in uint32_t N, const in uint32_t ne0_v4)
 {
-    uint32_t offset = (iq2 + r) * HSV / 4 + c;
+    uint32_t offset = (iq2 + r) * ne0_v4 + c;
     data_ov4[o_offset + offset] = D_TYPEV4(elems);
 }
