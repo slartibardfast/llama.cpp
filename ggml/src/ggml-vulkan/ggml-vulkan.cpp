@@ -3119,9 +3119,16 @@ static vk_fa_tuning_params get_fa_tuning_params_coopmat2(const vk_device& device
     return result;
 }
 
-static vk_fa_tuning_params get_fa_tuning_params(const vk_device& device, uint32_t hsk, uint32_t hsv, uint32_t n_rows, uint32_t n_kv, ggml_type kv_type, bool f32acc) {
+static vk_fa_tuning_params get_fa_tuning_params(const vk_device& device, uint32_t hsk, uint32_t hsv, uint32_t n_rows, uint32_t n_kv, ggml_type kv_type, bool f32acc, bool lse_mode = false) {
     FaCodePath path = device->coopmat2 ? FA_COOPMAT2 :
                       device->coopmat1_fa_support ? FA_COOPMAT1 : FA_SCALAR;
+
+    // LSE writeback is implemented in the scalar and cm1 FA shaders but not
+    // cm2. On a cm2-capable device, route LSE-mode FA to cm1 if available,
+    // otherwise scalar.
+    if (lse_mode && path == FA_COOPMAT2) {
+        path = device->coopmat1_fa_support ? FA_COOPMAT1 : FA_SCALAR;
+    }
 
     if (path == FA_COOPMAT1 && device->architecture == vk_device_architecture::NVIDIA_TURING) {
         // Nvidia compiler bug, see https://github.com/ggml-org/llama.cpp/pull/19075#issuecomment-3820716090
@@ -9327,7 +9334,7 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
 
     // For scalar/coopmat1 FA, we can use the "large" size to accommodate qga.
     // For coopmat2 FA, we always use the small size (which is still pretty large for gqa).
-    vk_fa_tuning_params tuning_params = get_fa_tuning_params(ctx->device, HSK, HSV, 512, KV, k->type, f32acc);
+    vk_fa_tuning_params tuning_params = get_fa_tuning_params(ctx->device, HSK, HSV, 512, KV, k->type, f32acc, lse_mode);
     const uint32_t max_gqa = std::min(tuning_params.block_rows, 32u);
 
     if (N <= 8 && qk_ratio > 1 && qk_ratio <= max_gqa &&
@@ -9340,7 +9347,7 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
         workgroups_y /= gqa_ratio;
     }
 
-    tuning_params = get_fa_tuning_params(ctx->device, HSK, HSV, N, KV, k->type, f32acc);
+    tuning_params = get_fa_tuning_params(ctx->device, HSK, HSV, N, KV, k->type, f32acc, lse_mode);
 
     const uint32_t q_stride = (uint32_t)(nbq1 / ggml_type_size(q->type));
     uint32_t k_stride = (uint32_t)(nbk1 / ggml_type_size(k->type));
@@ -15889,17 +15896,12 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
             }
         case GGML_OP_FLASH_ATTN_EXT:
             {
-                // LSE mode (op_params[4]==1) requires the kernel to emit
-                // (M, S) at cols [HSV] and [HSV+1] of an HSV+4-wide dst.
-                // Implemented in flash_attn.comp, flash_attn_cm1.comp, and
-                // flash_attn_split_k_reduce.comp. The cm2 variant is not
-                // yet ported, so refuse LSE on coopmat2-capable devices to
-                // keep the scheduler honest.
-                if (ggml_get_op_params_i32(op, 4) == 1) {
-                    if (device->coopmat2) {
-                        return false;
-                    }
-                }
+                // LSE mode (op_params[4]==1) emits (M, S, 0, 0) at cols
+                // [HSV..HSV+3] of an HSV+4-wide dst. Implemented in
+                // flash_attn.comp, flash_attn_cm1.comp, and
+                // flash_attn_split_k_reduce.comp. cm2 has no LSE branch,
+                // so the FA dispatcher routes LSE-mode FA to cm1 (or
+                // scalar) on cm2-capable devices.
                 bool coopmat2 = device->coopmat2;
                 uint32_t HSK = op->src[1]->ne[0];
                 uint32_t HSV = op->src[2]->ne[0];
