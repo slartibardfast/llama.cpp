@@ -23,6 +23,7 @@
 #include "ggml-cuda/diagmask.cuh"
 #include "ggml-cuda/diag.cuh"
 #include "ggml-cuda/fattn.cuh"
+#include "ggml-cuda/fused.cuh"
 #include "ggml-cuda/getrows.cuh"
 #include "ggml-cuda/im2col.cuh"
 #include "ggml-cuda/mmf.cuh"
@@ -2856,6 +2857,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_GATED_DELTA_NET:
             ggml_cuda_op_gated_delta_net(ctx, dst);
             break;
+        case GGML_OP_FUSED:
+            ggml_cuda_op_fused(ctx, dst);
+            break;
         case GGML_OP_RWKV_WKV7:
             ggml_cuda_op_rwkv_wkv7(ctx, dst);
             break;
@@ -5036,7 +5040,21 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
 #else
             return true;
 #endif // GGML_USE_MUSA
+        case GGML_OP_FUSED:
+            return op->type == GGML_TYPE_F32 &&
+                   op->src[0] && op->src[0]->type == GGML_TYPE_F32 &&
+                   op->src[1] && op->src[1]->type == GGML_TYPE_F32 &&
+                   ggml_is_contiguous(op->src[0]) &&
+                   ggml_is_contiguous(op->src[1]) &&
+                   ggml_is_contiguous(op);
         case GGML_OP_FLASH_ATTN_EXT:
+            // LSE mode (op_params[4]==1) requires the kernel to emit (M, S) into
+            // 2 trailing rows of the output. Not implemented on CUDA/HIP — refuse
+            // so the scheduler routes to CPU, which has the LSE-aware reference.
+            // Slow but correct fallback for residual_window two-pass FA.
+            if (op->op == GGML_OP_FLASH_ATTN_EXT && ggml_get_op_params_i32(op, 4) == 1) {
+                return false;
+            }
             return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);
         case GGML_OP_CROSS_ENTROPY_LOSS:
         case GGML_OP_CROSS_ENTROPY_LOSS_BACK:

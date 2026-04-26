@@ -15736,6 +15736,15 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
             }
         case GGML_OP_FLASH_ATTN_EXT:
             {
+                // LSE mode (op_params[4]==1) requires the kernel to emit (M, S)
+                // into 2 trailing rows of the output. Not implemented in Vulkan
+                // FA shaders. Refuse so the scheduler routes to CPU. Per
+                // PHASE28 iter 24 the previous behaviour was a silent fallback
+                // to single-pass shape; that hid the gap on Vulkan but was
+                // never a correct LSE path.
+                if (ggml_get_op_params_i32(op, 4) == 1) {
+                    return false;
+                }
                 bool coopmat2 = device->coopmat2;
                 uint32_t HSK = op->src[1]->ne[0];
                 uint32_t HSV = op->src[2]->ne[0];
