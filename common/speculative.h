@@ -14,10 +14,6 @@ enum common_speculative_type common_speculative_type_from_name(const std::string
 // convert type to string
 std::string common_speculative_type_to_str(enum common_speculative_type type);
 
-// check if the llama_context is compatible for speculative decoding
-// note: clears the memory of the context
-bool common_speculative_is_compat(llama_context * ctx_tgt);
-
 common_speculative * common_speculative_init(
         common_params_speculative & params,
         llama_context             * ctx_tgt);
@@ -54,3 +50,9 @@ void common_speculative_print_stats(const common_speculative * spec);
 // to avoid drift between the two code paths and to put all chained-rollout
 // awareness in one place.
 llama_tokens common_mtp_read_drafts(llama_context * ctx_tgt, int k_max);
+
+struct common_speculative_deleter {
+    void operator()(common_speculative * s) { common_speculative_free(s); }
+};
+
+typedef std::unique_ptr<common_speculative, common_speculative_deleter> common_speculative_ptr;
