@@ -2548,7 +2548,7 @@ ggml_tensor * llm_graph_context::build_attn(
     // position-order mask.
     //
     // Requires post-RoPE-store caches (self_k_pos == nullptr). f16, bf16,
-    // and turbo_kv_4b (post-PHASE28-iter21) all satisfy this. split-K
+    // and turbo_kv_4b (since the post-RoPE cache rewrite) all satisfy this. split-K
     // still uses pre-RoPE storage with rope-on-the-fly at attention time
     // and is not yet ported to two-pass.
     //

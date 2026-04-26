@@ -17,7 +17,7 @@ layout (push_constant) uniform parameter {
     uint ne3;
     uint k_num;
     uint sinks;
-    // PHASE28 substep 6.2: LSE mode + dst row stride (mirror of C++ struct).
+    // LSE mode + dst row stride (mirror of C++ struct).
     uint lse_mode;
     uint ne0_dst;
 } p;
@@ -95,7 +95,14 @@ void main() {
         L = L*ms + vs;
     }
 
-    L = (L == 0.0) ? 0.0 : 1.0 / L;
+    // In LSE mode, expose un-inverted L and the (sink-corrected) running max
+    // so callers can fuse splits themselves.
+    float L_pre_invert = L;
+    float effective_M = (p.sinks != 0 && sink > m_max) ? sink : m_max;
+
+    if (p.lse_mode == 0) {
+        L = (L == 0.0) ? 0.0 : 1.0 / L;
+    }
 
     // D dimension is split across workgroups in the y dimension
     uint d = tid + gl_WorkGroupID.y * BLOCK_SIZE;
@@ -114,11 +121,21 @@ void main() {
                 O *= ms;
             }
         }
-        O *= L;
+        if (p.lse_mode == 0) {
+            O *= L;
+        }
 
         const float FLT_MAX = uintBitsToFloat(0x7F7FFFFF);
         O = clamp(O, -FLT_MAX, FLT_MAX);
 
-        data_d[(i3 * p.ne2 + i2) * p.ne1 * D + D * n + d] = O;
+        data_d[(i3 * p.ne2 + i2) * p.ne1 * p.ne0_dst + p.ne0_dst * n + d] = O;
+    }
+
+    // LSE-only writeback of M (row D) and S (row D+1).
+    // Guarded so exactly one invocation per row writes the auxiliaries.
+    if (p.lse_mode != 0 && gl_WorkGroupID.y == 0 && tid == 0) {
+        uint base = (i3 * p.ne2 + i2) * p.ne1 * p.ne0_dst + p.ne0_dst * n;
+        data_d[base + D + 0] = effective_M;
+        data_d[base + D + 1] = L_pre_invert;
     }
 }
