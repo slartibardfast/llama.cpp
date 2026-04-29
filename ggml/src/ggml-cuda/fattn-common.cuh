@@ -599,6 +599,44 @@ constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
     }
 }
 
+template <typename T, int ne>
+static __device__ __forceinline__ void dequantize_V_iq4_nl(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+    const block_iq4_nl * x = (const block_iq4_nl *) vx;
+
+    const int64_t ib    =  i0          /  QK4_NL;
+    const int     iqs   =  i0          % (QK4_NL/2);
+    const int     shift = (i0 % QK4_NL) / (QK4_NL/2);
+
+    int q;
+    static_assert(ne == 2 || ne == 4, "bad ne");
+    ggml_cuda_memcpy_1<ne, 2>(&q, x[ib].qs + iqs);
+    q >>= 4*shift;
+    q &= 0x0F0F0F0F;
+
+    const uint8_t * q4 = (const uint8_t *) &q;
+
+#ifdef FP16_AVAILABLE
+    if constexpr (std::is_same_v<T, half>) {
+        const half2 d = __half2half2(x[ib].d);
+
+#pragma unroll
+        for (int l0 = 0; l0 < ne; l0 += 2) {
+            ((half2 *) dst)[l0/2] = d * make_half2(kvalues_iq4nl[q4[l0 + 0]], kvalues_iq4nl[q4[l0 + 1]]);
+        }
+    } else
+#endif // FP16_AVAILABLE
+    if constexpr (std::is_same_v<T, float>) {
+        const float d = x[ib].d;
+
+#pragma unroll
+        for (int l = 0; l < ne; ++l) {
+            ((float *) dst)[l] = d * kvalues_iq4nl[q4[l]];
+        }
+    } else {
+        static_assert(std::is_same_v<T, void>, "bad type");
+    }
+}
+
 template <ggml_type type_V, typename T, int ne>
 constexpr __device__ dequantize_V_t get_dequantize_V() {
     if constexpr (type_V == GGML_TYPE_F16) {
@@ -613,6 +651,8 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
         return dequantize_V_q5_1<T, ne>;
     } else if constexpr (type_V == GGML_TYPE_Q8_0) {
         return dequantize_V_q8_0<T, ne>;
+    } else if constexpr (type_V == GGML_TYPE_IQ4_NL) {
+        return dequantize_V_iq4_nl<T, ne>;
     } else if constexpr (type_V == GGML_TYPE_BF16) {
         return dequantize_V_bf16<float, ne>;
     } else {

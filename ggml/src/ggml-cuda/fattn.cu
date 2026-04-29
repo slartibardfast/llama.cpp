@@ -290,6 +290,10 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_0, GGML_TYPE_Q4_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0, GGML_TYPE_Q8_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_BF16, GGML_TYPE_BF16)
+    // K=F16 + V=IQ4_NL: PROFILING.md recommends iq4_nl as default
+    // --cache-type-v for agent workloads (no observed fingerprint
+    // divergence from f16, half the V-cache footprint).
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,  GGML_TYPE_IQ4_NL)
 #endif // GGML_CUDA_FA_ALL_QUANTS
 
     GGML_ABORT("fatal error");
@@ -374,7 +378,13 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
 #ifndef GGML_CUDA_FA_ALL_QUANTS
     if (K->type != V->type) {
-        return BEST_FATTN_KERNEL_NONE;
+        // K=F16 + V=IQ4_NL is instantiated in the default build for the
+        // agent --cache-type-v iq4_nl path; everything else mixed needs
+        // GGML_CUDA_FA_ALL_QUANTS.
+        const bool ok_mixed = K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_IQ4_NL;
+        if (!ok_mixed) {
+            return BEST_FATTN_KERNEL_NONE;
+        }
     }
 #endif // GGML_CUDA_FA_ALL_QUANTS
 
