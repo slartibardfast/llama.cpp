@@ -296,6 +296,84 @@ static __global__ void set_rows_turbo_kv_4b_kernel(
     }
 }
 
+// =============================================================================
+// GET_ROWS TURBO_KV_4B -> D_TYPE (f32 or f16)
+// =============================================================================
+// Source: turbo_kv_4b cache (3D: [blocks_per_row, n_rows, n_batch]).
+// src1: 1D row indices.
+// Dst: dequantized rows, type D_TYPE.
+
+template <typename dst_t>
+static __global__ void get_rows_turbo_kv_4b_kernel(
+    const char * __restrict__ vsrc,
+    const int32_t * __restrict__ vidx,
+    char * __restrict__ vdst,
+    const int64_t ne00,           // src ne[0] in raw elements (= blocks_per_row * 128)
+    const int64_t nb01, const int64_t nb02, const int64_t nb03,
+    const int64_t nb10, const int64_t nb11, const int64_t nb12,
+    const int64_t nb1, const int64_t nb2, const int64_t nb3)
+{
+    const uint32_t tid = threadIdx.x;
+    const int64_t i10 = blockIdx.x;        // row within group
+    const int64_t i11 = blockIdx.y;        // batch dim 1
+    const int64_t i12 = blockIdx.z;        // batch dim 2
+    // Each CUDA block handles all blocks_per_row sub-blocks for one (row, b1, b2) tuple.
+    const int64_t blocks_per_row = ne00 / TKV_BLOCK;
+
+    const int32_t src_row = *(const int32_t *)((const char *)vidx + i10*nb10 + i11*nb11 + i12*nb12);
+
+    __shared__ float lds[TKV_BLOCK];
+
+    for (int64_t br = 0; br < blocks_per_row; ++br) {
+        const block_turbo_kv_4b * blk = (const block_turbo_kv_4b *)
+            ((const char *)vsrc + src_row*nb01 + i11*nb02 + i12*nb03) + br;
+
+        const float norm = blk->norm;
+        const float inv_std = blk->inv_std;
+        const float rcp_inv_std = 1.0f / fmaxf(inv_std, 1e-10f);
+        float val = tkv_unpack((uint32_t)blk->mse_indices[tid >> 1], tid, rcp_inv_std);
+
+        tkv_fwht(val, tid, lds);
+        val *= norm * TKV_RSQRT128 * tkv_sign(tid);
+
+        char * dst_row_ptr = vdst + i10*nb1 + i11*nb2 + i12*nb3;
+        *(dst_t *)(dst_row_ptr + (br*TKV_BLOCK + tid) * sizeof(dst_t)) = (dst_t)val;
+        __syncthreads();
+    }
+}
+
+void ggml_cuda_op_get_rows_turbo_kv_4b(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    GGML_ASSERT(src0->type == GGML_TYPE_TURBO_KV_4B);
+    GGML_ASSERT(src1->type == GGML_TYPE_I32);
+    GGML_ASSERT(src0->ne[0] % TKV_BLOCK == 0);
+
+    const int64_t ne10 = src1->ne[0];
+    const int64_t ne11 = src1->ne[1];
+    const int64_t ne12 = src1->ne[2];
+
+    cudaStream_t stream = ctx.stream();
+    dim3 grid((unsigned)ne10, (unsigned)ne11, (unsigned)ne12);
+
+    if (dst->type == GGML_TYPE_F32) {
+        get_rows_turbo_kv_4b_kernel<float><<<grid, TKV_BLOCK, 0, stream>>>(
+            (const char *)src0->data, (const int32_t *)src1->data, (char *)dst->data,
+            src0->ne[0],
+            src0->nb[1], src0->nb[2], src0->nb[3],
+            src1->nb[0], src1->nb[1], src1->nb[2],
+            dst->nb[1], dst->nb[2], dst->nb[3]);
+    } else {
+        GGML_ASSERT(dst->type == GGML_TYPE_F16);
+        get_rows_turbo_kv_4b_kernel<half><<<grid, TKV_BLOCK, 0, stream>>>(
+            (const char *)src0->data, (const int32_t *)src1->data, (char *)dst->data,
+            src0->ne[0],
+            src0->nb[1], src0->nb[2], src0->nb[3],
+            src1->nb[0], src1->nb[1], src1->nb[2],
+            dst->nb[1], dst->nb[2], dst->nb[3]);
+    }
+}
+
 void ggml_cuda_op_set_rows_turbo_kv_4b(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
@@ -307,6 +385,8 @@ void ggml_cuda_op_set_rows_turbo_kv_4b(ggml_backend_cuda_context & ctx, ggml_ten
     const int64_t num_blocks = ne / TKV_BLOCK;
 
     cudaStream_t stream = ctx.stream();
+    if (num_blocks == 0) return;
+    GGML_ASSERT(num_blocks < UINT_MAX);
     if (src1->type == GGML_TYPE_I64) {
         set_rows_turbo_kv_4b_kernel<int64_t><<<(unsigned)num_blocks, TKV_BLOCK, 0, stream>>>(
             (const char *)src0->data, (const char *)src1->data, (char *)dst->data,

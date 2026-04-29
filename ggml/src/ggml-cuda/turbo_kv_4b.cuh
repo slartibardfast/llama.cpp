@@ -27,3 +27,5 @@ void ggml_cuda_cpy_turbo_kv_4b_f32(
     cudaStream_t stream);
 
 void ggml_cuda_op_set_rows_turbo_kv_4b(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+
+void ggml_cuda_op_get_rows_turbo_kv_4b(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
