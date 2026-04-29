@@ -2855,7 +2855,8 @@ struct test_cpy : public test_case {
             return 0.0;
         }
         if (type_dst == GGML_TYPE_Q4_0 || type_dst == GGML_TYPE_Q4_1 || type_dst == GGML_TYPE_IQ4_NL ||
-            type_dst == GGML_TYPE_Q5_0 || type_dst == GGML_TYPE_Q5_1 || type_dst == GGML_TYPE_Q8_0) {
+            type_dst == GGML_TYPE_Q5_0 || type_dst == GGML_TYPE_Q5_1 || type_dst == GGML_TYPE_Q8_0 ||
+            type_dst == GGML_TYPE_TURBO_KV_4B || type_src == GGML_TYPE_TURBO_KV_4B) {
             // estimate what the max nmse error would be if one quantized value is
             // off by one. The test values are distributed in [-150,150], so it'll be
             // roughly (150*2.0 / 2^bits)^2, divided by the mean square value of the reference,
@@ -7807,6 +7808,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_cpy(type_src, type_dst, {256, 4, 4, 4}));
             test_cases.emplace_back(new test_cpy(type_src, type_dst, {256, 2, 3, 4}, {0, 2, 1, 3})); // cpy by rows
         }
+    }
+    // PHASE30: turbo_kv_4b head-dim sweep — bisect single-block (DK=128) vs
+    // multi-block (DK=256/384/512) on Vulkan-on-Ampere. The shaders in
+    // ggml-vulkan/vulkan-shaders/cpy_*_turbo_kv_4b.comp hardcode wave64
+    // layout (turbo_kv_4b_rht.glsl:7-8); these cases pass on CPU/Vega and
+    // are expected to fail on Ampere (subgroup_size=32) until the wave32
+    // path is implemented.
+    for (int64_t dk : { 128, 256, 384, 512 }) {
+        test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_TURBO_KV_4B, {dk, 2, 3, 4}));
+        test_cases.emplace_back(new test_cpy(GGML_TYPE_F32, GGML_TYPE_TURBO_KV_4B, {dk, 2, 3, 4}, {0, 2, 1, 3}));
+        test_cases.emplace_back(new test_cpy(GGML_TYPE_TURBO_KV_4B, GGML_TYPE_F32, {dk, 2, 3, 4}));
+        test_cases.emplace_back(new test_cpy(GGML_TYPE_TURBO_KV_4B, GGML_TYPE_F32, {dk, 2, 3, 4}, {0, 2, 1, 3}));
     }
     for (ggml_type type_src : {GGML_TYPE_F16, GGML_TYPE_F32}) {
         for (ggml_type type_dst : {GGML_TYPE_F16, GGML_TYPE_F32}) {
