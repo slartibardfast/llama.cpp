@@ -57,6 +57,7 @@
 #include "ggml-cuda/gated_delta_net.cuh"
 #include "ggml-cuda/set.cuh"
 #include "ggml-cuda/set-rows.cuh"
+#include "ggml-cuda/turbo.cuh"
 #include "ggml-cuda/pad_reflect_1d.cuh"
 #include "ggml-cuda/solve_tri.cuh"
 #include "ggml-cuda/tri.cuh"
@@ -2385,6 +2386,14 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
 
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     const bool split = ggml_backend_buft_is_cuda_split(src0->buffer->buft);
+
+    // TURBO_*B: fused RHT-space mul_mat_vec; bypasses cuBLAS / mmq / mmvq.
+    if (!split && ggml_cuda_can_mul_mat_turbo(src0)
+        && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
+        && src1->ne[1] == 1) {
+        ggml_cuda_mul_mat_turbo(ctx, src0, src1, dst);
+        return;
+    }
 
     // If src0 is a temporary compute buffer it may have some padding that needs to be cleared for mul_mat_vec_q or mul_mat_q.
     // But if src0 is also a view of another tensor then this cannot be done safely because it may overwrite valid tensor data.
@@ -4929,6 +4938,13 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_IQ4_XS:
                     case GGML_TYPE_BF16:
                         return true;
+                    case GGML_TYPE_TURBO_2B:
+                    case GGML_TYPE_TURBO_3B:
+                    case GGML_TYPE_TURBO_4B:
+                    case GGML_TYPE_TURBO_5B:
+                        // Fused RHT mul_mat_vec; mul_mat_vec only (b->ne[1] == 1).
+                        return op->op == GGML_OP_MUL_MAT && b->type == GGML_TYPE_F32
+                               && op->type == GGML_TYPE_F32 && b->ne[1] == 1;
                     default:
                         return false;
                 }
