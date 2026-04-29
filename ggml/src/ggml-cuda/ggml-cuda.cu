@@ -2387,11 +2387,19 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     const bool split = ggml_backend_buft_is_cuda_split(src0->buffer->buft);
 
-    // TURBO_*B: fused RHT-space mul_mat_vec; bypasses cuBLAS / mmq / mmvq.
+    // TURBO_*B routing:
+    //   n == 1: custom fused RHT-space mul_mat_vec (memory-bound; beats
+    //           tensor cores on a single-row dot).
+    //   n >= 2: dequant src0 → fp16, then cuBLAS HGEMM via tensor cores
+    //           through the existing ggml_cuda_op_mul_mat_cublas path.
+    //           Tensor cores beat hand-written SIMT from sm_70 onward.
     if (!split && ggml_cuda_can_mul_mat_turbo(src0)
-        && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
-        && src1->ne[1] == 1) {
-        ggml_cuda_mul_mat_turbo(ctx, src0, src1, dst);
+        && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+        if (src1->ne[1] == 1) {
+            ggml_cuda_mul_mat_turbo(ctx, src0, src1, dst);
+            return;
+        }
+        ggml_cuda_op_mul_mat(ctx, src0, src1, dst, ggml_cuda_op_mul_mat_cublas, nullptr);
         return;
     }
 
@@ -4942,9 +4950,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_TURBO_3B:
                     case GGML_TYPE_TURBO_4B:
                     case GGML_TYPE_TURBO_5B:
-                        // Fused RHT mul_mat_vec; mul_mat_vec only (b->ne[1] == 1).
+                        // n=1: fused RHT MMV. n>=2: dequant→cuBLAS HGEMM.
                         return op->op == GGML_OP_MUL_MAT && b->type == GGML_TYPE_F32
-                               && op->type == GGML_TYPE_F32 && b->ne[1] == 1;
+                               && op->type == GGML_TYPE_F32;
                     default:
                         return false;
                 }

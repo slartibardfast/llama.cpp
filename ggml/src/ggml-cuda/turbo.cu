@@ -253,3 +253,118 @@ void ggml_cuda_mul_mat_turbo(
                     broadcast2, broadcast3, ne02, ne12); break;
     }
 }
+
+// =============================================================================
+// dequant_turbo_kernel<BITS>: TURBO_*B (packed) → fp16 (contiguous, row-major).
+// =============================================================================
+// One CUDA block per 128-element source block; 32 threads (one warp); 4
+// lane-local values per block. Inverse RHT (forward butterfly + sign-flip
+// AFTER butterfly), scale by norm * 1/sqrt(128), write fp16. Used as the
+// dequant prelude to cuBLAS HGEMM via ggml_get_to_fp16_cuda for n>=2 mat-mul.
+// Source data is contiguous packed blocks; output is contiguous fp16.
+
+template <int BITS, int BLOCK_BYTES>
+static __global__ void dequant_turbo_kernel(
+    const uint8_t * __restrict__ A,    // packed weights, contiguous
+    half          * __restrict__ Y,    // fp16 destination, contiguous
+    const float   * __restrict__ CB,   // codebook
+    const int64_t   n_blocks)
+{
+    const uint32_t tid = threadIdx.x;
+    const int64_t blk  = (int64_t)blockIdx.x + (int64_t)blockIdx.y * gridDim.x;
+    if (blk >= n_blocks) return;
+
+    const uint8_t * blk_ptr = A + blk * BLOCK_BYTES;
+    const uint16_t norm_bits    = (uint16_t)blk_ptr[0] | ((uint16_t)blk_ptr[1] << 8);
+    const uint16_t inv_std_bits = (uint16_t)blk_ptr[2] | ((uint16_t)blk_ptr[3] << 8);
+    const float norm    = turbo_fp16_to_f32(norm_bits);
+    const float inv_std = turbo_fp16_to_f32(inv_std_bits);
+    const float rcp_inv_std = 1.0f / fmaxf(inv_std, 1e-10f);
+
+    const uint8_t * qs = blk_ptr + 4;
+
+    // Codebook lookup → 4 lane-local values, scaled by 1/inv_std.
+    float v0 = CB[turbo_unpack<BITS>(qs, tid)]        * rcp_inv_std;
+    float v1 = CB[turbo_unpack<BITS>(qs, tid + 32u)]  * rcp_inv_std;
+    float v2 = CB[turbo_unpack<BITS>(qs, tid + 64u)]  * rcp_inv_std;
+    float v3 = CB[turbo_unpack<BITS>(qs, tid + 96u)]  * rcp_inv_std;
+
+    // Inverse RHT: butterfly first (5 in-warp stages + cross-quartet),
+    // then scale by norm/sqrt(128), then sign-flip.
+    #pragma unroll
+    for (uint32_t s = 1u; s <= 16u; s <<= 1) {
+        float o0 = __shfl_xor_sync(0xFFFFFFFFu, v0, s);
+        float o1 = __shfl_xor_sync(0xFFFFFFFFu, v1, s);
+        float o2 = __shfl_xor_sync(0xFFFFFFFFu, v2, s);
+        float o3 = __shfl_xor_sync(0xFFFFFFFFu, v3, s);
+        const bool hi = (tid & s) != 0u;
+        v0 = hi ? (o0 - v0) : (v0 + o0);
+        v1 = hi ? (o1 - v1) : (v1 + o1);
+        v2 = hi ? (o2 - v2) : (v2 + o2);
+        v3 = hi ? (o3 - v3) : (v3 + o3);
+    }
+    float t0, t1;
+    t0 = v0; t1 = v1; v0 = t0 + t1; v1 = t0 - t1;
+    t0 = v2; t1 = v3; v2 = t0 + t1; v3 = t0 - t1;
+    t0 = v0; t1 = v2; v0 = t0 + t1; v2 = t0 - t1;
+    t0 = v1; t1 = v3; v1 = t0 + t1; v3 = t0 - t1;
+
+    const float scale = norm * TKB_RSQRT128;
+    v0 *= scale * turbo_sign(tid);
+    v1 *= scale * turbo_sign(tid + 32u);
+    v2 *= scale * turbo_sign(tid + 64u);
+    v3 *= scale * turbo_sign(tid + 96u);
+
+    half * y_blk = Y + blk * TKB_BLOCK;
+    y_blk[tid]        = __float2half(v0);
+    y_blk[tid + 32u]  = __float2half(v1);
+    y_blk[tid + 64u]  = __float2half(v2);
+    y_blk[tid + 96u]  = __float2half(v3);
+}
+
+template <int BITS, int BLOCK_BYTES>
+static void dequant_row_turbo_cuda_impl(
+    const void * vx, half * y, int64_t k, cudaStream_t stream)
+{
+    GGML_ASSERT(k % TKB_BLOCK == 0);
+    const int device = ggml_cuda_get_device();
+    turbo_codebook_init(device);
+    const float * cb = g_turbo_cb[device][BITS - 2];
+    const int64_t n_blocks = k / TKB_BLOCK;
+    // Use 2D grid to dodge the 65535 limit on grid.x for very large k.
+    const unsigned gx = (unsigned)std::min<int64_t>(n_blocks, 65535);
+    const unsigned gy = (unsigned)((n_blocks + gx - 1) / gx);
+    dequant_turbo_kernel<BITS, BLOCK_BYTES><<<dim3(gx, gy, 1), dim3(32, 1, 1), 0, stream>>>(
+        (const uint8_t *)vx, y, cb, n_blocks);
+}
+
+void dequant_row_turbo_2b_cuda(const void * vx, half * y, int64_t k, cudaStream_t stream) {
+    dequant_row_turbo_cuda_impl<2, 4 + TKB_BLOCK*2/8>(vx, y, k, stream);
+}
+void dequant_row_turbo_3b_cuda(const void * vx, half * y, int64_t k, cudaStream_t stream) {
+    dequant_row_turbo_cuda_impl<3, 4 + TKB_BLOCK*3/8>(vx, y, k, stream);
+}
+void dequant_row_turbo_4b_cuda(const void * vx, half * y, int64_t k, cudaStream_t stream) {
+    dequant_row_turbo_cuda_impl<4, 4 + TKB_BLOCK*4/8>(vx, y, k, stream);
+}
+void dequant_row_turbo_5b_cuda(const void * vx, half * y, int64_t k, cudaStream_t stream) {
+    dequant_row_turbo_cuda_impl<5, 4 + TKB_BLOCK*5/8>(vx, y, k, stream);
+}
+
+bool ggml_cuda_should_dequant_turbo(int cc, int64_t n) {
+    if (n < 2) return false;
+    // sm_80+ (Ampere/Ada/Hopper/Blackwell) and AMD CDNA: tensor cores cheap,
+    // dequant+HGEMM beats fused at any n>=2.
+    if (cc >= GGML_CUDA_CC_AMPERE) return true;
+#ifdef GGML_USE_HIP
+    // CDNA gfx908+ has MFMA via hipBLAS; keep n>=2 threshold.
+    if (cc >= GGML_CUDA_CC_CDNA) return true;
+    // RDNA3+ via WMMA: shift threshold to n>=4.
+    if (cc >= GGML_CUDA_CC_RDNA3) return n >= 4;
+    // Older AMD: fall back to SGEMM at n>=8.
+    return n >= 8;
+#else
+    // Volta sm_70 / Turing sm_75: HMMA without cp.async; n>=4 threshold.
+    return n >= 4;
+#endif
+}

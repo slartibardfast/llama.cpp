@@ -1,5 +1,6 @@
 #include "convert.cuh"
 #include "dequantize.cuh"
+#include "turbo.cuh"
 
 #include <cstdint>
 
@@ -762,6 +763,14 @@ to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type) {
             return convert_unary_cont_cuda<float>;
         case GGML_TYPE_BF16:
             return convert_unary_cont_cuda<nv_bfloat16>;
+        case GGML_TYPE_TURBO_2B:
+            return dequant_row_turbo_2b_cuda;
+        case GGML_TYPE_TURBO_3B:
+            return dequant_row_turbo_3b_cuda;
+        case GGML_TYPE_TURBO_4B:
+            return dequant_row_turbo_4b_cuda;
+        case GGML_TYPE_TURBO_5B:
+            return dequant_row_turbo_5b_cuda;
         default:
             return nullptr;
     }
