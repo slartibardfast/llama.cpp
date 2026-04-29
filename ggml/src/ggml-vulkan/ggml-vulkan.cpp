@@ -16014,12 +16014,10 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     case GGML_TYPE_NVFP4:
                     case GGML_TYPE_I32:
                         return true;
-                    case GGML_TYPE_TURBO_2B:
-                    case GGML_TYPE_TURBO_3B:
-                    case GGML_TYPE_TURBO_4B:
-                    case GGML_TYPE_TURBO_4B_S:
-                    case GGML_TYPE_TURBO_5B:
-                        return device->subgroup_shuffle && device->subgroup_arithmetic;
+                    // TURBO_*B weight types: no Vulkan get_rows shader yet.
+                    // MUL_MAT covers the inference path; refuse here so the
+                    // scheduler routes to a backend that has a kernel
+                    // (CPU) instead of aborting in the dispatch.
                     default:
                         return false;
                 }

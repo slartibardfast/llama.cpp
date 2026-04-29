@@ -2218,6 +2218,19 @@ struct test_get_rows : public test_case {
             }
         }
     }
+
+    double max_nmse_err() override {
+        if (type == GGML_TYPE_TURBO_KV_4B || type == GGML_TYPE_TURBO_2B ||
+            type == GGML_TYPE_TURBO_3B   || type == GGML_TYPE_TURBO_4B ||
+            type == GGML_TYPE_TURBO_4B_S || type == GGML_TYPE_TURBO_5B) {
+            // Lossy RHT-coded quant; budget shape similar to Q4_0 family.
+            double e = 1.0/8.0;
+            e *= e;
+            e /= 0.25 * (double)(n * r * be1 * be2);
+            return e;
+        }
+        return 1e-6;
+    }
 };
 
 // GGML_OP_GET_ROWS_BACK
