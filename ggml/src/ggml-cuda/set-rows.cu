@@ -1,5 +1,6 @@
 #include "set-rows.cuh"
 #include "cpy-utils.cuh"
+#include "turbo_kv_4b.cuh"
 
 typedef void (*set_rows_kernel_t)(const char * src, char * dst);
 
@@ -321,6 +322,11 @@ void ggml_cuda_op_set_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
     GGML_ASSERT(src0->type == GGML_TYPE_F32);
     GGML_ASSERT(src1->type == GGML_TYPE_I64 || src1->type == GGML_TYPE_I32);
+
+    if (dst->type == GGML_TYPE_TURBO_KV_4B) {
+        ggml_cuda_op_set_rows_turbo_kv_4b(ctx, dst);
+        return;
+    }
 
     if (src1->type == GGML_TYPE_I64) {
         set_rows_cuda<float, int64_t>(ctx, src0, src1, dst);
