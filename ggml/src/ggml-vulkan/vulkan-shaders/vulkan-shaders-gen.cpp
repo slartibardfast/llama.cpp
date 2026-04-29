@@ -855,6 +855,19 @@ void process_shaders() {
         string_to_spv("dequant_turbo_" + suffix + "_w32",
             "dequant_turbo.comp",
             {{"BITS", bits_str}, {"SUBGROUP_SIZE", "32"}, {"D_TYPE", "float16_t"}});
+        // GET_ROWS variants for embedding/router lookups: f16 and f32 dst.
+        string_to_spv("get_rows_turbo_" + suffix,
+            "get_rows_turbo.comp",
+            {{"BITS", bits_str}, {"SUBGROUP_SIZE", "64"}, {"D_TYPE", "float16_t"}});
+        string_to_spv("get_rows_turbo_" + suffix + "_w32",
+            "get_rows_turbo.comp",
+            {{"BITS", bits_str}, {"SUBGROUP_SIZE", "32"}, {"D_TYPE", "float16_t"}});
+        string_to_spv("get_rows_turbo_" + suffix + "_f32",
+            "get_rows_turbo.comp",
+            {{"BITS", bits_str}, {"SUBGROUP_SIZE", "64"}, {"D_TYPE", "float"}});
+        string_to_spv("get_rows_turbo_" + suffix + "_f32_w32",
+            "get_rows_turbo.comp",
+            {{"BITS", bits_str}, {"SUBGROUP_SIZE", "32"}, {"D_TYPE", "float"}});
     }
 
     // TURBO_*B fused mul_mat_vec — dot in RHT space, no inverse FWHT per block.

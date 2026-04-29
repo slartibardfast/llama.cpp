@@ -4478,6 +4478,31 @@ static void ggml_vk_load_shaders(vk_device& device) {
 
 #undef TURBO_DEQUANT_PIPELINE
 
+        // GET_ROWS pipelines for TURBO_*B (f16 dst for embedding pre-norm,
+        // f32 dst for the rare full-precision lookup). 4 bindings: A
+        // (quantized), B (row index i32), D (output), codebook.
+#define TURBO_GETROWS_PIPELINE(TYPE, n_w64, n_w32, n_w64_f32, n_w32_f32) \
+        if (ss >= 64) { \
+            ggml_vk_create_pipeline(device, device->pipeline_get_rows[TYPE], \
+                #n_w64, n_w64##_len, n_w64##_data, \
+                "main", 4, sizeof(vk_op_binary_push_constants), {128, 1, 1}, {ss, 1, 1}, 1, false, true, ss); \
+            ggml_vk_create_pipeline(device, device->pipeline_get_rows_f32[TYPE], \
+                #n_w64_f32, n_w64_f32##_len, n_w64_f32##_data, \
+                "main", 4, sizeof(vk_op_binary_push_constants), {128, 1, 1}, {ss, 1, 1}, 1, false, true, ss); \
+        } else { \
+            ggml_vk_create_pipeline(device, device->pipeline_get_rows[TYPE], \
+                #n_w32, n_w32##_len, n_w32##_data, \
+                "main", 4, sizeof(vk_op_binary_push_constants), {128, 1, 1}, {ss, 1, 1}, 1, false, true, ss); \
+            ggml_vk_create_pipeline(device, device->pipeline_get_rows_f32[TYPE], \
+                #n_w32_f32, n_w32_f32##_len, n_w32_f32##_data, \
+                "main", 4, sizeof(vk_op_binary_push_constants), {128, 1, 1}, {ss, 1, 1}, 1, false, true, ss); \
+        }
+        TURBO_GETROWS_PIPELINE(GGML_TYPE_TURBO_2B, get_rows_turbo_2b, get_rows_turbo_2b_w32, get_rows_turbo_2b_f32, get_rows_turbo_2b_f32_w32)
+        TURBO_GETROWS_PIPELINE(GGML_TYPE_TURBO_3B, get_rows_turbo_3b, get_rows_turbo_3b_w32, get_rows_turbo_3b_f32, get_rows_turbo_3b_f32_w32)
+        TURBO_GETROWS_PIPELINE(GGML_TYPE_TURBO_4B, get_rows_turbo_4b, get_rows_turbo_4b_w32, get_rows_turbo_4b_f32, get_rows_turbo_4b_f32_w32)
+        TURBO_GETROWS_PIPELINE(GGML_TYPE_TURBO_5B, get_rows_turbo_5b, get_rows_turbo_5b_w32, get_rows_turbo_5b_f32, get_rows_turbo_5b_f32_w32)
+#undef TURBO_GETROWS_PIPELINE
+
         // TURBO mul_mat_vec: fused RHT-space dot, one row per workgroup.
         // Registered in pipeline_dequant_mul_mat_vec_f32_f32[0][type][0]
         // (workgroup size index 0, 1 output column).
@@ -10631,6 +10656,12 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
         ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src0_buf, src1_buf, src2_buf, src3_buf, dst_buf }, pc, elements);
     } else if (use_src2) {
         ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src0_buf, src1_buf, src2_buf, dst_buf }, pc, elements);
+    } else if (op == GGML_OP_GET_ROWS && ggml_vk_turbo_codebook_index(src0->type) >= 0) {
+        // TURBO_*B weight types: get_rows shader uses 4 bindings (A, B, D, codebook).
+        const int cb_idx = ggml_vk_turbo_codebook_index(src0->type);
+        vk_buffer& cb_buf = ctx->device->turbo_codebook_buf[cb_idx];
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+            { src0_buf, src1_buf, dst_buf, vk_subbuffer{ cb_buf, 0, cb_buf->size } }, pc, elements);
     } else if (use_src1) {
         ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src0_buf, src1_buf, dst_buf }, pc, elements);
     } else {
@@ -16014,10 +16045,11 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
                     case GGML_TYPE_NVFP4:
                     case GGML_TYPE_I32:
                         return true;
-                    // TURBO_*B weight types: no Vulkan get_rows shader yet.
-                    // MUL_MAT covers the inference path; refuse here so the
-                    // scheduler routes to a backend that has a kernel
-                    // (CPU) instead of aborting in the dispatch.
+                    case GGML_TYPE_TURBO_2B:
+                    case GGML_TYPE_TURBO_3B:
+                    case GGML_TYPE_TURBO_4B:
+                    case GGML_TYPE_TURBO_5B:
+                        return device->subgroup_shuffle && device->subgroup_arithmetic;
                     default:
                         return false;
                 }
