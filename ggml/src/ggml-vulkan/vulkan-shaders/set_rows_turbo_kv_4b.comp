@@ -1,8 +1,8 @@
 #version 450
 
 // SET_ROWS for TURBO_KV_4B: stride-based 4D addressing with subgroup-cooperative
-// forward FWHT + codebook quantize. Uses the same push_constant layout as
-// vk_op_binary_push_constants for full stride and offset support.
+// forward FWHT + codebook quantize. Subgroup-size-portable: 128-thread
+// workgroup, one element per lane.
 
 #extension GL_EXT_control_flow_attributes : enable
 #extension GL_EXT_shader_16bit_storage : require
@@ -27,7 +27,7 @@ layout (push_constant) uniform parameter {
     float param1; float param2; int param3;
 } p;
 
-layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
 
 layout (binding = 0) readonly buffer A {float data_a[];};
 #if B_SIZE == 64
@@ -75,33 +75,26 @@ void main() {
     uint dst_blk = i03 * p.nb23 + i02 * p.nb22 + dst_row * p.nb21
                  + (i00 / QUANT_K_TURBO_KV_4B) * p.nb20 + get_doffset();
 
-    uint tid = gl_SubgroupInvocationID;
+    uint tid = gl_LocalInvocationID.x;
 
-    // Read source data (64 threads x 2 elements = 128-element block)
-    float val0 = data_a[src_base + tid];
-    float val1 = data_a[src_base + tid + 64];
+    float val = data_a[src_base + tid];
 
-    // Forward RHT + codebook quantize (identical to cpy_f32_turbo_kv_4b)
-    float sum_sq = subgroupAdd(val0 * val0 + val1 * val1);
+    // Forward RHT + codebook quantize
+    float sum_sq = turbo_kv_workgroup_sum(val * val);
     float norm = sqrt(sum_sq);
     float rcp_norm = 1.0 / max(norm, 1e-10);
-    val0 *= rcp_norm;
-    val1 *= rcp_norm;
+    val *= rcp_norm;
 
-    turbo_kv_forward_rht(val0, val1, tid);
+    turbo_kv_forward_rht(val, tid);
 
-    float max_abs = subgroupMax(max(abs(val0), abs(val1)));
+    float max_abs = turbo_kv_workgroup_max(abs(val));
     float inv_std = 2.7326 / max(max_abs, 1e-10);
 
-    uint idx0 = turbo_kv_nearest(val0 * inv_std);
-    uint idx1 = turbo_kv_nearest(val1 * inv_std);
+    uint idx = turbo_kv_nearest(val * inv_std);
 
-    uint p0 = subgroupShuffleXor(idx0, 1);
-    uint p1 = subgroupShuffleXor(idx1, 1);
-
+    uint partner = subgroupShuffleXor(idx, 1);
     if ((tid & 1u) == 0) {
-        data_d[dst_blk].mse_indices[tid / 2]       = uint8_t(idx0 | (p0 << 4));
-        data_d[dst_blk].mse_indices[(tid + 64) / 2] = uint8_t(idx1 | (p1 << 4));
+        data_d[dst_blk].mse_indices[tid / 2] = uint8_t(idx | (partner << 4));
     }
     if (tid == 0) {
         data_d[dst_blk].norm    = norm;

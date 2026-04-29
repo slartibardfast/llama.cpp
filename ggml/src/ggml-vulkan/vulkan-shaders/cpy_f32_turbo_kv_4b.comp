@@ -1,8 +1,8 @@
 #version 450
 
 // Quantize F32 → TURBO_KV_4B: normalize → forward RHT → codebook nearest → pack.
-// Uses the standard vk_op_unary_push_constants layout for compatibility with the
-// ggml_vk_op_f32 dispatch path.
+// Subgroup-size-portable: 128-thread workgroup, one value per lane, works on
+// any sg in {32, 64}. See turbo_kv_4b_rht.glsl header for details.
 
 #extension GL_EXT_control_flow_attributes : enable
 #extension GL_EXT_shader_16bit_storage : require
@@ -31,7 +31,7 @@ layout (push_constant) uniform parameter {
     uint ne1_0mp;   uint ne1_0L;
 } p;
 
-layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
 
 layout (binding = 0) readonly buffer A {float data_a[];};
 layout (binding = 1) writeonly buffer D {block_turbo_kv_4b data_b[];};
@@ -42,32 +42,28 @@ void main() {
                         + gl_WorkGroupID.x;
     if (block_id >= p.ne / QUANT_K_TURBO_KV_4B) return;
 
-    const uint tid = gl_SubgroupInvocationID;
+    const uint tid = gl_LocalInvocationID.x;
     const uint base = block_id * QUANT_K_TURBO_KV_4B;
 
-    float val0 = data_a[base + tid];
-    float val1 = data_a[base + tid + 64];
+    float val = data_a[base + tid];
 
-    // Quantize: norm → normalize → forward RHT → inv_std → nearest → pack
-    float sum_sq = subgroupAdd(val0 * val0 + val1 * val1);
+    // Normalize by L2 norm of the 128-element block.
+    float sum_sq = turbo_kv_workgroup_sum(val * val);
     float norm = sqrt(sum_sq);
     float rcp_norm = 1.0 / max(norm, 1e-10);
-    val0 *= rcp_norm;
-    val1 *= rcp_norm;
+    val *= rcp_norm;
 
-    turbo_kv_forward_rht(val0, val1, tid);
+    turbo_kv_forward_rht(val, tid);
 
-    float max_abs = subgroupMax(max(abs(val0), abs(val1)));
+    float max_abs = turbo_kv_workgroup_max(abs(val));
     float inv_std = 2.7326 / max(max_abs, 1e-10);
 
-    uint idx0 = turbo_kv_nearest(val0 * inv_std);
-    uint idx1 = turbo_kv_nearest(val1 * inv_std);
+    uint idx = turbo_kv_nearest(val * inv_std);
 
-    uint partner0 = subgroupShuffleXor(idx0, 1);
-    uint partner1 = subgroupShuffleXor(idx1, 1);
+    // Pack pairs of 4-bit indices into bytes. Stride 1 is always intra-subgroup.
+    uint partner = subgroupShuffleXor(idx, 1);
     if ((tid & 1u) == 0) {
-        data_b[block_id].mse_indices[tid / 2]        = uint8_t(idx0 | (partner0 << 4));
-        data_b[block_id].mse_indices[(tid + 64) / 2]  = uint8_t(idx1 | (partner1 << 4));
+        data_b[block_id].mse_indices[tid / 2] = uint8_t(idx | (partner << 4));
     }
     if (tid == 0) {
         data_b[block_id].norm    = norm;

@@ -2,6 +2,7 @@
 
 // GET_ROWS: extract and dequantize specific rows from TURBO_KV_4B buffer.
 // Output type: D_TYPE (float16_t or float, selected by define).
+// Subgroup-size-portable: 128-thread workgroup, one element per lane.
 
 #extension GL_EXT_control_flow_attributes : enable
 #extension GL_EXT_shader_16bit_storage : require
@@ -9,21 +10,13 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_int32 : require
 #extension GL_KHR_shader_subgroup_basic : require
 #extension GL_KHR_shader_subgroup_shuffle : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
 
 #include "types.glsl"
 #include "turbo_kv_4b_rht.glsl"
 
-// Push-constant layout matches vk_op_binary_push_constants, which the
-// Vulkan backend populates for GGML_OP_GET_ROWS. The shader previously
-// declared a shorter struct whose field NAMES matched the natural
-// semantics but whose OFFSETS did not line up with what the dispatcher
-// actually writes — p.ne00 would read C's 'ne' (total element count)
-// instead of src0->ne[0] (per-row element count), causing the src_blk
-// formula below to multiply by (total / 128) instead of (per_row / 128).
-// Single-row get_rows happened to work because the two values are equal
-// when n_rows = 1. Multi-row get_rows silently corrupted src_blk for
-// all rows beyond the first. Caught by the backend PBT property
-// propagated from turbo_kv_4b_backend.allium.
+// Push-constant layout matches vk_op_binary_push_constants. See history at
+// the prior version of this file: a shorter struct caused multi-row corruption.
 layout (push_constant) uniform parameter {
     uint ne;
     uint ne00; uint ne01; uint ne02; uint ne03;
@@ -36,7 +29,7 @@ layout (push_constant) uniform parameter {
     float param1; float param2; int param3;
 } p;
 
-layout(local_size_x_id = 0, local_size_y = 1, local_size_z = 1) in;
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
 
 layout (binding = 0) readonly buffer A {block_turbo_kv_4b data_a[];};
 layout (binding = 1) readonly buffer B {int data_b[];};
@@ -45,7 +38,7 @@ layout (binding = 2) writeonly buffer D {D_TYPE data_d[];};
 void main() {
     const uint row_idx = gl_WorkGroupID.y;
     const uint blk_in_row = gl_WorkGroupID.x;
-    const uint tid = gl_SubgroupInvocationID;
+    const uint tid = gl_LocalInvocationID.x;
 
     const uint src_row = uint(data_b[row_idx]);
     const uint blocks_per_row = p.ne00 / QUANT_K_TURBO_KV_4B;
@@ -55,12 +48,10 @@ void main() {
     const float inv_std = data_a[src_blk].inv_std;
     const float rcp_inv_std = 1.0 / max(inv_std, 1e-10);
 
-    float val0 = turbo_kv_unpack_byte(uint(data_a[src_blk].mse_indices[tid / 2]),      tid,      rcp_inv_std);
-    float val1 = turbo_kv_unpack_byte(uint(data_a[src_blk].mse_indices[(tid + 64) / 2]), tid + 64, rcp_inv_std);
+    float val = turbo_kv_unpack_byte(uint(data_a[src_blk].mse_indices[tid / 2]), tid, rcp_inv_std);
 
-    turbo_kv_inverse_rht(val0, val1, tid, norm);
+    turbo_kv_inverse_rht(val, tid, norm);
 
     const uint dst_base = row_idx * p.ne00 + blk_in_row * QUANT_K_TURBO_KV_4B;
-    data_d[dst_base + tid]      = D_TYPE(val0);
-    data_d[dst_base + tid + 64] = D_TYPE(val1);
+    data_d[dst_base + tid] = D_TYPE(val);
 }

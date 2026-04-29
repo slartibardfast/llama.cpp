@@ -4,8 +4,21 @@
 // Requires: GL_KHR_shader_subgroup_shuffle (subgroupShuffleXor)
 // Optional: GL_KHR_shader_subgroup_arithmetic (subgroupAdd, subgroupMax — for quantize)
 //
-// Wave64 (GCN): 64 threads × 2 values = 128 elements per block.
-// Wave32 (RDNA): would need 32 threads × 4 values — different layout (not implemented).
+// Layout: 128-thread workgroup, one value per lane (val = data[tid]).
+// Works for any subgroup size in {32, 64} — Turing/Ampere/Ada/RDNA all sg=32,
+// GCN/Vega/MI200 sg=64. SUBGROUP_SIZE is a spec constant set by the dispatcher
+// to device->subgroup_size; the dispatcher also pins requiredSubgroupSize to
+// the same value via VK_EXT_subgroup_size_control so the unrolled bounds match
+// the runtime subgroup width.
+//
+// The 7-stage butterfly (log2(128)) splits naturally:
+//   - Stages with stride < SUBGROUP_SIZE: subgroupShuffleXor (no barrier).
+//   - Stages with stride >= SUBGROUP_SIZE: shared memory + barrier.
+// On sg=32 that's 5 cheap stages + 2 LDS stages. On sg=64: 6 cheap + 1 LDS.
+// Pattern matches cumsum.comp:15-17 / mul_mat_vec_base.glsl:154-200 in this
+// repo for portable subgroup-size-agnostic reductions.
+
+layout (constant_id = 0) const uint SUBGROUP_SIZE = 32;
 
 // Lloyd-Max-Gaussian codebook for N(0,1), 16 centroids (Max 1960 tables)
 const float TURBO_KV_CODEBOOK[16] = float[16](
@@ -23,39 +36,70 @@ float turbo_kv_sign(uint idx) {
     return (h & 1u) != 0 ? 1.0 : -1.0;
 }
 
-// Subgroup-cooperative Walsh-Hadamard butterfly (7 stages for dim=128).
-// Each thread holds val0 = data[tid] and val1 = data[tid+64].
-// Stages 0-5: cross-thread via subgroupShuffleXor (strides 1-32).
-// Stage 6: thread-local swap (stride 64).
-void turbo_kv_fwht(inout float val0, inout float val1, uint tid) {
-    [[unroll]] for (uint s = 1u; s <= 32u; s <<= 1) {
-        float p0 = subgroupShuffleXor(val0, s);
-        float p1 = subgroupShuffleXor(val1, s);
-        if ((tid & s) == 0) { val0 += p0; val1 += p1; }
-        else                { val0 = p0 - val0; val1 = p1 - val1; }
+// Shared memory for the cross-subgroup butterfly stages and for the
+// per-block scalar reductions (sum_sq / max_abs). 128 floats covers both:
+// the butterfly uses lds[0..128), the cross-subgroup reduce uses lds[0..4)
+// (max 4 partials at sg=32). They're not used simultaneously.
+shared float turbo_kv_lds[128];
+
+// Walsh-Hadamard butterfly, 7 stages for dim=128, one value per lane.
+void turbo_kv_fwht(inout float val, uint tid) {
+    // Subgroup-internal stages: shuffle, no barrier.
+    [[unroll]] for (uint s = 1u; s < SUBGROUP_SIZE; s <<= 1) {
+        float p = subgroupShuffleXor(val, s);
+        val = ((tid & s) == 0u) ? (val + p) : (p - val);
     }
-    float t = val0;
-    val0 = val0 + val1;
-    val1 = t - val1;
+    // Cross-subgroup stages: shared memory.
+    [[unroll]] for (uint s = SUBGROUP_SIZE; s < 128u; s <<= 1) {
+        barrier();
+        turbo_kv_lds[tid] = val;
+        barrier();
+        float p = turbo_kv_lds[tid ^ s];
+        val = ((tid & s) == 0u) ? (val + p) : (p - val);
+    }
 }
 
 // Inverse RHT: butterfly → normalize → sign_flip → scale
 // Forward is: sign_flip → butterfly → normalize
 // Inverse is: butterfly → normalize → sign_flip (sign only AFTER WHT, not before)
-void turbo_kv_inverse_rht(inout float val0, inout float val1, uint tid, float norm) {
-    turbo_kv_fwht(val0, val1, tid);
+void turbo_kv_inverse_rht(inout float val, uint tid, float norm) {
+    turbo_kv_fwht(val, tid);
     float scale = norm * TURBO_KV_RSQRT128;
-    val0 *= turbo_kv_sign(tid)      * scale;
-    val1 *= turbo_kv_sign(tid + 64) * scale;
+    val *= turbo_kv_sign(tid) * scale;
 }
 
 // Forward RHT: sign_flip → butterfly → normalize
-void turbo_kv_forward_rht(inout float val0, inout float val1, uint tid) {
-    val0 *= turbo_kv_sign(tid);
-    val1 *= turbo_kv_sign(tid + 64);
-    turbo_kv_fwht(val0, val1, tid);
-    val0 *= TURBO_KV_RSQRT128;
-    val1 *= TURBO_KV_RSQRT128;
+void turbo_kv_forward_rht(inout float val, uint tid) {
+    val *= turbo_kv_sign(tid);
+    turbo_kv_fwht(val, tid);
+    val *= TURBO_KV_RSQRT128;
+}
+
+// Cross-subgroup sum reduce over the 128-thread workgroup.
+// Uses the same shared LDS as the butterfly; safe because callers guard
+// with their own pre-barrier when interleaving.
+shared float turbo_kv_sh_partial[4]; // max 128/32 = 4 subgroups
+
+float turbo_kv_workgroup_sum(float val) {
+    float partial = subgroupAdd(val);
+    if (subgroupElect()) turbo_kv_sh_partial[gl_SubgroupID] = partial;
+    barrier();
+    float total = 0.0;
+    [[unroll]] for (uint i = 0u; i < 128u / SUBGROUP_SIZE; i++) {
+        total += turbo_kv_sh_partial[i];
+    }
+    return total;
+}
+
+float turbo_kv_workgroup_max(float val) {
+    float partial = subgroupMax(val);
+    if (subgroupElect()) turbo_kv_sh_partial[gl_SubgroupID] = partial;
+    barrier();
+    float m = turbo_kv_sh_partial[0];
+    [[unroll]] for (uint i = 1u; i < 128u / SUBGROUP_SIZE; i++) {
+        m = max(m, turbo_kv_sh_partial[i]);
+    }
+    return m;
 }
 
 // Nearest codebook entry. Codebook is sorted — unrolled linear scan.
