@@ -294,6 +294,10 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     // --cache-type-v for agent workloads (no observed fingerprint
     // divergence from f16, half the V-cache footprint).
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,  GGML_TYPE_IQ4_NL)
+    // TQ_V_4B: 128-element symmetric 4-bit (q4_0 layout, 4× scale
+    // amortization). Per-thread dequant — no RHT, fits fattn-vec.
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,    GGML_TYPE_TQ_V_4B)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_TQ_V_4B, GGML_TYPE_TQ_V_4B)
 #endif // GGML_CUDA_FA_ALL_QUANTS
 
     GGML_ABORT("fatal error");
@@ -378,10 +382,11 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
 #ifndef GGML_CUDA_FA_ALL_QUANTS
     if (K->type != V->type) {
-        // K=F16 + V=IQ4_NL is instantiated in the default build for the
-        // agent --cache-type-v iq4_nl path; everything else mixed needs
-        // GGML_CUDA_FA_ALL_QUANTS.
-        const bool ok_mixed = K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_IQ4_NL;
+        // Default-build instantiated mixed pairs: K=F16 paired with
+        // either V=IQ4_NL or V=TQ_V_4B (both common agent V-cache
+        // configs). Everything else mixed needs GGML_CUDA_FA_ALL_QUANTS.
+        const bool ok_mixed = K->type == GGML_TYPE_F16
+                              && (V->type == GGML_TYPE_IQ4_NL || V->type == GGML_TYPE_TQ_V_4B);
         if (!ok_mixed) {
             return BEST_FATTN_KERNEL_NONE;
         }
@@ -401,6 +406,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_BF16:
+        case GGML_TYPE_TQ_V_4B:
             break;
         default:
             return BEST_FATTN_KERNEL_NONE;

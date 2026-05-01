@@ -1,0 +1,7 @@
+// Instantiations for K=TQ_V_4B, V=TQ_V_4B fattn-vec kernels.
+
+#include "../fattn-vec.cuh"
+
+DECL_FATTN_VEC_CASE( 64, GGML_TYPE_TQ_V_4B, GGML_TYPE_TQ_V_4B);
+DECL_FATTN_VEC_CASE(128, GGML_TYPE_TQ_V_4B, GGML_TYPE_TQ_V_4B);
+DECL_FATTN_VEC_CASE(256, GGML_TYPE_TQ_V_4B, GGML_TYPE_TQ_V_4B);

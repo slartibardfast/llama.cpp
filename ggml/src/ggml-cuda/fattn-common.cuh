@@ -3,6 +3,7 @@
 #include "common.cuh"
 #include "convert.cuh"
 #include "vecdotq.cuh"
+#include "../../include/ggml-turbo-quant.h"
 
 #include <cstdint>
 
@@ -131,6 +132,40 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_q4_0(
 
         const float2 Q_ds = ((const float2 *) Q_ds_v)[k_KQ_0/nthreads];
         sum += __half2float(K_q4_0[ib].d) * (sumi*Q_ds.x - (8/QI8_1)*Q_ds.y);
+    }
+
+    return sum;
+}
+
+template<int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tq_v_4b(
+    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+
+    // TQ_V_4B: 128-element K block. q8_1 activation block is 32 elements
+    // (QI8_1 == 8 ints per Q block). One TQ_V_4B block covers 4 Q blocks.
+    // Same (q - 8) symmetric quantizer as q4_0; bias correction is identical.
+    const block_tq_v_4b * K_blocks = (const block_tq_v_4b *) K_c;
+    GGML_UNUSED(Q_v);
+
+    float sum = 0.0f;
+
+#pragma unroll
+    for (int k_KQ_0 = 0; k_KQ_0 < int(D/sizeof(int)); k_KQ_0 += nthreads) {
+        const int k_KQ = k_KQ_0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
+
+        const int ib    =  k_KQ /  32;       // 32 ints per TQ_V_4B block
+        const int iqs4  =  k_KQ %  16;       // 16 byte-positions per block half
+        const int shift = (k_KQ %  32) / 16; // 0 = low-nibble half, 1 = high-nibble half
+
+        int v;
+        ggml_cuda_memcpy_1<sizeof(int), 2>(&v, K_blocks[ib].qs + sizeof(int)*iqs4);
+        v = (v >> (4*shift)) & 0x0F0F0F0F;
+        const int u = Q_q8[k_KQ_0/nthreads];
+
+        const int sumi = ggml_cuda_dp4a(v, u, 0);
+
+        const float2 Q_ds = ((const float2 *) Q_ds_v)[k_KQ_0/nthreads];
+        sum += __half2float(*(const half *)&K_blocks[ib].d) * (sumi*Q_ds.x - (8/QI8_1)*Q_ds.y);
     }
 
     return sum;
@@ -591,11 +626,55 @@ constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
         return vec_dot_fattn_vec_KQ_q5_1<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_Q8_0) {
         return vec_dot_fattn_vec_KQ_q8_0<D, nthreads>;
+    } else if constexpr (type_K == GGML_TYPE_TQ_V_4B) {
+        return vec_dot_fattn_vec_KQ_tq_v_4b<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_BF16) {
         return vec_dot_fattn_vec_KQ_bf16<D, nthreads>;
     } else {
         static_assert(type_K == -1, "bad type");
         return nullptr;
+    }
+}
+
+template <typename T, int ne>
+static __device__ __forceinline__ void dequantize_V_tq_v_4b(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+    // TQ_V_4B: 128-element block, fp16 scale + 64 bytes of nibbles.
+    // Layout matches q4_0 semantics: low nibble = first half of block,
+    // high nibble = second half. Dequant: (q - 8) * d.
+    const block_tq_v_4b * x = (const block_tq_v_4b *) vx;
+
+    const int64_t ib    =  i0          /  TQ_V_4B_BLOCK_SIZE;       // 128
+    const int     iqs   =  i0          % (TQ_V_4B_BLOCK_SIZE/2);    // 0..63
+    const int     shift = (i0 % TQ_V_4B_BLOCK_SIZE) / (TQ_V_4B_BLOCK_SIZE/2);
+
+    int q;
+    static_assert(ne == 2 || ne == 4, "bad ne");
+    ggml_cuda_memcpy_1<ne, 2>(&q, x[ib].qs + iqs);
+    q >>= 4*shift;
+    q &= 0x0F0F0F0F;
+    q = __vsubss4(q, 0x08080808);
+
+    const int8_t * q8 = (const int8_t *) &q;
+
+#ifdef FP16_AVAILABLE
+    if constexpr (std::is_same_v<T, half>) {
+        const half2 d = __half2half2(*(const half *)&x[ib].d);
+
+#pragma unroll
+        for (int l0 = 0; l0 < ne; l0 += 2) {
+            ((half2 *) dst)[l0/2] = d * make_half2(q8[l0 + 0], q8[l0 + 1]);
+        }
+    } else
+#endif // FP16_AVAILABLE
+    if constexpr (std::is_same_v<T, float>) {
+        const float d = __half2float(*(const half *)&x[ib].d);
+
+#pragma unroll
+        for (int l = 0; l < ne; ++l) {
+            ((float *) dst)[l] = d * q8[l];
+        }
+    } else {
+        static_assert(std::is_same_v<T, void>, "bad type");
     }
 }
 
@@ -653,6 +732,8 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
         return dequantize_V_q8_0<T, ne>;
     } else if constexpr (type_V == GGML_TYPE_IQ4_NL) {
         return dequantize_V_iq4_nl<T, ne>;
+    } else if constexpr (type_V == GGML_TYPE_TQ_V_4B) {
+        return dequantize_V_tq_v_4b<T, ne>;
     } else if constexpr (type_V == GGML_TYPE_BF16) {
         return dequantize_V_bf16<float, ne>;
     } else {
