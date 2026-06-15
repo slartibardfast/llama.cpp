@@ -3060,7 +3060,16 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
 #ifdef GGML_CUDA_NO_PEER_COPY
             return false;
 #else
-            CUDA_CHECK(cudaMemcpyPeerAsync(dst->data, cuda_ctx_dst->device, src->data, cuda_ctx_src->device, ggml_nbytes(dst), cuda_ctx_src->stream()));
+            // cudaMemcpyPeerAsync is not capturable in a CUDA graph. While the src
+            // stream is capturing, use a capturable DtoD copy over UVA instead — it
+            // takes the direct peer path here because peer access is already enabled.
+            cudaStreamCaptureStatus capture_status;
+            CUDA_CHECK(cudaStreamIsCapturing(cuda_ctx_src->stream(), &capture_status));
+            if (capture_status != cudaStreamCaptureStatusNone) {
+                CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, cuda_ctx_src->stream()));
+            } else {
+                CUDA_CHECK(cudaMemcpyPeerAsync(dst->data, cuda_ctx_dst->device, src->data, cuda_ctx_src->device, ggml_nbytes(dst), cuda_ctx_src->stream()));
+            }
 #endif // GGML_CUDA_NO_PEER_COPY
         }
 
