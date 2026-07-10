@@ -7528,7 +7528,7 @@ struct test_falcon : public test_llm {
 // ###########################################
 static const ggml_type all_types[] = {
     GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16,
-    GGML_TYPE_Q4_0, GGML_TYPE_Q4_1,
+    GGML_TYPE_Q4_0, GGML_TYPE_Q4_0_AR16, GGML_TYPE_Q4_1,
     GGML_TYPE_Q5_0, GGML_TYPE_Q5_1,
     GGML_TYPE_Q8_0,
     GGML_TYPE_Q1_0,

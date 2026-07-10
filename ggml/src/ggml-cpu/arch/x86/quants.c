@@ -856,6 +856,42 @@ void ggml_vec_dot_q4_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
     *s = sumf;
 }
 
+// Q4_0_AR16 x Q8_0 vec_dot, scalar (documented fallback; SIMD optimization deferred).
+// Q4_0_AR16 blocks are 16 elements; Q8_0 blocks are 32, so two AR16 blocks pair with
+// one Q8_0 block. Interleaved nibble unpack, symmetric scale.
+void ggml_vec_dot_q4_0_ar16_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    const int qk = QK8_0;
+    const int nb = n / qk;
+
+    assert(n % qk == 0);
+    assert(nrc == 1);
+    UNUSED(nrc); UNUSED(bx); UNUSED(by); UNUSED(bs);
+
+    const block_q4_0_ar16 * GGML_RESTRICT x = vx;
+    const block_q8_0      * GGML_RESTRICT y = vy;
+
+    float sumf = 0.0f;
+    for (int ib = 0; ib < nb; ++ib) {
+        const block_q4_0_ar16 * a = &x[2*ib + 0];
+        const block_q4_0_ar16 * b = &x[2*ib + 1];
+
+        int sum_a = 0, sum_b = 0;
+        for (int j = 0; j < QK4_0_AR16/2; ++j) {
+            const int a0 = (a->qs[j] & 0x0F) - 8;
+            const int a1 = (a->qs[j] >>   4) - 8;
+            const int b0 = (b->qs[j] & 0x0F) - 8;
+            const int b1 = (b->qs[j] >>   4) - 8;
+            sum_a += a0 * y[ib].qs[2*j + 0] + a1 * y[ib].qs[2*j + 1];
+            sum_b += b0 * y[ib].qs[QK4_0_AR16 + 2*j + 0] + b1 * y[ib].qs[QK4_0_AR16 + 2*j + 1];
+        }
+        const float yd = GGML_CPU_FP16_TO_FP32(y[ib].d);
+        sumf += sum_a * GGML_CPU_FP16_TO_FP32(a->d) * yd;
+        sumf += sum_b * GGML_CPU_FP16_TO_FP32(b->d) * yd;
+    }
+
+    *s = sumf;
+}
+
 void ggml_vec_dot_q4_1_q8_1(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     const int qk = QK8_1;
     const int nb = n / qk;
