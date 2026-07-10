@@ -1,0 +1,54 @@
+name: Spec gates (allium + binding fixture)
+
+# The verification lanes for the specs co-located on this branch (host
+# methodology, template ledger entry b6232a5). allium check + analyse must be
+# green on every spec; every `allium plan` obligation must be dispositioned
+# (host-lifecycle obligations, resolved against the fixture sources); and the
+# binding fixture must run green against this tree's ggml scalar reference.
+
+on:
+  push:
+    branches: [host-specs]
+
+permissions:
+  contents: read
+
+jobs:
+  spec-lanes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust + allium-cli + host-lifecycle
+        run: |
+          curl -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.95.0
+          source "$HOME/.cargo/env"
+          cargo install allium-cli --version 3.5.0 --locked --quiet
+          cargo install --git https://github.com/connollydavid/host-lifecycle --tag v0.40.1 --quiet
+          allium --version
+
+      - name: Allium check + analyse (every .allium)
+        run: |
+          source "$HOME/.cargo/env"
+          rc=0
+          while IFS= read -r f; do
+            allium check   "$f" || { echo "::error::check failed: $f"; rc=1; }
+            allium analyse "$f" >/dev/null || { echo "::error::analyse failed: $f"; rc=1; }
+          done < <(find specs -name '*.allium' | sort)
+          exit $rc
+
+      - name: Allium obligations (every .allium)
+        run: |
+          source "$HOME/.cargo/env"
+          rc=0
+          while IFS= read -r f; do
+            host-lifecycle obligations "$f" --tests specs || { echo "::error::obligations failed: $f"; rc=1; }
+          done < <(find specs -name '*.allium' | sort)
+          exit $rc
+
+      - name: Binding fixture (spec vs the landed scalar reference)
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq ninja-build
+          ./specs/mmq/run-binding.sh
