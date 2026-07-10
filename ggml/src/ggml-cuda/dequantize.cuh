@@ -57,6 +57,23 @@ static __device__ __forceinline__ void dequantize_q4_0(const void * vx, const in
     v.y = (v.y - 8.0f) * d;
 }
 
+static __device__ __forceinline__ void dequantize_q4_0_ar16(const void * vx, const int64_t ib, const int iqs, float2 & v){
+    const block_q4_0_ar16 * x = (const block_q4_0_ar16 *) vx;
+
+    const float d = x[ib].d;
+
+    // Interleaved nibble layout: element k is nibble k, i.e. byte k/2, low nibble for even k
+    // (NOT Q4_0's split halves). iqs is in 0..QK4_0_AR16/2; v.x is element iqs, v.y is
+    // element iqs + QK4_0_AR16/2. Scale is symmetric: d = absmax/8, value = (code - 8)*d.
+    const int shift = 4*(iqs & 1);
+
+    v.x = (x[ib].qs[iqs/2 + 0] >> shift) & 0xF;
+    v.y = (x[ib].qs[iqs/2 + 4] >> shift) & 0xF;
+
+    v.x = (v.x - 8.0f) * d;
+    v.y = (v.y - 8.0f) * d;
+}
+
 static __device__ __forceinline__ void dequantize_q4_1(const void * vx, const int64_t ib, const int iqs, float2 & v){
     const block_q4_1 * x = (const block_q4_1 *) vx;
 
