@@ -3,15 +3,16 @@
 # which binds the spec against the landed GGML_TYPE_Q4_0_AR16 (id 42) scalar
 # reference on this branch. Each line: <obligation-id> => <disposition>
 #
-# Known divergence (reported, not masked): the engine's quantize computes
-# codes as roundf(x * (1/scale)) — round-half-away-from-zero on a reciprocal
-# multiply — where QuantizeFormula says round_nearest_even(x / scale). The
-# two agree except at exact rounding ties; the fixture's
-# probe_rne_tie_divergence demonstrates the tie case ([8, 2.5, 0...]: engine
-# code 11, spec code 10) and reports it. The same divergence exists verbatim
-# in the ik_llama.cpp reference this port mirrors (whose own code comment
-# also claims RNE). check_quantize_formula binds bit-exact on random and
-# structured non-tie inputs.
+# Tie-semantics reconciliation (orchestrator ruling, plan/0134 lane): the
+# ik spec text said round_nearest_even(x / scale) while both forks' C
+# implements roundf(x * (1/scale)) — ties away from zero on a reciprocal
+# multiply. The spec was reconciled to the C (ik's C is the bit-identical
+# ground truth the port is accepted against; the AutoRound remix carries
+# codes verbatim, so tie semantics never touch calibration). The amended
+# QuantizeFormula is discharged by check_quantize_formula (random +
+# structured inputs, bit-exact) and pinned at exact ties by
+# check_quantize_tie_semantics ([8, 2.5, -2.5, ...]: 2.5 -> code 11,
+# -2.5 -> code 5; RNE would give 10/6).
 entity-fields.FloatRow => waived: external entity managed by ggml's tensor system; a modeling wrapper with no independent C artifact to verify
 entity-fields.Q8_0_Row => waived: external entity owned by ggml's q8_0 layout, treated as opaque by this spec; exercised only as the vec_dot partner inside check_vec_dot_q8_0
 config-default.block_size => test:check_block_layout exercises=QK4_0_AR16
@@ -29,6 +30,7 @@ rule-success.UnpackCode => test:check_unpack_code exercises=quantize_row_q4_0_ar
 rule-failure.UnpackCode.1 => waived: the k >= 0 precondition is a caller contract in C; an out-of-range k is undefined behaviour with no observable failure path to drive
 rule-failure.UnpackCode.2 => waived: the k < 16 precondition is a caller contract in C; an out-of-range k is undefined behaviour with no observable failure path to drive
 contract-signature.DequantizeBlock.invoke => test:check_dequantize_formula exercises=dequantize_row_q4_0_ar16
+# QuantizeFormula's tie behaviour is additionally pinned by check_quantize_tie_semantics.
 contract-signature.QuantizeRow.invoke => test:check_quantize_formula exercises=quantize_row_q4_0_ar16_ref
 contract-signature.VecDot.invoke => test:check_vec_dot_q8_0 exercises=ggml_vec_dot_q4_0_ar16_q8_0
 invariant.ColPermEquivalence16Aligned => test:check_colperm_16aligned exercises=quantize_row_q4_0_ar16_ref,dequantize_row_q4_0_ar16
