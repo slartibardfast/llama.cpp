@@ -267,6 +267,13 @@ contract QuantizeRow {
         -- touch calibrated weights. Demonstrating tie: block
         -- [8, 2.5, 0, ...] has scale exactly 1.0; 2.5 rounds to 3
         -- (code 11) under ties-away, where RNE would give 2 (code 10).
+        --
+        -- Standing intent (operator, 2026-07-10): a future native
+        -- kernel rework may adopt RNE, the statistically unbiased
+        -- convention; ties-away holds until then for ggml-family
+        -- consistency and bit-identity with ik's C. Such a switch is
+        -- a format-semantics revision: this formula and the fixture's
+        -- check_quantize_tie_semantics must flip in the same change.
 
     @invariant ZeroBlockHandling
         -- If block_max = 0 (entire 16-element block is exactly zero),
