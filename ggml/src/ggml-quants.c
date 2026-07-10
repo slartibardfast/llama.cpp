@@ -476,6 +476,66 @@ void dequantize_row_q4_0(const block_q4_0 * GGML_RESTRICT x, float * GGML_RESTRI
     }
 }
 
+// Q4_0_AR16: AutoRound 16-element interleaved-nibble symmetric 4-bit.
+// Differs from Q4_0 in two load-bearing ways: the scale is symmetric
+// (d = absmax/8, not Q4_0's signed max/-8) and the nibble pack is interleaved
+// (byte j = code[2j] | code[2j+1]<<4, not Q4_0's split halves).
+void quantize_row_q4_0_ar16_ref(const float * GGML_RESTRICT x, block_q4_0_ar16 * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK4_0_AR16;
+
+    assert(k % qk == 0);
+
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        float amax = 0.0f;
+        for (int j = 0; j < qk; j++) {
+            const float v = fabsf(x[i*qk + j]);
+            if (v > amax) amax = v;
+        }
+
+        const float d  = amax / 8.0f;
+        const float id = d != 0.0f ? 1.0f/d : 0.0f;
+
+        y[i].d = GGML_FP32_TO_FP16(d);
+
+        for (int j = 0; j < qk/2; ++j) {
+            const float x0 = x[i*qk + 2*j + 0] * id;   // even element -> low nibble
+            const float x1 = x[i*qk + 2*j + 1] * id;   // odd  element -> high nibble
+
+            const int8_t  c0i = (int8_t) roundf(x0);
+            const int8_t  c1i = (int8_t) roundf(x1);
+            const uint8_t c0  = (uint8_t)(c0i < -8 ? 0 : (c0i > 7 ? 15 : c0i + 8));
+            const uint8_t c1  = (uint8_t)(c1i < -8 ? 0 : (c1i > 7 ? 15 : c1i + 8));
+
+            y[i].qs[j] = c0 | (c1 << 4);
+        }
+    }
+}
+
+void quantize_row_q4_0_ar16(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_q4_0_ar16_ref(x, (block_q4_0_ar16 *) y, k);
+}
+
+void dequantize_row_q4_0_ar16(const block_q4_0_ar16 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK4_0_AR16;
+
+    assert(k % qk == 0);
+
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        const float d = GGML_FP16_TO_FP32(x[i].d);
+        for (int j = 0; j < qk/2; ++j) {
+            const int c0 = (x[i].qs[j] & 0x0F) - 8;   // even element
+            const int c1 = (x[i].qs[j] >>   4) - 8;   // odd  element
+
+            y[i*qk + 2*j + 0] = c0 * d;
+            y[i*qk + 2*j + 1] = c1 * d;
+        }
+    }
+}
+
 void dequantize_row_q4_1(const block_q4_1 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
     static const int qk = QK4_1;
 
@@ -2134,6 +2194,22 @@ size_t quantize_q4_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, 
     char * qrow = (char *)dst;
     for (int64_t row = 0; row < nrow; ++row) {
         quantize_row_q4_0_impl(src, (block_q4_0*)qrow, n_per_row, quant_weights);
+        src += n_per_row;
+        qrow += row_size;
+    }
+    return nrow * row_size;
+}
+
+size_t quantize_q4_0_ar16(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    // AR16 is a lossless AutoRound repack; the imatrix is not used.
+    if (!quant_weights) {
+        quantize_row_q4_0_ar16_ref(src, dst, (int64_t)nrow*n_per_row);
+        return nrow * ggml_row_size(GGML_TYPE_Q4_0_AR16, n_per_row);
+    }
+    size_t row_size = ggml_row_size(GGML_TYPE_Q4_0_AR16, n_per_row);
+    char * qrow = (char *)dst;
+    for (int64_t row = 0; row < nrow; ++row) {
+        quantize_row_q4_0_ar16_ref(src, (block_q4_0_ar16*)qrow, n_per_row);
         src += n_per_row;
         qrow += row_size;
     }
