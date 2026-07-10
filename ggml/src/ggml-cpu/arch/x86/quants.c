@@ -858,12 +858,14 @@ void ggml_vec_dot_q4_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
 
 // Q4_0_AR16 x Q8_0 vec_dot, scalar (documented fallback; SIMD optimization deferred).
 // Q4_0_AR16 blocks are 16 elements; Q8_0 blocks are 32, so two AR16 blocks pair with
-// one Q8_0 block. Interleaved nibble unpack, symmetric scale.
+// one Q8_0 block. Interleaved nibble unpack, symmetric scale. n may be an odd multiple
+// of 16 (blck_size(Q4_0_AR16) == 16): the final AR16 block then dots against the first
+// 16 elements of one more Q8_0 block, sharing that block's scale.
 void ggml_vec_dot_q4_0_ar16_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     const int qk = QK8_0;
-    const int nb = n / qk;
+    const int nb = n / qk; // full Q8_0 blocks (a 16-element tail is handled below)
 
-    assert(n % qk == 0);
+    assert(n % QK4_0_AR16 == 0);
     assert(nrc == 1);
     UNUSED(nrc); UNUSED(bx); UNUSED(by); UNUSED(bs);
 
@@ -887,6 +889,19 @@ void ggml_vec_dot_q4_0_ar16_q8_0(int n, float * GGML_RESTRICT s, size_t bs, cons
         const float yd = GGML_CPU_FP16_TO_FP32(y[ib].d);
         sumf += sum_a * GGML_CPU_FP16_TO_FP32(a->d) * yd;
         sumf += sum_b * GGML_CPU_FP16_TO_FP32(b->d) * yd;
+    }
+
+    if (n % qk != 0) {
+        // odd tail: one AR16 block against the first half of a final (zero-padded) Q8_0 block
+        const block_q4_0_ar16 * a = &x[2*nb];
+
+        int sum_a = 0;
+        for (int j = 0; j < QK4_0_AR16/2; ++j) {
+            const int a0 = (a->qs[j] & 0x0F) - 8;
+            const int a1 = (a->qs[j] >>   4) - 8;
+            sum_a += a0 * y[nb].qs[2*j + 0] + a1 * y[nb].qs[2*j + 1];
+        }
+        sumf += sum_a * GGML_CPU_FP16_TO_FP32(a->d) * GGML_CPU_FP16_TO_FP32(y[nb].d);
     }
 
     *s = sumf;

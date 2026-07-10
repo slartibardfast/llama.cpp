@@ -8,7 +8,7 @@
 //     test-backend-ops), including shapes test-backend-ops does not generate:
 //     ne00 % 32 == 16 (odd 16-element block count) and dual-GPU row-split buffers.
 //
-// The CPU dequantize fixture always runs. The GPU sections run when a GPU backend is
+// The CPU dequantize fixture and CPU MUL_MAT shapes always run. The GPU sections run when a GPU backend is
 // present; the split-buffer section additionally needs >= 2 devices of the same backend.
 // Missing hardware skips the section (exit stays 0), it does not fail.
 
@@ -259,9 +259,9 @@ int main() {
 
     int fails = 0;
     fails += test_dequant_fixture(cpu, "CPU");
-    // The CPU MUL_MAT reference is exercised across k=256 shapes by test-backend-ops;
-    // k % 32 == 16 shapes are NOT run on CPU here: the scalar vec_dot pairs two AR16
-    // blocks per Q8_0 block and drops the odd tail block (known foundation gap).
+    fails += test_mul_mat(cpu, "CPU", 16, 1, 256, nullptr);
+    fails += test_mul_mat(cpu, "CPU", 16, 64, 256, nullptr);
+    fails += test_mul_mat(cpu, "CPU", 4, 3, 48, nullptr);   // odd block count: scalar vec_dot tail
     ggml_backend_free(cpu);
 
     ggml_backend_t gpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_GPU, nullptr);
