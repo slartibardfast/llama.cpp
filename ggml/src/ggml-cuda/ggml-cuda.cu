@@ -2506,7 +2506,8 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
                                    src0->view_src;
 
     bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && !bad_padding_clear && src1->type == GGML_TYPE_F32 &&
-                             dst->type == GGML_TYPE_F32 && src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
+                             dst->type == GGML_TYPE_F32 && src1->ne[1] <= MMVQ_MAX_BATCH_SIZE &&
+                             (src0->type != GGML_TYPE_Q4_0_AR16 || src0->ne[0] % (2*QK4_0_AR16) == 0);
 
     // fusion is not universally faster on Pascal
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
@@ -2549,7 +2550,8 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
     bool use_mul_mat_vec_q = ggml_is_quantized(src0->type) && !bad_padding_clear
         && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
-        && src1->ne[1] <= MMVQ_MAX_BATCH_SIZE;
+        && src1->ne[1] <= MMVQ_MAX_BATCH_SIZE
+        && (src0->type != GGML_TYPE_Q4_0_AR16 || src0->ne[0] % (2*QK4_0_AR16) == 0);
     bool use_mul_mat_q     = ggml_is_quantized(src0->type) && !bad_padding_clear
         && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32;
 
@@ -2636,7 +2638,8 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
         static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
         if (ne2 <= MMVQ_MAX_BATCH_SIZE) {
-            if (ggml_is_quantized(src0->type)) {
+            if (ggml_is_quantized(src0->type) &&
+                (src0->type != GGML_TYPE_Q4_0_AR16 || src0->ne[0] % (2*QK4_0_AR16) == 0)) {
                 const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc);
                 if (ne2 <= mmvq_mmid_max) {
                     ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);
@@ -5138,6 +5141,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_F16:
                     case GGML_TYPE_Q1_0:
                     case GGML_TYPE_Q4_0:
+                    case GGML_TYPE_Q4_0_AR16:
                     case GGML_TYPE_Q4_1:
                     case GGML_TYPE_Q5_0:
                     case GGML_TYPE_Q5_1:
@@ -5176,6 +5180,7 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     case GGML_TYPE_I32:
                     case GGML_TYPE_Q1_0:
                     case GGML_TYPE_Q4_0:
+                    case GGML_TYPE_Q4_0_AR16:
                     case GGML_TYPE_Q4_1:
                     case GGML_TYPE_Q5_0:
                     case GGML_TYPE_Q5_1:
