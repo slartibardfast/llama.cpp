@@ -1,0 +1,36 @@
+# Obligations for q4_0_ar16.allium, derived by `allium plan`.
+# Discharging tests live in specs/mmq/q4_0_ar16_binding.c (see run-binding.sh),
+# which binds the spec against the landed GGML_TYPE_Q4_0_AR16 (id 42) scalar
+# reference on this branch. Each line: <obligation-id> => <disposition>
+#
+# Known divergence (reported, not masked): the engine's quantize computes
+# codes as roundf(x * (1/scale)) — round-half-away-from-zero on a reciprocal
+# multiply — where QuantizeFormula says round_nearest_even(x / scale). The
+# two agree except at exact rounding ties; the fixture's
+# probe_rne_tie_divergence demonstrates the tie case ([8, 2.5, 0...]: engine
+# code 11, spec code 10) and reports it. The same divergence exists verbatim
+# in the ik_llama.cpp reference this port mirrors (whose own code comment
+# also claims RNE). check_quantize_formula binds bit-exact on random and
+# structured non-tie inputs.
+entity-fields.FloatRow => waived: external entity managed by ggml's tensor system; a modeling wrapper with no independent C artifact to verify
+entity-fields.Q8_0_Row => waived: external entity owned by ggml's q8_0 layout, treated as opaque by this spec; exercised only as the vec_dot partner inside check_vec_dot_q8_0
+config-default.block_size => test:check_block_layout exercises=QK4_0_AR16
+config-default.type_size => test:check_block_layout exercises=block_q4_0_ar16
+config-default.vec_dot_rel_tol => test:check_vec_dot_q8_0 exercises=ggml_vec_dot_q4_0_ar16_q8_0
+config-default.vec_dot_abs_tol => test:check_vec_dot_q8_0 exercises=ggml_vec_dot_q4_0_ar16_q8_0
+config-default.vec_dot_fp16_gemm_rel_tol => waived: no FP16-accumulator path is landed in this fork (CUDA port pending); the bound is retained for that work and cannot yet bind on anything
+config-default.vec_dot_fp16_gemm_abs_tol => waived: no FP16-accumulator path is landed in this fork (CUDA port pending); the bound is retained for that work and cannot yet bind on anything
+config-default.quantize_rne_abs_tol => test:check_quantize_formula exercises=quantize_row_q4_0_ar16_ref
+config-default.dequantize_rel_tol => test:check_dequantize_formula exercises=dequantize_row_q4_0_ar16
+config-default.bit_exact_codes_rel_tol => test:check_colperm_16aligned exercises=quantize_row_q4_0_ar16_ref,dequantize_row_q4_0_ar16
+entity-fields.Block_Q4_0_AR16 => test:check_block_layout exercises=block_q4_0_ar16
+entity-fields.QuantizedRow => test:check_row_layout exercises=quantize_row_q4_0_ar16_ref
+rule-success.UnpackCode => test:check_unpack_code exercises=quantize_row_q4_0_ar16_ref
+rule-failure.UnpackCode.1 => waived: the k >= 0 precondition is a caller contract in C; an out-of-range k is undefined behaviour with no observable failure path to drive
+rule-failure.UnpackCode.2 => waived: the k < 16 precondition is a caller contract in C; an out-of-range k is undefined behaviour with no observable failure path to drive
+contract-signature.DequantizeBlock.invoke => test:check_dequantize_formula exercises=dequantize_row_q4_0_ar16
+contract-signature.QuantizeRow.invoke => test:check_quantize_formula exercises=quantize_row_q4_0_ar16_ref
+contract-signature.VecDot.invoke => test:check_vec_dot_q8_0 exercises=ggml_vec_dot_q4_0_ar16_q8_0
+invariant.ColPermEquivalence16Aligned => test:check_colperm_16aligned exercises=quantize_row_q4_0_ar16_ref,dequantize_row_q4_0_ar16
+invariant.AutoRoundG128Lossless => test:check_autoround_g128_lossless exercises=dequantize_row_q4_0_ar16
+invariant.Determinism => test:check_determinism exercises=quantize_row_q4_0_ar16_ref
