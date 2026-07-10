@@ -5,19 +5,18 @@
 // specs/mmq/q4_0_ar16.obligations (disposition `test:<name>`). The spec-side
 // reference implementations here are written independently from the engine
 // code, straight from the allium formulas: quantize is
-// clamp(round_nearest_even(x / scale), -8, 7) + 8 with scale = absmax/8
-// (division, RNE via rintf under the default FE_TONEAREST mode), dequantize
+// clamp(round_ties_away(x * (1/scale)), -8, 7) + 8 with scale = absmax/8
+// (fp32 reciprocal multiply, ties away from zero via roundf), dequantize
 // is (code - 8) * fp32(d).
 //
-// Known divergence (reported, see the .obligations manifest): the engine
-// computes codes as roundf(x * (1/scale)) — round-half-AWAY-FROM-ZERO on a
-// reciprocal multiply — where the spec says round_nearest_even(x / scale).
-// The two agree except at exact rounding ties (and quotients within an ULP
-// of a tie). check_quantize_formula binds the spec formula on random and
-// structured non-tie inputs and FAILS on any mismatch there; the divergence
-// probe below demonstrates the tie case and reports it without masking it.
-// The same divergence exists verbatim in the ik_llama.cpp reference this
-// port mirrors (its own code comment also claims RNE).
+// Tie-semantics history: the ik spec text originally said
+// round_nearest_even(x / scale); both forks' C implements ties-away on a
+// reciprocal multiply. The orchestrator ruling (plan/0134 lane) reconciled
+// the SPEC to the C — ik's C is the bit-identical ground truth the port is
+// accepted against, and the production AutoRound remix carries codes
+// verbatim, so tie semantics never touch calibration. The former divergence
+// probe is now check_quantize_tie_semantics, a positive check that the tie
+// case rounds away from zero as the amended QuantizeFormula states.
 //
 // Build + run: see specs/mmq/run-binding.sh (CPU-only static build of the
 // ggml-cpu target, then compile this file against libggml-cpu.a +
@@ -43,7 +42,6 @@ void ggml_vec_dot_q4_0_ar16_q8_0(int n, float * s, size_t bs, const void * vx, s
 void ggml_cpu_init(void); // fills the CPU backend's fp16 tables; required before vec_dot
 
 static int n_fail = 0;
-static int n_divergence = 0;
 
 #define FAIL(...) do { printf("FAIL     " __VA_ARGS__); printf("\n"); n_fail++; } while (0)
 #define PASS(...) do { printf("pass     " __VA_ARGS__); printf("\n"); } while (0)
@@ -67,28 +65,26 @@ static int spec_unpack_code(const uint8_t * qs, int k) {
 }
 
 // QuantizeFormula (spec): per 16-elem block, scale = absmax/8, d = fp16(scale),
-// code_k = clamp(round_nearest_even(x_k / scale), -8, 7) + 8, interleaved pack.
+// inv_scale = 1/scale (fp32, 0 when scale = 0),
+// code_k = clamp(round_ties_away(x_k * inv_scale), -8, 7) + 8, interleaved pack.
 static void spec_quantize_block(const float * x, block_q4_0_ar16 * out) {
     float amax = 0.0f;
     for (int k = 0; k < 16; k++) {
         const float v = fabsf(x[k]);
         if (v > amax) amax = v;
     }
-    const float scale = amax / 8.0f;
+    const float scale     = amax / 8.0f;
+    const float inv_scale = scale != 0.0f ? 1.0f/scale : 0.0f;
     out->d = ggml_fp32_to_fp16(scale);
     for (int j = 0; j < 8; j++) {
         int c[2];
         for (int half = 0; half < 2; half++) {
             const int k = 2*j + half;
-            int code = 8; // ZeroBlockHandling: scale = 0 -> code 8
-            if (scale != 0.0f) {
-                const float q = x[k] / scale;      // division, per the spec
-                long r = lrintf(q);                // RNE under FE_TONEAREST
-                if (r < -8) r = -8;
-                if (r >  7) r =  7;
-                code = (int) r + 8;
-            }
-            c[half] = code;
+            const float q = x[k] * inv_scale;      // fp32 reciprocal multiply, per the spec
+            long r = lroundf(q);                   // ties away from zero, per the spec
+            if (r < -8) r = -8;
+            if (r >  7) r =  7;
+            c[half] = (int) r + 8;                 // scale = 0 -> q = 0 -> code 8 (ZeroBlockHandling)
         }
         out->qs[j] = (uint8_t)(c[0] | (c[1] << 4));
     }
@@ -188,26 +184,30 @@ static void check_quantize_formula(void) {
     PASS("check_quantize_formula: d + codes bit-exact vs spec formula over %d blocks (incl. zero block)", NB);
 }
 
-// Divergence probe (NOT an obligation discharge; reported, kept out of the
-// pass/fail budget so it cannot be mistaken for a green binding): at an exact
-// rounding tie the engine's roundf (half-away-from-zero) departs from the
-// spec's round_nearest_even. Constructed case: block [8, 2.5, 0, ...]:
-// absmax 8 -> scale 1.0 exactly; 2.5/1.0 = 2.5 -> RNE 2 (code 10), engine
-// roundf 3 (code 11).
-static void probe_rne_tie_divergence(void) {
-    float x[16] = { 8.0f, 2.5f, 0 };
+// Tie semantics at an exact rounding tie (the reconciled QuantizeFormula:
+// ties away from zero). Constructed case: block [8, 2.5, -2.5, 8, ...]:
+// absmax 8 -> scale exactly 1.0; quotient 2.5 -> 3 (code 11) and -2.5 -> -3
+// (code 5) under ties-away — RNE would give 2 (code 10) / -2 (code 6). Kept
+// as its own named check so the tie behaviour stays pinned: if the engine
+// ever silently moves to RNE, this fails before any model build drifts.
+// exercises: quantize_row_q4_0_ar16_ref
+static void check_quantize_tie_semantics(void) {
+    float x[16] = { 8.0f, 2.5f, -2.5f, 8.0f, 0 };
     block_q4_0_ar16 got, want;
     quantize_row_q4_0_ar16_ref(x, &got, 16);
     spec_quantize_block(x, &want);
     if (memcmp(&got, &want, sizeof(got)) != 0) {
-        printf("DIVERGE  probe_rne_tie_divergence: at x/scale = 2.5 engine code = %d (roundf, half-away-from-zero), "
-               "spec round_nearest_even code = %d — QuantizeFormula's RNE is not what the engine implements at exact ties "
-               "(same in the ik_llama.cpp reference)\n",
-               spec_unpack_code(got.qs, 1), spec_unpack_code(want.qs, 1));
-        n_divergence++;
-    } else {
-        printf("note     probe_rne_tie_divergence: tie case agreed (unexpected — recheck the engine rounding)\n");
+        FAIL("check_quantize_tie_semantics: tie codes got %d/%d, spec ties-away wants %d/%d",
+             spec_unpack_code(got.qs, 1), spec_unpack_code(got.qs, 2),
+             spec_unpack_code(want.qs, 1), spec_unpack_code(want.qs, 2));
+        return;
     }
+    if (spec_unpack_code(got.qs, 1) != 11 || spec_unpack_code(got.qs, 2) != 5) {
+        FAIL("check_quantize_tie_semantics: tie 2.5/-2.5 gave codes %d/%d, ties-away wants 11/5",
+             spec_unpack_code(got.qs, 1), spec_unpack_code(got.qs, 2));
+        return;
+    }
+    PASS("check_quantize_tie_semantics: exact ties round away from zero (2.5 -> code 11, -2.5 -> code 5)");
 }
 
 // contract-signature.DequantizeBlock.invoke — DequantizeFormula + ResultLength,
@@ -368,9 +368,8 @@ int main(void) {
     check_colperm_16aligned();
     check_autoround_g128_lossless();
     check_vec_dot_q8_0();
-    probe_rne_tie_divergence();
+    check_quantize_tie_semantics();
 
-    printf("\n%s: %d failure(s), %d reported divergence(s)\n",
-           n_fail == 0 ? "GREEN" : "RED", n_fail, n_divergence);
+    printf("\n%s: %d failure(s)\n", n_fail == 0 ? "GREEN" : "RED", n_fail);
     return n_fail == 0 ? 0 : 1;
 }

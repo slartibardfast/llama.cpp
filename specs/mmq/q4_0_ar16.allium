@@ -15,13 +15,16 @@
 -- 16-element permutation boundary.
 --
 -- This spec is the adapted twin of ik_llama.cpp's
--- host-specs:specs/mmq/q4_0_ar16.allium; the semantics are unchanged,
--- only the binding (type id, symbol names, file paths) is this fork's.
+-- host-specs:specs/mmq/q4_0_ar16.allium; the binding (type id, symbol
+-- names, file paths) is this fork's. One reconciliation against the ik
+-- spec TEXT: QuantizeFormula here states ties-away-from-zero rounding,
+-- which is what both forks' C actually implements — see the note on
+-- the formula itself.
 --
 -- Includes:
 --   - Block layout (10 bytes total) and the QuantizedRow wrapper.
 --   - Nibble unpack convention (interleaved per even/odd k).
---   - Quantize + dequantize contracts (RNE codes, sym INT4).
+--   - Quantize + dequantize contracts (ties-away codes, sym INT4).
 --   - vec_dot contract against Q8_0 query rows (the CPU vec-dot partner:
 --     two AR16 blocks pair with one 32-element Q8_0 block).
 --   - The col-perm-equivalence-16-aligned invariant (the *reason* this
@@ -115,9 +118,11 @@ config {
     vec_dot_fp16_gemm_rel_tol: Decimal = 0.05
     vec_dot_fp16_gemm_abs_tol: Decimal = 0.01
 
-    -- Quantize is integer arithmetic (clamp+RNE on a scalar). The
-    -- resulting *codes* must be bit-exact across SIMD variants —
-    -- there is no rounding budget here.
+    -- Quantize is integer arithmetic (clamp + ties-away rounding on a
+    -- scalar). The resulting *codes* must be bit-exact across SIMD
+    -- variants — there is no rounding budget here. (The name keeps the
+    -- historical `rne` stem so the obligation ids stay stable across
+    -- the tie-semantics reconciliation recorded at QuantizeFormula.)
     quantize_rne_abs_tol: Decimal = 0.0
 
     -- Dequantize is `(code - 8) * fp32(d)`: a single fp16-to-fp32
@@ -226,8 +231,8 @@ contract DequantizeBlock {
 }
 
 -- Per-row quantize. Symmetric INT4 with per-block scale = max_abs / 8;
--- codes are clamped + round-nearest-even into [-8, 7] then offset by
--- +8 to produce nibble-storable [0, 15].
+-- codes are rounded ties-away-from-zero, clamped into [-8, 7], then
+-- offset by +8 to produce nibble-storable [0, 15].
 contract QuantizeRow {
     invoke: (values: FloatRow) -> QuantizedRow
 
@@ -240,13 +245,28 @@ contract QuantizeRow {
         -- For each block i in 0..(values.n_elements / 16):
         --   block_max = max(abs(values.data[16*i .. 16*i + 16]))
         --   scale     = block_max / 8
+        --   inv_scale = 1 / scale            (fp32 reciprocal; 0 when scale = 0)
         --   For k in 0..16:
-        --     code_k = clamp(round_nearest_even(values.data[16*i+k] / scale), -8, 7) + 8
+        --     code_k = clamp(round_ties_away(values.data[16*i+k] * inv_scale), -8, 7) + 8
         -- The result block has d = fp16(scale) and qs packing the
         -- codes per UnpackCode's convention. Bit-exact on codes
         -- within config.quantize_rne_abs_tol (0.0). max, clamp,
-        -- round_nearest_even are inline black-box helpers, not
+        -- round_ties_away are inline black-box helpers, not
         -- deferred refs.
+        --
+        -- Rounding reconciliation (orchestrator ruling, plan/0134 lane):
+        -- the ik spec text said round_nearest_even(x / scale), but the
+        -- C both forks ship — ik's quantize_row_q4_0_ar16_ref and this
+        -- port's bit-identical copy — computes roundf(x * (1/scale)):
+        -- ties away from zero, on an fp32 reciprocal multiply. The spec
+        -- binds to that C, the ground truth the port is accepted
+        -- against, so the formula above states ties-away + reciprocal
+        -- verbatim. Calibration is unaffected: the production AutoRound
+        -- remix carries INT4 codes verbatim (AutoRoundG128Lossless) and
+        -- never routes through this quantize, so tie semantics never
+        -- touch calibrated weights. Demonstrating tie: block
+        -- [8, 2.5, 0, ...] has scale exactly 1.0; 2.5 rounds to 3
+        -- (code 11) under ties-away, where RNE would give 2 (code 10).
 
     @invariant ZeroBlockHandling
         -- If block_max = 0 (entire 16-element block is exactly zero),
@@ -348,7 +368,7 @@ invariant Determinism {
 
 -- Black-box helpers used inline above (per project convention,
 -- `deferred` is for cross-`.allium` refs only):
---   max, clamp, round_nearest_even, abs, fp32, fp16, nibble_at,
+--   max, clamp, round_ties_away, abs, fp32, fp16, nibble_at,
 --   permute_blocks, permute_columns_16_aligned, rel_diff,
 --   autoround_to_q4_0_ar16, autoround_scale_fp16_for_block,
 --   scaled_codes, DequantizeRow.

@@ -28,9 +28,11 @@ specs/<topic>/           one dir per concern (mmq, ...)
   C-side precondition contracts).
 - **binding fixture** (discharge): `specs/mmq/run-binding.sh` builds ggml CPU-only
   (static, ccache off) and runs the property checks bit-exact against the scalar
-  reference. A known spec-vs-implementation divergence (round-nearest-even vs the
-  engine's roundf at exact rounding ties) is demonstrated by a probe and reported
-  in the fixture output and the manifest header, not masked.
+  reference. The quantize tie semantics were reconciled spec-to-C (the ik spec
+  text said round-nearest-even; both forks' C rounds ties away from zero on a
+  reciprocal multiply, and the C is the accepted ground truth) — the amended
+  QuantizeFormula records the ruling, and `check_quantize_tie_semantics` pins
+  the tie behaviour so a silent move to RNE would fail the lane.
 
 CI: `.github/workflows/spec-gates.yml` (push to `host-specs`). The host references
 this branch by pin in `.host-software`.
