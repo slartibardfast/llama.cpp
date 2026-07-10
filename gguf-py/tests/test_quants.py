@@ -64,7 +64,7 @@ class GGMLQuants:
         self.libggml.ggml_quantize_requires_imatrix.argtypes = (ctypes.c_int,)
 
         for t in (
-            "q4_0", "q4_1", "q5_0", "q5_1", "q8_0",
+            "q4_0", "q4_0_ar16", "q4_1", "q5_0", "q5_1", "q8_0",
             "q2_K", "q3_K", "q4_K", "q5_K", "q6_K",
             "tq1_0", "tq2_0",
             "mxfp4",
@@ -246,3 +246,94 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.DEBUG)
 
     do_test(args.libggml, args.quick, GGMLQuantizationType[args.type.upper()] if args.type is not None else None)
+
+
+# ----------------------------------------------------------------------
+# pytest cases for Q4_0_AR16 (AutoRound 16-element interleaved-nibble
+# symmetric 4-bit). These exercise the numpy reference in
+# gguf.quants.Q4_0_AR16 without a built libggml -- pure numpy. The
+# Python-vs-C differential runs through do_test above
+# (`tests/test_quants.py --type q4_0_ar16`).
+# ----------------------------------------------------------------------
+
+from gguf.quants import Q4_0_AR16  # noqa: E402
+
+
+def test_q4_0_ar16_roundtrip():
+    np.random.seed(0)
+    x = np.random.randn(64, 16).astype(np.float32)
+    blocks = Q4_0_AR16.quantize_blocks(x)
+    assert blocks.shape == (64, 10)
+    assert blocks.dtype == np.uint8
+    y = Q4_0_AR16.dequantize_blocks(blocks)
+    assert y.shape == (64, 16)
+    assert y.dtype == np.float32
+
+    # Sym INT4 with positive scale = absmax/8 has the worst-case
+    # per-element error at the positive-max element (code clipped from
+    # 8 -> 7), exactly block_max/8 in fp32. Storing d as fp16 adds at
+    # most ~7 * d * 2^-10 of slack on top.
+    per_block_max = np.abs(x).max(axis=1, keepdims=True)
+    err = np.abs(x - y)
+    tol = per_block_max / 8 + per_block_max * 1e-2
+    assert np.all(err <= tol), f"max err {err.max()} > tol {tol.max()}"
+
+
+def test_q4_0_ar16_deterministic():
+    np.random.seed(1)
+    x = np.random.randn(32, 16).astype(np.float32)
+    a = Q4_0_AR16.quantize_blocks(x)
+    b = Q4_0_AR16.quantize_blocks(x)
+    assert np.array_equal(a, b)
+
+
+def test_q4_0_ar16_col_perm_16_aligned_lossless():
+    # The format's reason for existing: any permutation of 16-element
+    # column chunks of the source row reshuffles whole blocks
+    # bit-exactly (no block straddles the permutation boundary, unlike
+    # Q4_0's 32-element blocks).
+    np.random.seed(42)
+    n_blocks = 32
+    x = np.random.randn(n_blocks, 16).astype(np.float32)
+    blocks = Q4_0_AR16.quantize_blocks(x)
+    perm = np.random.permutation(n_blocks)
+
+    # Path A: permute blocks (16-element chunks), then dequantize.
+    a = Q4_0_AR16.dequantize_blocks(blocks[perm])
+
+    # Path B: dequantize, then permute the same way (16-aligned chunks).
+    b = Q4_0_AR16.dequantize_blocks(blocks)[perm]
+
+    assert np.array_equal(a, b)
+
+
+def test_q4_0_ar16_zero_block():
+    # All-zero block -> scale 0, codes all 8, dequantize to 0.0.
+    x = np.zeros((1, 16), dtype=np.float32)
+    blocks = Q4_0_AR16.quantize_blocks(x)
+    # d bytes (positions 0..2) zero, all qs bytes encode 8 | 8 << 4 = 0x88.
+    assert blocks[0, 0] == 0 and blocks[0, 1] == 0
+    assert np.all(blocks[0, 2:] == 0x88)
+    y = Q4_0_AR16.dequantize_blocks(blocks)
+    assert np.all(y == 0.0)
+
+
+def test_q4_0_ar16_byte_layout_literal():
+    # Literal byte <-> code-vector cross-check that pins the INTERLEAVED
+    # nibble layout independently of any helper. Catches a silent
+    # regression to Q4_0's split-halves packing.
+    #
+    # Signed codes [-8..7] with scale 1.0: absmax is 8 -> d = 1.0, values
+    # quantize to themselves (no rounding ties in play).
+    signed = np.arange(-8, 8, dtype=np.float32)
+    blocks = Q4_0_AR16.quantize_blocks(signed.reshape(1, 16))
+    d_back = blocks[0, 0:2].copy().view(np.float16)[0]
+    assert float(d_back) == 1.0, f"expected d=1.0, got {float(d_back)}"
+    # Codes after the +8 offset: [0, 1, ..., 15]. Interleaved packing
+    # gives byte j = (2j) | ((2j+1) << 4).
+    expected_qs = np.array([0x10, 0x32, 0x54, 0x76, 0x98, 0xBA, 0xDC, 0xFE],
+                           dtype=np.uint8)
+    assert np.array_equal(blocks[0, 2:10], expected_qs), (
+        f"interleaved layout mismatch: got {blocks[0, 2:10].tolist()} "
+        f"expected {expected_qs.tolist()}"
+    )
