@@ -136,6 +136,22 @@ template <int vdr> static __device__ __forceinline__ float vec_dot_q4_0_q8_1_imp
     return d4 * (sumi * ds8f.x - (8*vdr/QI4_0) * ds8f.y);
 }
 
+#define VDR_Q4_0_AR16_Q8_1_MMVQ 2
+#define VDR_Q4_0_AR16_Q8_1_MMQ  8
+
+// Unpack one 32-bit word of block_q4_0_ar16 quants (8 interleaved nibbles, i.e. 8
+// consecutive elements: element k is nibble k, NOT Q4_0's split halves) into two
+// ints of signed int8 values in element order, with the symmetric offset
+// (code - 8) already applied.
+static __device__ __forceinline__ int2 unpack_q4_0_ar16(const int q) {
+    const int lo = (q >> 0) & 0x0F0F0F0F; // even elements in bytes 0..3
+    const int hi = (q >> 4) & 0x0F0F0F0F; // odd  elements in bytes 0..3
+    int2 v;
+    v.x = __vsubss4(__byte_perm(lo, hi, 0x5140), 0x08080808); // elements 0..3
+    v.y = __vsubss4(__byte_perm(lo, hi, 0x7362), 0x08080808); // elements 4..7
+    return v;
+}
+
 #define VDR_Q4_1_Q8_1_MMVQ 2
 #define VDR_Q4_1_Q8_1_MMQ  4
 
@@ -781,6 +797,32 @@ static __device__ __forceinline__ float vec_dot_q4_0_q8_1(
     return vec_dot_q4_0_q8_1_impl<VDR_Q4_0_Q8_1_MMVQ>(v, u, bq4_0->d, bq8_1->ds);
 }
 
+
+static __device__ __forceinline__ float vec_dot_q4_0_ar16_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    // kbx indexes 16-element AR16 blocks; two of them pair with one 32-element q8_1
+    // block, kbx parity picking the half (the host dispatch guarantees ne00 % 32 == 0
+    // so the parity of the combined block index matches the column parity).
+    // Each call handles one whole block: qi/vdr == 1, so iqs is always 0.
+    const block_q4_0_ar16 * bq4 = (const block_q4_0_ar16 *) vbq + kbx;
+
+    const int i8 = 4*(kbx & 1);
+
+    int sumi = 0;
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        const int2 v = unpack_q4_0_ar16(get_int_b2(bq4->qs, i));
+
+        sumi = ggml_cuda_dp4a(v.x, get_int_b4(bq8_1->qs, i8 + 2*i + 0), sumi);
+        sumi = ggml_cuda_dp4a(v.y, get_int_b4(bq8_1->qs, i8 + 2*i + 1), sumi);
+    }
+
+    GGML_UNUSED(iqs);
+
+    // symmetric scale, offset already applied in the unpack: no ds8.y correction term
+    return __half2float(bq4->d) * __low2float(bq8_1->ds) * sumi;
+}
 
 static __device__ __forceinline__ float vec_dot_q4_1_q8_1(
     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
