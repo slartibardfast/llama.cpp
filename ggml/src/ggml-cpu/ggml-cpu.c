@@ -246,6 +246,12 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .nrows                    = 1,
 #endif
     },
+    [GGML_TYPE_Q4_0_AR16] = {
+        .from_float               = quantize_row_q4_0_ar16,
+        .vec_dot                  = ggml_vec_dot_q4_0_ar16_q8_0,
+        .vec_dot_type             = GGML_TYPE_Q8_0,
+        .nrows                    = 1,
+    },
     [GGML_TYPE_Q4_1] = {
         .from_float               = quantize_row_q4_1,
         .vec_dot                  = ggml_vec_dot_q4_1_q8_1,
@@ -1161,6 +1167,16 @@ void ggml_set_f32_nd(const struct ggml_tensor * tensor, int i0, int i1, int i2, 
 
 // ggml_compute_forward_mul_mat
 
+// Row size of the quantized-src1 work buffer: rounds ne up to a whole number of
+// vec_dot_type blocks. A src0 type whose block is smaller than the vec_dot_type
+// block (Q4_0_AR16: 16 vs Q8_0: 32) permits row lengths that are not a multiple
+// of the vec_dot_type block; the final partial block is stored zero-padded.
+// Equal to ggml_row_size() whenever ne is a block multiple.
+static size_t ggml_row_size_padded(enum ggml_type type, int64_t ne) {
+    const int64_t blck = ggml_blck_size(type);
+    return ggml_type_size(type)*((ne + blck - 1)/blck);
+}
+
 static void ggml_compute_forward_mul_mat_one_chunk(
     const struct ggml_compute_params * params,
     struct ggml_tensor * dst,
@@ -1193,7 +1209,7 @@ static void ggml_compute_forward_mul_mat_one_chunk(
     }
 
     const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
-    const size_t row_size = ggml_row_size(vec_dot_type, ne10);
+    const size_t row_size = ggml_row_size_padded(vec_dot_type, ne10);
 
     assert(ne12 % ne02 == 0);
     assert(ne13 % ne03 == 0);
@@ -1323,7 +1339,7 @@ UseGgmlGemm1:;
         char * wdata = params->wdata;
 
         const size_t nbw0 = ggml_type_size(vec_dot_type);
-        const size_t nbw1 = ggml_row_size(vec_dot_type, ne10);
+        const size_t nbw1 = ggml_row_size_padded(vec_dot_type, ne10);
         const size_t nbw2 = nbw1*ne11;
         const size_t nbw3 = nbw2*ne12;
 
@@ -1350,6 +1366,18 @@ UseGgmlGemm1:;
                     from_float((float *)((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11 + ne10_block_start*bs*nb10),
                                (void *)               (wdata + i13*nbw3 + i12*nbw2 + i11*nbw1 + ne10_block_start*nbw0),
                                (ne10_block_end - ne10_block_start) * bs);
+                    // an ne10 that is not a multiple of the vec_dot_type block (possible when
+                    // src0's block is smaller, e.g. Q4_0_AR16) leaves a tail: quantize it into
+                    // one final zero-padded block
+                    if (ith == nth - 1 && ne10 % bs != 0) {
+                        GGML_ASSERT(bs <= QK_K);
+                        const int64_t ne10_full = ne10 - ne10 % bs;
+                        float pad[QK_K];
+                        memset(pad, 0, bs*sizeof(float));
+                        memcpy(pad, (const float *)((const char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11) + ne10_full,
+                               (ne10 - ne10_full)*sizeof(float));
+                        from_float(pad, (void *) (wdata + i13*nbw3 + i12*nbw2 + i11*nbw1 + (ne10/bs)*nbw0), bs);
+                    }
                 }
             }
         }
@@ -1366,7 +1394,7 @@ UseGgmlGemm1:;
 #if GGML_USE_LLAMAFILE
     if (src1->type != vec_dot_type) {
         const void* wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
-        const size_t row_size = ggml_row_size(vec_dot_type, ne10);
+        const size_t row_size = ggml_row_size_padded(vec_dot_type, ne10);
 
         for (int64_t i13 = 0; i13 < ne13; i13++)
             for (int64_t i12 = 0; i12 < ne12; i12++)
@@ -1568,7 +1596,7 @@ static void ggml_compute_forward_mul_mat_id(
     void * wdata_cur = params->wdata;
 
     if (src1->type != vec_dot_type) {
-        incr_ptr_aligned(&wdata_cur, ggml_row_size(vec_dot_type, ggml_nelements(src1)), sizeof(int64_t));
+        incr_ptr_aligned(&wdata_cur, ggml_row_size_padded(vec_dot_type, src1->ne[0])*ggml_nrows(src1), sizeof(int64_t));
     }
 
     int64_t * matrix_row_counts = // [n_as]
@@ -1586,7 +1614,7 @@ static void ggml_compute_forward_mul_mat_id(
         char * wdata = params->wdata;
 
         const size_t nbw0 = ggml_type_size(vec_dot_type);
-        const size_t nbw1 = ggml_row_size(vec_dot_type, ne10);
+        const size_t nbw1 = ggml_row_size_padded(vec_dot_type, ne10);
         const size_t nbw2 = nbw1*ne11;
         const size_t nbw3 = nbw2*ne12;
 
@@ -1613,6 +1641,18 @@ static void ggml_compute_forward_mul_mat_id(
                     from_float((float *)((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11 + ne10_block_start*bs*nb10),
                                (void *)               (wdata + i13*nbw3 + i12*nbw2 + i11*nbw1 + ne10_block_start*nbw0),
                                (ne10_block_end - ne10_block_start) * bs);
+                    // an ne10 that is not a multiple of the vec_dot_type block (possible when
+                    // src0's block is smaller, e.g. Q4_0_AR16) leaves a tail: quantize it into
+                    // one final zero-padded block
+                    if (ith == nth - 1 && ne10 % bs != 0) {
+                        GGML_ASSERT(bs <= QK_K);
+                        const int64_t ne10_full = ne10 - ne10 % bs;
+                        float pad[QK_K];
+                        memset(pad, 0, bs*sizeof(float));
+                        memcpy(pad, (const float *)((const char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11) + ne10_full,
+                               (ne10 - ne10_full)*sizeof(float));
+                        from_float(pad, (void *) (wdata + i13*nbw3 + i12*nbw2 + i11*nbw1 + (ne10/bs)*nbw0), bs);
+                    }
                 }
             }
         }
@@ -1653,7 +1693,7 @@ static void ggml_compute_forward_mul_mat_id(
 
         const char * src0_cur = (const char *) src0->data + cur_a * nb02;
         const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
-        const size_t row_size = ggml_row_size(vec_dot_type, ne10);
+        const size_t row_size = ggml_row_size_padded(vec_dot_type, ne10);
 
         const int64_t nr0 = ne01;
         const int64_t nr1 = cne1;
@@ -2835,7 +2875,7 @@ struct ggml_cplan ggml_graph_plan(
                         const enum ggml_type vec_dot_type = type_traits_cpu[node->src[0]->type].vec_dot_type;
 
                         if (node->src[1]->type != vec_dot_type) {
-                            cur = ggml_row_size(vec_dot_type, ggml_nelements(node->src[1]));
+                            cur = ggml_row_size_padded(vec_dot_type, node->src[1]->ne[0])*ggml_nrows(node->src[1]);
                         }
                     } break;
                 case GGML_OP_MUL_MAT_ID:
@@ -2848,7 +2888,7 @@ struct ggml_cplan ggml_graph_plan(
                         const int n_as = src0->ne[2];
                         // src1
                         if (src1->type != vec_dot_type) {
-                            cur += ggml_row_size(vec_dot_type, ggml_nelements(src1)) + sizeof(int64_t);
+                            cur += ggml_row_size_padded(vec_dot_type, src1->ne[0])*ggml_nrows(src1) + sizeof(int64_t);
                         }
                         // matrix_row_counts
                         cur += n_as * sizeof(int64_t) + sizeof(int64_t);
