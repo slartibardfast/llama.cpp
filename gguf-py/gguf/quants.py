@@ -252,6 +252,61 @@ class Q4_0(__Quant, qtype=GGMLQuantizationType.Q4_0):
         return (d * qs.astype(np.float32))
 
 
+class Q4_0_AR16(__Quant, qtype=GGMLQuantizationType.Q4_0_AR16):
+    # AutoRound 16-element-block 4-bit symmetric quant (mainline port type id 43).
+    #
+    # Layout per 10-byte block: bytes 0..2 fp16 d, bytes 2..10 the 8-byte nibble
+    # payload qs. Code k lives in the low nibble of qs[k/2] for even k and the
+    # high nibble for odd k -- INTERLEAVED nibbles (NOT Q4_0's split-halves
+    # layout, where byte j packs codes [j] and [j + 8]).
+    #
+    # Scale is symmetric: d = absmax / 8 (positive; NOT Q4_0's signed max/-8).
+    # code_k = clamp(roundf(x[k] / d), -8, 7) + 8, then dequant is (code - 8) * d.
+    # Rounding matches the C quantize_row_q4_0_ar16_ref bit-exactly: roundf,
+    # i.e. round-to-nearest with ties AWAY FROM ZERO. np.rint alone (ties to
+    # even) would silently diverge from the C at exact .5 ties.
+
+    @classmethod
+    def quantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:
+        n_blocks = blocks.shape[0]
+
+        d = abs(blocks).max(axis=-1, keepdims=True) / 8
+        with np.errstate(divide="ignore"):
+            id = np.where(d == 0, 0, 1 / d)
+
+        # C roundf: nearest integer, ties away from zero. np.rint is correct
+        # everywhere except exact .5 ties (exactly representable in fp32 for
+        # this domain), which get patched toward sign(x).
+        scaled = blocks * id
+        qs = np.rint(scaled)
+        tie = np.abs(scaled - np.trunc(scaled)) == np.float32(0.5)
+        qs = np.where(tie, np.trunc(scaled) + np.copysign(np.float32(1), scaled), qs)
+        qs = (qs.astype(np.int32).clip(-8, 7) + 8).astype(np.uint8)
+
+        # Interleaved pack: byte j = codes[2j] | codes[2j+1] << 4.
+        qs = qs.reshape((n_blocks, cls.block_size // 2, 2))
+        qs = qs[..., 0] | (qs[..., 1] << np.uint8(4))
+
+        d = d.astype(np.float16).view(np.uint8)
+
+        return np.concatenate([d, qs], axis=-1)
+
+    @classmethod
+    def dequantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:
+        n_blocks = blocks.shape[0]
+
+        d, qs = np.hsplit(blocks, [2])
+
+        d = d.view(np.float16).astype(np.float32)
+
+        # Interleaved unpack: flat code order per byte is [low, high], so the
+        # row order is [b0_lo, b0_hi, b1_lo, b1_hi, ...] = codes[0..16].
+        qs = qs.reshape((n_blocks, cls.block_size // 2, 1)) >> np.array([0, 4], dtype=np.uint8).reshape((1, 1, 2))
+        qs = (qs & np.uint8(0x0F)).reshape((n_blocks, -1)).astype(np.int8) - np.int8(8)
+
+        return (d * qs.astype(np.float32))
+
+
 class Q4_1(__Quant, qtype=GGMLQuantizationType.Q4_1):
     @classmethod
     def quantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:
