@@ -2971,6 +2971,15 @@ private:
 
             slot.n_draft_total += draft.size();
 
+            // keep the verify batch a fixed size so the graph gets reused - pads just fail verification and roll back like any rejected draft
+            {
+                const int n_pad = std::min(params_base.speculative.draft.n_max, slot.get_n_draft_max());
+                if ((int) draft.size() < n_pad) {
+                    const llama_token tok_pad = draft.empty() ? slot.sampled : draft.back();
+                    draft.resize(n_pad, tok_pad);
+                }
+            }
+
             // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
             const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
 
