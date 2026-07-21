@@ -1159,19 +1159,6 @@ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
 
     LLAMA_LOG_DEBUG("%s: seq_id = %d, sampler = %p\n", __func__, (int) seq_id, (void *) sampler);
 
-    if (sampler && model.split_mode() == LLAMA_SPLIT_MODE_TENSOR) {
-        static bool warned = false;
-        if (!warned) {
-            LLAMA_LOG_WARN("%s: backend sampling not supported with SPLIT_MODE_TENSOR; using CPU\n", __func__);
-            warned = true;
-        }
-        if (sampling.samplers.count(seq_id) > 0) {
-            sched_need_reserve = true;
-        }
-        sampling.samplers.erase(seq_id);
-        return false;
-    }
-
     const bool can_offload =
         sampler &&
         sampler->iface->backend_init &&
@@ -1296,14 +1283,16 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     } else {
         res->reset();
 
+        const auto t_reset_us = ggml_time_us();
+
         ggml_backend_sched_reset(sched.get());
         ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
 
-        //const auto t_start_us = ggml_time_us();
+        const auto t_start_us = ggml_time_us();
 
         gf = model.build_graph(gparams);
 
-        //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
+        const auto t_build_us = ggml_time_us();
 
         if (!gf) {
             LLAMA_LOG_ERROR("%s: failed to initialize graph\n", __func__);
@@ -1316,6 +1305,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
         }
+
+        LLAMA_LOG_DEBUG("%s: graph rebuild: reset %.3f ms, build %.3f ms, alloc %.3f ms (n_nodes = %d)\n", __func__,
+                (t_start_us - t_reset_us)/1000.0, (t_build_us - t_start_us)/1000.0, (ggml_time_us() - t_build_us)/1000.0, ggml_graph_n_nodes(gf));
     }
 
     // set the input data for the input tensors

@@ -488,13 +488,13 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         }
 
         // output
+        // note: mirrored (not split) so that the logits come out mirrored on every device,
+        //       which allows backend sampling ops (top_k/argsort/argmax are per-row) to run under tensor split
         if (std::regex_match(tensor_name, pattern_output_weight)) {
-            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1);
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
         }
         if (std::regex_match(tensor_name, pattern_output_bias)) {
-            const ggml_tensor * output_weight = ud->model->get_tensor("output.weight");
-            GGML_ASSERT(output_weight != nullptr);
-            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0);
+            return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_MIRRORED);
         }
 
         // everything else
