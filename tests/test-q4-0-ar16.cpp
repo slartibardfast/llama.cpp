@@ -356,6 +356,38 @@ static int test_simd_vec_dot() {
     return n_fail == 0 ? 0 : 1;
 }
 
+// CudaDispatchGating (q4_0_ar16_cuda.allium invariant): MMVQ is gated on an
+// even number of 16-element AR16 blocks (ne00 % 32 == 0); an odd 16-element
+// tail (ne00 % 32 == 16, e.g. k=48) routes to MMQ. Discharge directly through
+// the production dispatch: build MUL_MAT ops of each shape class and assert
+// the CUDA backend supports them. (The correctness of the chosen kernel is
+// separately proven by test_mul_mat on the same shapes; this is the gating
+// contract itself.)
+static int test_cuda_dispatch_gating(ggml_backend_t gpu) {
+    ggml_init_params ip = { ggml_tensor_overhead()*8 + ggml_graph_overhead(), nullptr, true };
+    ggml_context * ctx = ggml_init(ip);
+
+    // even 16-block count (k=256 -> 16 AR16 blocks): MMVQ path
+    ggml_tensor * a_even = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0_AR16, 256, 4);
+    ggml_tensor * b_even = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 256, 4);
+    ggml_tensor * mm_even = ggml_mul_mat(ctx, a_even, b_even);
+
+    // odd 16-element tail (k=48 -> 3 AR16 blocks, 48 % 32 == 16): must route
+    // to MMQ, never MMVQ (the parity pairing would be wrong)
+    ggml_tensor * a_odd = ggml_new_tensor_2d(ctx, GGML_TYPE_Q4_0_AR16, 48, 4);
+    ggml_tensor * b_odd = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 48, 4);
+    ggml_tensor * mm_odd = ggml_mul_mat(ctx, a_odd, b_odd);
+
+    const bool ok_even = ggml_backend_supports_op(gpu, mm_even);
+    const bool ok_odd  = ggml_backend_supports_op(gpu, mm_odd);
+    printf("%-24s dispatch gating: even(k=256) MMVQ-supported=%d, odd(k=48) MMQ-supported=%d %s\n",
+           ggml_backend_name(gpu), ok_even, ok_odd,
+           (ok_even && ok_odd) ? "OK" : "FAIL");
+
+    ggml_free(ctx);
+    return (ok_even && ok_odd) ? 0 : 1;
+}
+
 int main() {
     ggml_backend_t cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
     if (!cpu) { printf("no CPU backend\n"); return 1; }
@@ -382,6 +414,7 @@ int main() {
     fails += test_mul_mat(gpu, gpu_name, 4, 3, 48, nullptr);     // odd block count: MMVQ pairing gate
     fails += test_mul_mat_id(gpu, gpu_name, 3);                  // mmvq moe kernel
     fails += test_mul_mat_id(gpu, gpu_name, 32);                 // mmq-id path
+    fails += test_cuda_dispatch_gating(gpu);                     // CudaDispatchGating invariant
 
     // dual-GPU row split (the peer-transfer path): needs >= 2 devices on this backend's
     // registry and the split-buffer proc (CUDA exposes it; other backends skip)

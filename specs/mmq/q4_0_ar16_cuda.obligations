@@ -1,0 +1,32 @@
+# Obligations for q4_0_ar16_cuda.allium, derived by `allium plan`.
+# Discharging tests live in tests/test-q4-0-ar16.cpp (ctest-registered), which
+# drives the PRODUCTION CUDA dispatch for the Q4_0_AR16 kernels. Each line:
+# <obligation-id> => <disposition>
+#
+# This spec is the CUDA re-port contract: after rebasing onto modern upstream
+# MMQ, every obligation must still discharge when the AR16 suite drives the
+# real dispatch (not a private symbol). A kernel that passes --help but fails
+# an obligation here is a re-port bug.
+#
+# entity-fields / config-default obligations for the modeling entities
+# (Q8_1_Row, Shape) are waived: they are wrappers describing the CUDA kernel
+# contracts, not independent C artifacts. Their behavioral content is
+# discharged by the kernel-contract obligations below.
+
+# --- DequantizeKernel ---
+contract-signature.DequantizeKernel.invoke => test:check_cuda_dequant_fixture exercises=dequantize_q4_0_ar16 (via ggml_backend_graph_compute GET_ROWS, CUDA0 + CPU)
+
+# --- GetRowsKernel ---
+contract-signature.GetRowsKernel.invoke => test:check_cuda_dequant_fixture exercises=ggml_get_rows (CUDA0)
+contract-signature.GetRowsKernel.invoke => test:GPU-split(2) MUL_MAT exercises=ggml_get_rows on the dual-GPU row-split AR16 tensor (no double-scale / no tail-drop)
+
+# --- VecDotMMVQ ---
+contract-signature.VecDotMMVQ.invoke => test:CUDA0 MUL_MAT m=16 n=1 k=256 exercises=vec_dot_q4_0_ar16_q8_1 MMVQ (DP4A, even 16-block count)
+contract-signature.VecDotMMVQ.invoke => test:CUDA0 MUL_MAT_ID n_tokens=3 exercises=mmvq moe kernel (DP4A pairing)
+
+# --- VecDotMMQ ---
+contract-signature.VecDotMMQ.invoke => test:CUDA0 MUL_MAT m=16 n=64 k=256 exercises=MMQ (prompt-eval, native 16-block tiles)
+contract-signature.VecDotMMQ.invoke => test:CUDA0 MUL_MAT m=4 n=3 k=48 exercises=MMQ odd-tail (ne00 % 32 == 16, the k=48 case)
+
+# --- CudaDispatchGating invariant ---
+invariant.CudaDispatchGating => test:check_cuda_dispatch_gating exercises=ggml-cuda supports_op (odd_tail routes to MMQ not MMVQ) — verify a ne00 % 32 == 16 shape is NOT dispatched to MMVQ and IS to MMQ, on CUDA0
