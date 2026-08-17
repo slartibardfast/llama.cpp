@@ -1,0 +1,199 @@
+-- allium: 3
+-- q4_0_ar16_cuda.allium
+
+-- Scope: the CUDA backend contracts for GGML_TYPE_Q4_0_AR16, distilled from
+-- the fork's ggml/src/ggml-cuda/* implementations (branch `autoround`, HEAD
+-- 5990f5946). This is the contract set the RE-PORT onto modern upstream MMQ
+-- must satisfy: every CUDA kernel that survives the rebase has an obligation
+-- here, so the re-port is verified against a spec, not by guesswork.
+--
+-- This spec is the CUDA-specific twin of q4_0_ar16.allium (the C reference
+-- semantics). It deliberately EXCLUDES what that spec already binds (block
+-- layout, nibble convention, QuantizeRow/DequantizeRow, ColPermEquivalence,
+-- AutoRoundG128Lossless, Determinism) and adds ONLY the backend contracts:
+--   - DequantizeKernel (float2 vectorized, byte iqs/2 + 4 half)
+--   - GetRowsKernel (dequant of selected rows, bit-exact to scalar)
+--   - VecDotMMVQ (DP4A, 2 AR16 blocks per q8_1 block, parity pairing,
+--     symmetric no-correction)
+--   - VecDotMMQ (tile loader, MMQ_TILE_NE_K geometry)
+--   - SupportsOp gating (which ops expose AR16 on CUDA, and their shape
+--     guards: ne00 % 32 == 0 for MMVQ, routing to MMQ otherwise)
+--
+-- Purpose: the rebase re-ports these onto upstream's modern MMQ architecture
+-- (upstream mmq.cuh went 4238 -> 1597 lines, refactored tile/SRAM infra).
+-- Each @invariant below is a gate: after re-port, the AR16 CUDA suite (drives
+-- the PRODUCTION dispatch, not a private symbol) must satisfy them. A re-ported
+-- kernel that passes --help but violates an invariant is a re-port bug.
+
+-- ============================================================
+-- External entities — owned by ggml CUDA, opaque here
+-- ============================================================
+
+-- A q8_1 block row on the b side of MMVQ/MMQ. q8_1 has a 2-component scale
+-- (d, s): d * sumi where the symmetric AR16 scale contributes d and q8_1
+-- contributes s (see VecDotMMVQ). Layout owned by the q8_1 spec.
+entity Q8_1_Row {
+    n_elements: Integer
+}
+
+-- A tensor shape in the CUDA dispatch. ne00 is the row length in elements.
+-- odd_tail is true when ne00 is not a whole multiple of 32 (i.e. the row has
+-- an odd number of 16-element AR16 blocks and cannot pair two per q8_1 block).
+-- expose_mmvq / expose_mmq are the supports_op gate results for the shape.
+entity Shape {
+    ne00: Integer
+    odd_tail: Boolean
+    expose_mmvq: Boolean
+    expose_mmq: Boolean
+}
+
+-- ============================================================
+-- Config
+-- ============================================================
+
+config {
+    -- Vectorized dequant processes two elements per call (float2).
+    -- iqs indexes 0..QK4_0_AR16/2; v.x = element iqs, v.y = element iqs + 8.
+    -- The kernel reads byte iqs/2 for v.x and byte iqs/2 + 4 for v.y.
+    vec_width: Integer = 2
+
+    -- MMVQ DP4A pairing: two 16-element AR16 blocks pair with one 32-element
+    -- q8_1 block. kbx indexes AR16 blocks; i8 = 4*(kbx & 1) selects the q8_1
+    -- half. Host dispatch guarantees ne00 % 32 == 0 so kbx parity matches
+    -- column parity.
+    mmvq_blocks_per_q8_1: Integer = 2
+    q8_1_half_bytes: Integer = 4
+
+    -- MMQ tile geometry follows the upstream MMQ_TILE_NE_K = 32 convention.
+    -- AR16 tiles are native 16-element blocks; the loader zero-pads src1 rows
+    -- to MATRIX_ROW_PADDING, so odd 16-element tails are handled by MMQ (not
+    -- MMVQ), which is why the MMQ path must exist for ne00 % 32 == 16.
+    mmq_tile_ne_k: Integer = 32
+}
+
+-- ============================================================
+-- Contracts
+-- ============================================================
+
+-- The vectorized dequantize kernel. Bit-exact to the scalar DequantizeFormula
+-- from q4_0_ar16.allium, for every element, across the float2 half split.
+contract DequantizeKernel {
+    invoke: (block: Block, ib: Integer, iqs: Integer) -> FloatRow
+
+    @invariant InterleavedNibbleVectorized
+        -- For k in {iqs, iqs + 8} (the two elements a call produces):
+        --   code = nibble_at(block.qs, k/2, k)     (interleaved: even k low, odd k high)
+        --   result = (code - 8) * fp32(block.d)
+        -- Identical to the scalar DequantizeFormula; the float2 vectorized
+        -- form must NOT alter element values. Bit-exact (tol 0.0).
+        -- The kernel reads byte iqs/2 (v.x) and byte iqs/2 + 4 (v.y) because
+        -- 8 elements fit per half — the interleaved layout maps elements
+        -- iqs and iqs+8 to byte pairs 4 apart, unlike Q4_0's split halves
+        -- (which read iqs/2 and iqs/2 + 2 for elements iqs and iqs+16).
+
+    @invariant HalfIndependence
+        -- v.x and v.y are independent elements (iqs and iqs+8); they must
+        -- not share a nibble or a byte. This is what distinguishes AR16's
+        -- interleaved layout from Q4_0's split-half in the vectorized kernel.
+}
+
+-- The GET_ROWS kernel: dequantize selected rows of a 2D AR16 tensor.
+contract GetRowsKernel {
+    invoke: (a: Tensor, rows: Set<Integer>) -> Tensor
+
+    @invariant RowSelectCorrectness
+        -- out[i] = DequantizeRow(a[rows[i]]) for every selected row i,
+        -- bit-exact to the scalar reference. Selection order preserved.
+
+    @invariant PartialRows
+        -- GET_ROWS on a row-split (multi-GPU) AR16 tensor must dequantize
+        -- only the rows resident on each device and assemble the correct
+        -- global row. The split-buffer path must not double-apply the scale
+        -- or drop tail rows (the pointer-dedup / name-dedup failure class).
+}
+
+-- The MMVQ (vec_dot, prompt-eval fallback) kernel: DP4A against q8_1.
+contract VecDotMMVQ {
+    invoke: (a: AR16_Row, b: Q8_1_Row) -> Decimal
+
+    @invariant PairingParity
+        -- Two AR16 blocks pair with one 32-element q8_1 block. For block
+        -- index kbx, i8 = 4*(kbx & 1) selects the q8_1 half. Host guarantees
+        -- ne00 % 32 == 0, so kbx parity == column parity; the kernel relies
+        -- on this and must not assume a different pairing.
+
+    @invariant UnpackOffsetApplied
+        -- unpack_q4_0_ar16 applies the symmetric offset (code - 8) inline
+        -- (via __vsubss4 against 0x08080808). The dot product uses these
+        -- signed int8 values against q8_1 bytes. NO additional ds8.y
+        -- correction term is applied (AR16 is symmetric); adding one would
+        -- double-count and break the score.
+
+    @invariant ScoreCorrectness
+        -- result = fp32(bq4.d) * fp32(q8_1.ds.low) * sumi, where sumi is the
+        -- DP4A sum over the paired blocks. Must agree with the scalar
+        -- VecDot reference within the q4_0_ar16.allium VecDot tolerances.
+}
+
+-- The MMQ (matrix-multiply) kernel: tiled, prompt-eval on GPU.
+contract VecDotMMQ {
+    invoke: (a: AR16_Tensor, b: F32_Tensor) -> Tensor
+
+    @invariant Native16Blocks
+        -- The AR16 tile loader works on NATIVE 16-element blocks (blck_size
+        -- 16), not the 32-element Q4_0 blocks the generic loader assumes.
+        -- Each 16-element block has its own scale d.
+
+    @invariant OddTailViaMMQ
+        -- When ne00 % 32 == 16 (odd number of 16-element blocks), MMVQ's
+        -- parity pairing is inapplicable, so the dispatch MUST route to MMQ.
+        -- The MMQ path zero-pads src1 rows to MATRIX_ROW_PADDING, so the
+        -- odd tail is handled correctly (the scalar CPU path pads its q8_0
+        -- tail the same way per the C fix at HEAD).
+
+    @invariant ScoreCorrectness
+        -- out = DequantizeRow(a) @ b, within the q4_0_ar16.allium VecDot
+        -- tolerances for the path's accumulator precision (FP32 or FP16).
+}
+
+-- ============================================================
+-- Invariant — dispatch gating
+-- ============================================================
+
+-- Which ops expose AR16 on CUDA, and their shape guards. This is the
+-- supports_op gate; a re-port must preserve it exactly, else the dispatch
+-- silently falls back (or worse, routes an odd-tail shape to MMVQ).
+invariant CudaDispatchGating {
+    for shape in Shape:
+        -- MMVQ (and its fused/mul_mat_id variants) are gated on an even
+        -- number of 16-element AR16 blocks (ne00 % 32 == 0), because
+        -- vec_dot_q4_0_ar16_q8_1 pairs two AR16 blocks per q8_1 block.
+        -- An odd 16-element tail (odd_tail) routes to MMQ.
+        shape.odd_tail implies shape.expose_mmvq = false
+        shape.odd_tail implies shape.expose_mmq = true
+
+    -- GET_ROWS and DEQUANTIZE are exposed for all valid AR16 shapes
+    -- (any row length that is a multiple of 16).
+}
+
+-- ============================================================
+-- Implementation notes
+-- ============================================================
+
+-- Black-box helpers used inline: nibble_at, DequantizeRow, fp32.
+--
+-- C reference (this fork, branch `autoround`):
+--   ggml/src/ggml-cuda/dequantize.cuh  — dequantize_q4_0_ar16 (float2)
+--   ggml/src/ggml-cuda/vecdotq.cuh     — unpack_q4_0_ar16,
+--                                        vec_dot_q4_0_ar16_q8_1 (MMVQ DP4A)
+--   ggml/src/ggml-cuda/mmq.cuh         — tile loader (native 16-blocks)
+--   ggml/src/ggml-cuda/template-instances/mmq-instance-q4_0_ar16.cu
+--   ggml/src/ggml-cuda/convert.cu      — dequantize row for mixed precision
+--   ggml/src/ggml-cuda/getrows.cu      — GET_ROWS dispatch
+--   ggml/src/ggml-cuda/ggml-cuda.cu    — supports_op gating
+--
+-- RE-PORT GATE: after rebasing onto upstream master, every @invariant above
+-- must hold when the AR16 CUDA suite drives the PRODUCTION dispatch. The
+-- current test-q4-0-ar16 (dequant fixture, MUL_MAT 3 shapes, MUL_MAT_ID
+-- mmvq+mmq, dual-GPU split) + the AR16 test-backend-ops sweep are the
+-- execution; this spec is the contract they check against.
