@@ -253,7 +253,7 @@ class Q4_0(__Quant, qtype=GGMLQuantizationType.Q4_0):
 
 
 class Q4_0_AR16(__Quant, qtype=GGMLQuantizationType.Q4_0_AR16):
-    # AutoRound 16-element-block 4-bit symmetric quant (fork-local type id 42).
+    # AutoRound 16-element-block 4-bit symmetric quant (fork-local type id 43).
     #
     # Layout per 10-byte block: bytes 0..2 fp16 d, bytes 2..10 the 8-byte nibble
     # payload qs. Code k lives in the low nibble of qs[k/2] for even k and the

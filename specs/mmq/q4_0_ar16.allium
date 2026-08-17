@@ -1,7 +1,7 @@
 -- allium: 3
 -- q4_0_ar16.allium
 
--- Scope: GGML_TYPE_Q4_0_AR16 (type id 42 in this fork) — 16-element-block
+-- Scope: GGML_TYPE_Q4_0_AR16 (type id 43 in this fork) — 16-element-block
 -- 4-bit symmetric quant, ported into llama.cpp (branch `autoround`, upstream
 -- b9222) from ik_llama.cpp, where it carries the AutoRound V-col-reorder
 -- work. Differs from Q4_0 in three ways:
@@ -10,6 +10,14 @@
 --   (b) INTERLEAVED nibble layout (byte j = code[2j] | code[2j+1]<<4)
 --       — Q4_0 packs split-halves (byte j = code[j] | code[j+QK/2]<<4);
 --   (c) symmetric scale d = absmax/8 — Q4_0 uses signed d = max/-8.
+-- Enum-rule-taker convention: the type id (43) and the file type (29) are the
+-- FIRST FREE SLOTS at the upstream GGML_TYPE/GGML_FTYPE tail, re-anchored on
+-- every rebase against ggml-org/llama.cpp. We do NOT claim fixed numbers:
+-- upstream owns ids 0..42 (type) and 0..28 (ftype); if upstream adds a type
+-- ahead of us, AR16 moves to the new tail. The GGUF serialized tensor id is
+-- GGML_TYPE_Q4_0_AR16; the gguf-py constant mirrors it. Re-anchor =
+-- update ggml.h, gguf-py/constants.py, and every "id N" reference in specs/,
+-- then re-run the binding + ctest + pytest.
 -- The format exists to preserve Intel AutoRound INT4 W4G128 calibration
 -- through a V-col reorder where Q4_0's 32-element block straddles the
 -- 16-element permutation boundary.
@@ -380,7 +388,7 @@ invariant Determinism {
 --   autoround_to_q4_0_ar16, autoround_scale_fp16_for_block,
 --   scaled_codes, DequantizeRow.
 --
--- C reference (this fork, branch `autoround`, GGML_TYPE_Q4_0_AR16 = 42,
+-- C reference (this fork, branch `autoround`, GGML_TYPE_Q4_0_AR16 = 43,
 -- GGML_FTYPE_MOSTLY_Q4_0_AR16 = 28):
 --   ggml/include/ggml.h                 — type + ftype enum entries
 --   ggml/src/ggml-common.h              — QK4_0_AR16, block_q4_0_ar16 typedef

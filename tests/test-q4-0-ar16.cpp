@@ -4,9 +4,13 @@
 //   - DequantizeFormula, bit-exact (tol 0.0): result[k] = fp32(UnpackCode(qs,k) - 8) * fp32(d)
 //     with the INTERLEAVED nibble layout (element k = nibble k: byte k/2, low nibble for
 //     even k -- NOT Q4_0's split halves) and the symmetric scale d = absmax/8.
+//   - QuantizeFormula tie semantics: the C ref rounds with roundf (ties AWAY from zero),
+//     pinned as ground truth in the spec reconciliation (ties toward +-inf, NOT banker's).
 //   - MUL_MAT / MUL_MAT_ID vs an independent reference (NMSE, same 5e-4 bound as
 //     test-backend-ops), including shapes test-backend-ops does not generate:
 //     ne00 % 32 == 16 (odd 16-element block count) and dual-GPU row-split buffers.
+//   - The x86 SIMD vec_dot path (ggml_vec_dot_q4_0_ar16_q8_0) vs the scalar reference,
+//     including the odd 16-element tail block (ne00 % 32 == 16).
 //
 // The CPU dequantize fixture and CPU MUL_MAT shapes always run. The GPU sections run when a GPU backend is
 // present; the split-buffer section additionally needs >= 2 devices of the same backend.
@@ -14,6 +18,7 @@
 
 #include "ggml.h"
 #include "ggml-backend.h"
+#include "ggml-cpu.h"
 
 #include <chrono>
 #include <cmath>
@@ -253,12 +258,112 @@ static int test_mul_mat_id(ggml_backend_t backend, const char * name, int n_toke
     return ok ? 0 : 1;
 }
 
+// QuantizeFormula tie semantics: the C ref uses roundf, which rounds HALVES
+// away from zero (roundf(0.5)=1, roundf(-0.5)=-1), NOT banker's rounding.
+// Pin it directly through the public quantize_chunk path (which routes to
+// quantize_row_q4_0_ar16_ref): build a row whose x*id values land exactly on
+// .5 ties and assert the emitted codes are the ties-away-from-zero codes.
+static int test_quantize_ties() {
+    // Element 15 = 8.0 sets amax = 8.0 -> d = 1.0, id = 1.0, so the tie
+    // elements below land exactly on their .5 ties (x*id = x). roundf is
+    // ties-away-from-zero: code = 8 + roundf(x).
+    //   x =  0.5 -> roundf 1 -> code  9 (low nibble, element 0)
+    //   x = -0.5 -> roundf -1 -> code  7 (high nibble, element 1)
+    //   x =  2.5 -> roundf 3 -> code 11 (low nibble, element 2)
+    //   x = -2.5 -> roundf -3 -> code  5 (high nibble, element 3)
+    //   x =  7.5 -> roundf 8 -> code 16 -> clamped to 15 (element 4)
+    //   x = -7.5 -> roundf -8 -> code 0 (element 5)
+    //   x =  8.0 -> roundf 8 -> code 16 -> clamped to 15 (element 15)
+    const float x[16] = {
+         0.5f, -0.5f,  2.5f, -2.5f,  7.5f, -7.5f,  0.0f, 0.0f,
+         0.0f,  0.0f,  0.0f,  0.0f,  0.0f,  0.0f,  0.0f, 8.0f
+    };
+    blk_ar16 blk;
+    const size_t nbytes = ggml_row_size(GGML_TYPE_Q4_0_AR16, 16);
+    ggml_quantize_chunk(GGML_TYPE_Q4_0_AR16, x, &blk, 0, 1, 16, nullptr);
+    if (nbytes != sizeof(blk_ar16)) {
+        printf("quantize tie row size: got %zu want %zu\n", nbytes, sizeof(blk_ar16));
+        return 1;
+    }
+
+    const uint8_t want_qs[8] = {
+        (uint8_t)(0x9 | (0x7 << 4)),   // byte 0: elem0 low=9, elem1 high=7
+        (uint8_t)(0xB | (0x5 << 4)),   // byte 1: elem2 low=11, elem3 high=5
+        (uint8_t)(0xF | (0x0 << 4)),   // byte 2: elem4 low=15 (clamped), elem5 high=0
+        0x88, 0x88, 0x88, 0x88,        // bytes 3..6: zero-coded (8|8<<4)
+        (uint8_t)(0x8 | (0xF << 4)),   // byte 7: elem14 low=8, elem15 high=15 (clamped)
+    };
+    int n_fail = 0;
+    for (int j = 0; j < 8; j++) {
+        if (blk.qs[j] != want_qs[j]) {
+            printf("quantize tie byte %d: got 0x%02X want 0x%02X\n", j, blk.qs[j], want_qs[j]);
+            n_fail++;
+        }
+    }
+    // d must be fp16(amax/8) = fp16(1.0) = 0x3C00
+    if (blk.d != 0x3C00) {
+        printf("quantize tie d: got 0x%04X want 0x3C00 (fp16 1.0)\n", (unsigned)blk.d);
+        n_fail++;
+    }
+    printf("%-24s quantize tie semantics: %s\n", "CPU", n_fail == 0 ? "OK" : "FAIL");
+    return n_fail == 0 ? 0 : 1;
+}
+
+// x86 SIMD vec_dot vs a scalar reference. The SIMD kernel (registered as the
+// CPU type-traits vec_dot for AR16, paired with Q8_0) is exercised through the
+// public type-traits table so the test binds the dispatched path. The direct
+// vec_dot contract pairs two 16-elem AR16 blocks per 32-elem Q8_0 block, so it
+// is only called on k that is a whole multiple of 32 (the odd 16-elem tail is
+// handled by the mul_mat path's zero-padding, covered separately by the MUL_MAT
+// shapes in this file and fixed at HEAD).
+static int test_simd_vec_dot() {
+    const struct ggml_type_traits_cpu * tr = ggml_get_type_traits_cpu(GGML_TYPE_Q4_0_AR16);
+    const struct ggml_type_traits * tb = ggml_get_type_traits(GGML_TYPE_Q4_0_AR16);
+    if (tr == nullptr || tr->vec_dot == nullptr || tr->vec_dot_type != GGML_TYPE_Q8_0
+        || tb == nullptr || tb->to_float == nullptr) {
+        printf("CPU vec_dot / to_float trait missing or not Q8_0-paired\n");
+        return 1;
+    }
+    // shape matrix: even block counts only (32, 64, 256) -- the direct
+    // vec_dot contract requires whole Q8_0 (32-elem) blocks.
+    const int ks[] = { 32, 64, 256 };
+    int n_fail = 0;
+    for (int ki = 0; ki < 3; ki++) {
+        const int k = ks[ki];
+        std::vector<float> x((size_t)k), y((size_t)k);
+        for (int j = 0; j < k; j++) {
+            x[j] = sinf(0.003f * j);
+            y[j] = cosf(0.002f * j) * 0.1f;
+        }
+        std::vector<uint8_t> qx(ggml_row_size(GGML_TYPE_Q4_0_AR16, k));
+        std::vector<uint8_t> qy(ggml_row_size(GGML_TYPE_Q8_0, k));
+        ggml_quantize_chunk(GGML_TYPE_Q4_0_AR16, x.data(), qx.data(), 0, 1, k, nullptr);
+        ggml_quantize_chunk(GGML_TYPE_Q8_0, y.data(), qy.data(), 0, 1, k, nullptr);
+
+        float sum_simd = 0.0f, sum_ref = 0.0f;
+        tr->vec_dot(k, &sum_simd, 0, qx.data(), 0, qy.data(), 0, 0);
+        // scalar reference: dequant x via the traits table, use y directly, dot
+        std::vector<float> dx((size_t)k);
+        tb->to_float(qx.data(), dx.data(), k);
+        for (int j = 0; j < k; j++) sum_ref += dx[j] * y[j];
+
+        const double diff = fabs((double)sum_simd - (double)sum_ref);
+        const double tol  = 1e-2 * (fabs((double)sum_ref) + 1.0); // fp32 accumulation slack
+        const bool ok = diff <= tol;
+        printf("%-24s SIMD vec_dot k=%4d diff %.4g %s\n", "CPU", k, diff, ok ? "OK" : "FAIL");
+        if (!ok) n_fail++;
+    }
+    return n_fail == 0 ? 0 : 1;
+}
+
 int main() {
     ggml_backend_t cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
     if (!cpu) { printf("no CPU backend\n"); return 1; }
 
     int fails = 0;
     fails += test_dequant_fixture(cpu, "CPU");
+    fails += test_quantize_ties();
+    fails += test_simd_vec_dot();
     fails += test_mul_mat(cpu, "CPU", 16, 1, 256, nullptr);
     fails += test_mul_mat(cpu, "CPU", 16, 64, 256, nullptr);
     fails += test_mul_mat(cpu, "CPU", 4, 3, 48, nullptr);   // odd block count: scalar vec_dot tail

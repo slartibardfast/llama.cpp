@@ -1,6 +1,6 @@
 # Obligations for q4_0_ar16.allium, derived by `allium plan`.
 # Discharging tests live in specs/mmq/q4_0_ar16_binding.c (see run-binding.sh),
-# which binds the spec against the landed GGML_TYPE_Q4_0_AR16 (id 42) scalar
+# which binds the spec against the landed GGML_TYPE_Q4_0_AR16 (id 43) scalar
 # reference on this branch. Each line: <obligation-id> => <disposition>
 #
 # Tie-semantics reconciliation (orchestrator ruling, plan/0134 lane): the

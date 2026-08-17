@@ -1,5 +1,5 @@
 // q4_0_ar16_binding.c — binds specs/mmq/q4_0_ar16.allium against the landed
-// GGML_TYPE_Q4_0_AR16 (id 42) C reference in this fork.
+// GGML_TYPE_Q4_0_AR16 (id 43) C reference in this fork.
 //
 // Each check_* function discharges the obligation(s) named next to it in
 // specs/mmq/q4_0_ar16.obligations (disposition `test:<name>`). The spec-side
@@ -355,7 +355,7 @@ static void check_vec_dot_q8_0(void) {
 }
 
 int main(void) {
-    printf("q4_0_ar16_binding: specs/mmq/q4_0_ar16.allium vs GGML_TYPE_Q4_0_AR16 (id 42) scalar reference\n\n");
+    printf("q4_0_ar16_binding: specs/mmq/q4_0_ar16.allium vs GGML_TYPE_Q4_0_AR16 (id 43) scalar reference\n\n");
 
     ggml_cpu_init();
 
