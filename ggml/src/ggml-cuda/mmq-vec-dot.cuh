@@ -448,12 +448,18 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     constexpr int nwarps    = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
     constexpr int I         = ggml_cuda_mmq_get_I(type, J, fallback);
+    constexpr int qk        = ggml_cuda_type_traits<type>::qk;
 
     constexpr tile_x_sizes txs = mmq_get_dp4a_tile_x_sizes(type, I);
     const int   * x_qs = (const int   *) x;
     const float * x_df = (const float *) x_qs + txs.qs;
     const int   * y_qs = (const int   *) y + 4;
     const float * y_df = (const float *) y;
+
+    // Weight stride in int32 per QI8_0 activation codes: qk elements = qk/4 int32 per block.
+    // Per QI8_0=8 activation codes, we need 8 weight elements = 2 int32.
+    constexpr int weight_stride_int32 = qk / 4 * (QI8_0 / qk);  // = 2 for qk=16
+    constexpr int weight_blocks_per_tile = MMQ_TILE_NE_K / qk;  // 2 for qk=16
 
 // #pragma unroll
     for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += QI8_0) {
@@ -467,8 +473,10 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
             for (int i0 = 0; i0 < I; i0 += warp_size) {
                 const int i = i0 + threadIdx.x;
 
+                // Weight pointer advances by 2 int32 per QI8_0 activation codes (8 weight elements = 2 int32)
+                const int weight_k0 = (k0 / qk) * (qk / 4) * weight_blocks_per_tile + (k0 % qk) / 4;
                 sum[j0/nwarps*I/warp_size + i0/warp_size] += vec_dot_q8_0_16_q8_1_impl<QI8_0>(
-                    &x_qs[i*(2*MMQ_TILE_NE_K + 1) + k0],
+                    &x_qs[i*(2*MMQ_TILE_NE_K + 1) + weight_k0 * weight_stride_int32],
                     &y_qs[j*MMQ_TILE_Y_K + k01],
                     &x_df[i*(2*MMQ_TILE_NE_K*2/QI8_0) + i/(QI8_0/4) + k0/(QI8_0/2)],
                     y_df[j*MMQ_TILE_Y_K + k01/QI8_1]);
