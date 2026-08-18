@@ -282,7 +282,11 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
         x_qs[i*sram_stride + 4*kbx + 1] = v0.y;
         x_qs[i*sram_stride + 4*kbx + 2] = v1.x;
         x_qs[i*sram_stride + 4*kbx + 3] = v1.y;
-        x_df[i*sram_stride           + kbx] = bxi->d;
+        const float d = bxi->d;
+        x_df[i*sram_stride + 4*kbx + 0] = d;
+        x_df[i*sram_stride + 4*kbx + 1] = d;
+        x_df[i*sram_stride + 4*kbx + 2] = d;
+        x_df[i*sram_stride + 4*kbx + 3] = d;
 #else
         x_qs[i*(2*MMQ_TILE_NE_K + 1) + 4*kbx + 0] = v0.x;
         x_qs[i*(2*MMQ_TILE_NE_K + 1) + 4*kbx + 1] = v0.y;
