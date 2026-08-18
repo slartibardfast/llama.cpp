@@ -288,11 +288,26 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
         x_df[i*sram_stride + 4*kbx + 2] = d;
         x_df[i*sram_stride + 4*kbx + 3] = d;
 #else
-        x_qs[i*(2*MMQ_TILE_NE_K + 1) + 4*kbx + 0] = v0.x;
-        x_qs[i*(2*MMQ_TILE_NE_K + 1) + 4*kbx + 1] = v0.y;
-        x_qs[i*(2*MMQ_TILE_NE_K + 1) + 4*kbx + 2] = v1.x;
-        x_qs[i*(2*MMQ_TILE_NE_K + 1) + 4*kbx + 3] = v1.y;
-        x_df[i*(2*MMQ_TILE_NE_K*2/QI8_0) + i/(QI8_0/4) + kbx] = bxi->d;
+        const int valid_k_blocks = *ggml_cuda_mmq_get_valid_k_blocks_ptr();
+        if (kbx < valid_k_blocks) {
+            x_qs[i*(2*MMQ_TILE_NE_K + 1) + 4*kbx + 0] = v0.x;
+            x_qs[i*(2*MMQ_TILE_NE_K + 1) + 4*kbx + 1] = v0.y;
+            x_qs[i*(2*MMQ_TILE_NE_K + 1) + 4*kbx + 2] = v1.x;
+            x_qs[i*(2*MMQ_TILE_NE_K + 1) + 4*kbx + 3] = v1.y;
+            const float d = bxi->d;
+            // AR16 has 1 scale per 16 elements, but DP4A expects 1 per 8 (QI8_0).
+            // Replicate each scale 2x to match expected density.
+            x_df[i*(2*MMQ_TILE_NE_K*2/QI8_0) + i/(QI8_0/4) + 2*kbx + 0] = d;
+            x_df[i*(2*MMQ_TILE_NE_K*2/QI8_0) + i/(QI8_0/4) + 2*kbx + 1] = d;
+        } else if (kbx < 2*MMQ_TILE_NE_K / QK4_0_AR16) {
+            // Zero-pad invalid blocks to avoid reading garbage in vec_dot
+            x_qs[i*(2*MMQ_TILE_NE_K + 1) + 4*kbx + 0] = 0;
+            x_qs[i*(2*MMQ_TILE_NE_K + 1) + 4*kbx + 1] = 0;
+            x_qs[i*(2*MMQ_TILE_NE_K + 1) + 4*kbx + 2] = 0;
+            x_qs[i*(2*MMQ_TILE_NE_K + 1) + 4*kbx + 3] = 0;
+            x_df[i*(2*MMQ_TILE_NE_K*2/QI8_0) + i/(QI8_0/4) + 2*kbx + 0] = 0.0f;
+            x_df[i*(2*MMQ_TILE_NE_K*2/QI8_0) + i/(QI8_0/4) + 2*kbx + 1] = 0.0f;
+        }
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
     }
 }

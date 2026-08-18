@@ -15,6 +15,14 @@ typedef void (*ggml_cuda_mmq_vec_dot_t)(const int * __restrict__ x, const int * 
 typedef void (*ggml_cuda_mmq_write_back_t)(const float * __restrict__ sum, const int32_t * __restrict__ get_rows_to_sorted,
     float * __restrict__ dst, const float * __restrict__ y_scale, const int stride, const int i_max, const int j_max);
 
+// Global device variable for partial-K tile handling (fallback path)
+// Set by kernel before calling load_tiles, read by load_tiles for DP4A scale indexing.
+// Defined in mmq.cu, accessed via getter/setter functions.
+static __device__ __forceinline__ int* ggml_cuda_mmq_get_valid_k_blocks_ptr() {
+    extern __device__ int ggml_cuda_mmq_valid_k_blocks;
+    return &ggml_cuda_mmq_valid_k_blocks;
+}
+
 enum mmq_q8_1_ds_layout {
     MMQ_Q8_1_DS_LAYOUT_D4,
     MMQ_Q8_1_DS_LAYOUT_DS4,
@@ -914,6 +922,11 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
     constexpr int sz = sizeof(block_q8_1_mmq) / sizeof(int);
 
     for (int kb0 = kb0_start; kb0 < kb0_stop; kb0 += blocks_per_iter) {
+        const int valid_k_blocks = min(blocks_per_iter, kb0_stop - kb0);
+        if (threadIdx.x == 0 && threadIdx.y == 0) {
+            *ggml_cuda_mmq_get_valid_k_blocks_ptr() = valid_k_blocks;
+        }
+        __syncthreads();
         load_tiles(x, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x);
         {
             const int * by0 = y + ncols_y * (kb0 * qk / ne_block) * sz;
