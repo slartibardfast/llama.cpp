@@ -272,42 +272,33 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
             i = min(i, i_max);
         }
 
-        const block_q4_0_ar16 * bxi = (const block_q4_0_ar16 *) x + kbx0 + i*stride + kbx;
+        // Only the first valid_k_blocks blocks of the iteration window hold data;
+        // zero the rest so the vec_dot never multiplies out-of-bounds or stale data.
+        const int valid_k_blocks = *ggml_cuda_mmq_get_valid_k_blocks_ptr();
+        const bool kb_valid = kbx < valid_k_blocks;
+        const block_q4_0_ar16 * bxi = (const block_q4_0_ar16 *) x + kbx0 + i*stride + (kb_valid ? kbx : 0);
 
-        const int2 v0 = unpack_q4_0_ar16(get_int_b2(bxi->qs, 0)); // elements 0..7
-        const int2 v1 = unpack_q4_0_ar16(get_int_b2(bxi->qs, 1)); // elements 8..15
+        const int2 v0 = kb_valid ? unpack_q4_0_ar16(get_int_b2(bxi->qs, 0)) : make_int2(0, 0); // elements 0..7
+        const int2 v1 = kb_valid ? unpack_q4_0_ar16(get_int_b2(bxi->qs, 1)) : make_int2(0, 0); // elements 8..15
+        const float d = kb_valid ? (float) bxi->d : 0.0f;
 
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
         x_qs[i*sram_stride + 4*kbx + 0] = v0.x;
         x_qs[i*sram_stride + 4*kbx + 1] = v0.y;
         x_qs[i*sram_stride + 4*kbx + 2] = v1.x;
         x_qs[i*sram_stride + 4*kbx + 3] = v1.y;
-        const float d = bxi->d;
-        x_df[i*sram_stride + 4*kbx + 0] = d;
-        x_df[i*sram_stride + 4*kbx + 1] = d;
-        x_df[i*sram_stride + 4*kbx + 2] = d;
-        x_df[i*sram_stride + 4*kbx + 3] = d;
+        // One scale per 16-element block, matching the vec_dot's linear k0/4 scale index.
+        // The NVFP4 SRAM layout leaves a 20-float gap between the qs rows (stride 84,
+        // qs region 64 ints, df at +64); 16 scales fit without overlapping the next row.
+        x_df[i*sram_stride + kbx] = d;
 #else
-        const int valid_k_blocks = *ggml_cuda_mmq_get_valid_k_blocks_ptr();
-        if (kbx < valid_k_blocks) {
-            x_qs[i*(2*MMQ_TILE_NE_K + 1) + 4*kbx + 0] = v0.x;
-            x_qs[i*(2*MMQ_TILE_NE_K + 1) + 4*kbx + 1] = v0.y;
-            x_qs[i*(2*MMQ_TILE_NE_K + 1) + 4*kbx + 2] = v1.x;
-            x_qs[i*(2*MMQ_TILE_NE_K + 1) + 4*kbx + 3] = v1.y;
-            const float d = bxi->d;
-            // AR16 has 1 scale per 16 elements, but DP4A expects 1 per 8 (QI8_0).
-            // Replicate each scale 2x to match expected density.
-            x_df[i*(2*MMQ_TILE_NE_K*2/QI8_0) + i/(QI8_0/4) + 2*kbx + 0] = d;
-            x_df[i*(2*MMQ_TILE_NE_K*2/QI8_0) + i/(QI8_0/4) + 2*kbx + 1] = d;
-        } else if (kbx < 2*MMQ_TILE_NE_K / QK4_0_AR16) {
-            // Zero-pad invalid blocks to avoid reading garbage in vec_dot
-            x_qs[i*(2*MMQ_TILE_NE_K + 1) + 4*kbx + 0] = 0;
-            x_qs[i*(2*MMQ_TILE_NE_K + 1) + 4*kbx + 1] = 0;
-            x_qs[i*(2*MMQ_TILE_NE_K + 1) + 4*kbx + 2] = 0;
-            x_qs[i*(2*MMQ_TILE_NE_K + 1) + 4*kbx + 3] = 0;
-            x_df[i*(2*MMQ_TILE_NE_K*2/QI8_0) + i/(QI8_0/4) + 2*kbx + 0] = 0.0f;
-            x_df[i*(2*MMQ_TILE_NE_K*2/QI8_0) + i/(QI8_0/4) + 2*kbx + 1] = 0.0f;
-        }
+        x_qs[i*(2*MMQ_TILE_NE_K + 1) + 4*kbx + 0] = v0.x;
+        x_qs[i*(2*MMQ_TILE_NE_K + 1) + 4*kbx + 1] = v0.y;
+        x_qs[i*(2*MMQ_TILE_NE_K + 1) + 4*kbx + 2] = v1.x;
+        x_qs[i*(2*MMQ_TILE_NE_K + 1) + 4*kbx + 3] = v1.y;
+        // AR16 has 1 scale per 16 elements; the DP4A tile consumes 2 adjacent
+        // scales per vec_dot call (one per block), so store one scale per block.
+        x_df[i*(2*MMQ_TILE_NE_K*2/QI8_0) + i/(QI8_0/4) + kbx] = d;
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
     }
 }

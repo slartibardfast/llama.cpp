@@ -281,7 +281,7 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
     return MMVQ_MAX_BATCH_SIZE;
 }
 
-bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
+bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne00, int64_t ne11) {
     if (!ggml_is_quantized(type)) {
         return false;
     }
@@ -327,6 +327,13 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
             default:
                 return ne11 <= MMVQ_MAX_BATCH_SIZE;
         }
+    }
+    // Types whose MMVQ vec_dot pairs two qk-element blocks with one 32-element
+    // q8_1 block need an even block count: an odd 16-element tail (ne00 % 32 == 16)
+    // would read the q8_1 padding quantized from out-of-bounds src1 elements.
+    // Route those to MMQ, which zero-pads the partial block.
+    if (type == GGML_TYPE_Q4_0_AR16 && ne00 % QK8_1 != 0) {
+        return false;
     }
     return ne11 <= MMVQ_MAX_BATCH_SIZE;
 }

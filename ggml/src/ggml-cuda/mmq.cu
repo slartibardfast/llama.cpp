@@ -306,6 +306,11 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
         return false;
     }
 
+    // MMQ needs a J tile of at least 8 columns; smaller batches cannot form one.
+    if (type == GGML_TYPE_Q4_0_AR16 && ne11 < 8) {
+        return false;
+    }
+
     // MMQ tiles require at least 48 KiB per-block shared memory; fall back to BLAS otherwise.
     {
         const int    id    = ggml_cuda_get_device();
